@@ -49,8 +49,9 @@ public sealed class E131Sender : IDisposable
         var targetAddress = IPAddress.Parse(targetIp);
         _destination = new IPEndPoint(targetAddress, port);
 
-        // Find best local address for the target subnet
-        var localAddr = FindBestLocalAddressForTarget(targetAddress) ?? IPAddress.Loopback;
+        // Find best local address for the target subnet.
+        // Fall back to Any so the OS can route out a real interface.
+        var localAddr = FindBestLocalAddressForTarget(targetAddress) ?? IPAddress.Any;
         BoundLocalAddress = localAddr;
 
         _sendSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
@@ -140,9 +141,9 @@ public sealed class E131Sender : IDisposable
         WriteUInt16BE(buffer, offset, (ushort)(FLAGS | rootFlagsAndLen)); offset += 2;
         WriteUInt32BE(buffer, offset, VECTOR_ROOT_E131_DATA); offset += 4;   // vector = 0x00000004
 
-        // UUID — use a random GUID per sender instance (matching Haukcode.sACN which uses SenderId)
-        var uuid = _uuid.ToByteArray();
-        for (int i = 0; i < uuid.Length; i++) buffer[offset + i] = uuid[i];
+        // CID UUID must be written in RFC4122/network byte order.
+        Span<byte> cid = buffer.AsSpan(offset, 16);
+        _uuid.TryWriteBytes(cid, bigEndian: true, out _);
         offset += 16;
 
         // ===== FRAMING LAYER =====
@@ -162,7 +163,7 @@ public sealed class E131Sender : IDisposable
         buffer[offset++] = 100;                    // priority (standard)
         WriteUInt16BE(buffer, offset, 0); offset += 2;   // sync address
         buffer[offset++] = seqNum;                 // sequence number — per-universe counter
-        buffer[offset++] = 0x06;                   // options: terminated stream
+        buffer[offset++] = 0x00;                   // options: normal data stream
         WriteUInt16BE(buffer, offset, universe); offset += 2;   // universe number
 
         // ===== DMP LAYER =====

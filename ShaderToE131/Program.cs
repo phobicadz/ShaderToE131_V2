@@ -13,7 +13,7 @@ class Program : IDisposable
     private const string TargetIp = "192.168.2.150";
     private const int MatW = PixelMapper.Width;     // 53
     private const int MatH = PixelMapper.Height;    // 11
-    private const ushort UniverseId = 0;            // sACN universe (bits 15-4: 0 → 0x0000)
+    private const ushort UniverseId = 1;            // sACN universe (valid range: 1..63999)
 
     private IWindow? _window;
     private GL? _gl;
