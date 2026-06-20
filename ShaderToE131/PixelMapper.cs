@@ -13,14 +13,13 @@ public static class PixelMapper
 
     /// <summary>
     /// Convert a framebuffer (x, y) coordinate to an index in the LED strip.
-    /// Even rows: left → right. Odd rows: right → left (serpentine).
+    /// Straight raster order (matching ShaderToE131 working reference).
     /// </summary>
     public static int ToLedIndex(int x, int y)
     {
         if (x < 0 || x >= Width || y < 0 || y >= Height) return -1;
 
-        int rowOffset = y * Width;
-        return rowOffset + (y % 2 == 1 ? (Width - 1 - x) : x);
+        return y * Width + x;
     }
 
     /// <summary>
