@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Linq;
 using Silk.NET.Maths;
 using Silk.NET.OpenGL;
 using Silk.NET.Windowing;
@@ -19,6 +20,10 @@ class Program : IDisposable
     private delegate void SwapIntervalFn(int interval);
 
     private bool _noPreview = false;
+    private string? _shaderSource = null;
+    private bool _demoMode = false;
+    private double _demoTimePerShaderSec = 10.0;
+    private string? _shaderDirPath = null;
 
     private IWindow? _window;
     private GL? _gl;
@@ -28,12 +33,61 @@ class Program : IDisposable
     private byte[] _e131Buffer = new byte[PixelMapper.TotalChannels];
     private double _startTime;
     private int _frameCount = 0;
+    private int _demoIndex = -1;            // current shader index in demo mode
+    private long _demoShaderStartTimeMs;     // tick when current shader started
+    private string[]? _demoShaders;          // resolved paths for all shaders
     private long _lastStatusLogMs;
     private int _framesSent;
     private int _sendErrors;
 
-    // ShaderToy fragment shader — paste your mainImage body here.
-    // Use {{ and }} for literal curly braces in GLSL; use {AR} for the aspect ratio value.
+    /// <summary>
+    /// Build the final GLSL fragment shader source.
+    /// Wraps raw ShaderToy-style mainImage code with required boilerplate,
+    /// or returns the built-in default if no custom shader was provided.
+    /// </summary>
+    private static string BuildFragmentShader(string rawSource)
+    {
+        // Check if the source already has #version and void main() — treat as complete
+        bool isComplete = rawSource.Contains("#version") && (rawSource.Contains("void main()") || rawSource.Contains("out vec4 FragColor"));
+        if (!isComplete)
+        {
+            // Common ShaderToy built-in helpers that aren't in standard GLSL.
+            // Injected once at the top so all wrapped shaders can use them.
+            string shaderToyHelpers = @"
+vec3 HSVtoRGB(vec3 c)
+{{
+    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}}
+// Alias for shaders that call it PascalCase
+#define HSVToRGB HSVtoRGB
+";
+
+            // Wrap ShaderToy-style source: add defines, uniforms, helpers, and void main()
+            string wrapped = @"#version 330 core
+#define iTime u_time
+#define iResolution u_resolution
+uniform float u_time;
+uniform vec2  u_resolution;
+uniform int   u_frame;
+out vec4 FragColor;
+
+" + shaderToyHelpers + rawSource + @"
+void main()
+{{
+    vec2 fragCoord = gl_FragCoord.xy;
+    mainImage(FragColor, fragCoord);
+}};";
+            return wrapped;
+        }
+        // Already a complete GLSL fragment shader — replace {AR} placeholder
+        return rawSource.Replace("{AR}", PixelMapper.AspectRatio.ToString());
+    }
+
+    /// <summary>
+    /// Built-in default ShaderToy fragment shader (used when no --shader file is specified).
+    /// </summary>
     private const string DefaultFragmentShader = @"#version 330 core
 #define iTime u_time
 #define iResolution u_resolution
@@ -78,9 +132,42 @@ void main()
     static void Main(string[] args)
     {
         var prog = new Program();
-        foreach (var arg in args)
-            if (arg == "--no-preview") prog._noPreview = true;
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i] == "--no-preview") { prog._noPreview = true; }
+            else if (args[i] == "--shader" && i + 1 < args.Length)
+                prog._shaderSource = args[++i];
+            else if (args[i] == "--demo") { prog._demoMode = true; }
+            else if (args[i] == "--demo-time" && i + 1 < args.Length && double.TryParse(args[++i], out var secs))
+                prog._demoTimePerShaderSec = secs;
+            else if (args[i] == "--shader-dir" && i + 1 < args.Length)
+                prog._shaderDirPath = args[++i];
+        }
         prog.Run();
+    }
+
+    /// <summary>
+    /// Resolve a shader filename to an absolute path.
+    /// Searches: current directory, shaders/ subfolder, and app base directory.
+    /// </summary>
+    private static string? ResolveShaderPath(string name)
+    {
+        // If already an absolute path, just check it
+        if (Path.IsPathRooted(name) && File.Exists(name))
+            return name;
+
+        var candidates = new[]
+        {
+            Path.Combine(Directory.GetCurrentDirectory(), name),
+            Path.Combine(Directory.GetCurrentDirectory(), "shaders", name),
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, name),
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "shaders", name),
+        };
+
+        foreach (var candidate in candidates)
+            if (File.Exists(candidate)) return candidate;
+
+        return null;
     }
 
     private unsafe void Run()
@@ -90,6 +177,54 @@ void main()
         Console.WriteLine($"  Target: {TargetIp}:5568 (unicast, universe={UniverseId})");
         Console.WriteLine($"  Aspect ratio: {PixelMapper.AspectRatio:F3}");
         Console.WriteLine();
+
+        // Resolve shader source(s) — file override, demo mode, or built-in default
+        if (_demoMode)
+        {
+            // Resolve shader directory — explicit path, fallback to base/shaders/
+            string shaderDir;
+            if (!string.IsNullOrEmpty(_shaderDirPath))
+            {
+                shaderDir = Path.IsPathRooted(_shaderDirPath) ? _shaderDirPath : Path.Combine(Directory.GetCurrentDirectory(), _shaderDirPath);
+            }
+            else
+            {
+                shaderDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "shaders");
+            }
+            if (Directory.Exists(shaderDir))
+                _demoShaders = Directory.GetFiles(shaderDir, "*.glsl", SearchOption.TopDirectoryOnly)
+                                         .OrderBy(Path.GetFileName).ToArray();
+            else
+                _demoShaders = Array.Empty<string>();
+
+            if (_demoShaders.Length == 0)
+            {
+                Console.WriteLine("[ERROR] No .glsl files found in shaders/ directory for demo mode.");
+                return;
+            }
+
+            Console.WriteLine($"Demo mode: {_demoShaders.Length} shader(s), {_demoTimePerShaderSec}s each");
+            Console.WriteLine();
+        }
+        else if (!string.IsNullOrEmpty(_shaderSource))
+        {
+            var fullPath = ResolveShaderPath(_shaderSource);
+            if (fullPath != null && File.Exists(fullPath))
+            {
+                Console.WriteLine($"  Shader: {fullPath}");
+                _shaderSource = File.ReadAllText(fullPath);
+            }
+            else
+            {
+                Console.WriteLine($"[ERROR] Shader file not found: {_shaderSource}");
+                Console.WriteLine("      Available shaders in ./shaders/: " + string.Join(", ", Directory.Exists("shaders") ? Directory.GetFiles("shaders", "*.glsl").Select(Path.GetFileName) : Enumerable.Empty<string>()));
+                return;
+            }
+        }
+        else
+        {
+            _shaderSource = DefaultFragmentShader;
+        }
 
         _sender = new E131Sender(TargetIp, 5568);
         Console.WriteLine("E.1.31 sender initialized.");
@@ -119,14 +254,54 @@ void main()
         _window.Run();
     }
 
+    /// <summary>
+    /// Load a shader from demo mode index and reset the GL time uniform.
+    /// </summary>
+    private unsafe void LoadDemoShader(int index)
+    {
+        if (_demoShaders == null || index < 0 || index >= _demoShaders.Length) return;
+
+        _demoIndex = index;
+        var fullPath = _demoShaders[index];
+        Console.WriteLine($"[Demo] Loading shader #{index + 1}/{_demoShaders.Length}: {Path.GetFileName(fullPath)}");
+        _shaderSource = File.ReadAllText(fullPath);
+
+        // Reload the shader program with the new source
+        ReloadShader();
+
+        // Reset time so the animation starts fresh for each shader
+        _startTime = Environment.TickCount64 / 1000.0;
+        _demoShaderStartTimeMs = Environment.TickCount64;
+    }
+
+    /// <summary>
+    /// Reload/recompile the shader program with a new source.
+    /// Used in demo mode to swap shaders mid-flight.
+    /// </summary>
+    private unsafe void ReloadShader()
+    {
+        if (_gl == null || _window == null) return;
+
+        // Dispose old program (ShaderProgram.Dispose cleans up GL resources)
+        _shaderProgram?.Dispose();
+
+        string fragShader = BuildFragmentShader(_shaderSource!);
+        _shaderProgram = new ShaderProgram(_gl, fragShader, MatW, MatH, _window);
+        Console.WriteLine($"[Reload] Shader program created.");
+    }
+
     private unsafe void OnLoad()
     {
         Console.WriteLine("GL loaded — initializing shaders...");
         _gl = _window!.CreateOpenGL();
 
+        // In demo mode, load the first shader and set start time
+        if (_demoMode && _demoShaders != null && _demoShaders.Length > 0)
+        {
+            LoadDemoShader(0);
+        }
 
-
-        string fragShader = DefaultFragmentShader.Replace("{AR}", PixelMapper.AspectRatio.ToString());
+        string fragShader = BuildFragmentShader(_shaderSource!);
         _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!);
         Console.WriteLine("Shader program created.");
         // Disable VSync via wglSwapIntervalEXT
@@ -178,6 +353,12 @@ void main()
         Console.WriteLine("GL loaded — initializing shaders...");
         _gl = _window!.CreateOpenGL();
 
+        // In demo mode, load the first shader and set start time
+        if (_demoMode && _demoShaders != null && _demoShaders.Length > 0)
+        {
+            LoadDemoShader(0);
+        }
+
         // Disable VSync via wglSwapIntervalEXT
         try
         {
@@ -195,7 +376,7 @@ void main()
         }
         catch { /* VSync already off or extension not available */ }
 
-        string fragShader = DefaultFragmentShader.Replace("{AR}", PixelMapper.AspectRatio.ToString());
+        string fragShader = BuildFragmentShader(_shaderSource);
         _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!);
         Console.WriteLine("Shader program created.");
     }
@@ -203,6 +384,17 @@ void main()
     private unsafe void OnRender(double deltaTime)
     {
         if (_shaderProgram == null || _sender == null) return;
+
+        // Demo mode: check if it's time to swap shaders
+        if (_demoMode && _demoShaders != null && _demoIndex >= 0)
+        {
+            long elapsed = Environment.TickCount64 - _demoShaderStartTimeMs;
+            if (elapsed >= (long)(_demoTimePerShaderSec * 1000))
+            {
+                int next = (_demoIndex + 1) % _demoShaders.Length;
+                LoadDemoShader(next);
+            }
+        }
 
         // Render shader output into the matrix-sized framebuffer.
         _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
@@ -243,6 +435,17 @@ void main()
     private unsafe void OnRenderHeadless(double deltaTime)
     {
         if (_shaderProgram == null || _sender == null) return;
+
+        // Demo mode: check if it's time to swap shaders
+        if (_demoMode && _demoShaders != null && _demoIndex >= 0)
+        {
+            long elapsed = Environment.TickCount64 - _demoShaderStartTimeMs;
+            if (elapsed >= (long)(_demoTimePerShaderSec * 1000))
+            {
+                int next = (_demoIndex + 1) % _demoShaders.Length;
+                LoadDemoShader(next);
+            }
+        }
 
         // Render shader output into the matrix-sized framebuffer.
         _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
