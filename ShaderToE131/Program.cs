@@ -18,6 +18,8 @@ class Program : IDisposable
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void SwapIntervalFn(int interval);
 
+    private bool _noPreview = false;
+
     private IWindow? _window;
     private GL? _gl;
     private E131Sender? _sender;
@@ -73,7 +75,13 @@ void main()
     vec3 col = 0.5 + 0.5*cos(iTime+uv.xyx+vec3(0,2,4));
     FragColor = vec4(vec3(pixel) * col, 1.0);
 }};";
-    static void Main() => new Program().Run();
+    static void Main(string[] args)
+    {
+        var prog = new Program();
+        foreach (var arg in args)
+            if (arg == "--no-preview") prog._noPreview = true;
+        prog.Run();
+    }
 
     private unsafe void Run()
     {
@@ -85,6 +93,13 @@ void main()
 
         _sender = new E131Sender(TargetIp, 5568);
         Console.WriteLine("E.1.31 sender initialized.");
+
+        if (_noPreview)
+        {
+            Console.WriteLine("Running headless (no preview window). Press Ctrl+C to stop.");
+            RunHeadless();
+            return;
+        }
         Console.WriteLine($"  Source adapter IP: {_sender.BoundLocalAddress?.ToString() ?? "auto-route"}");
 
         var opts = WindowOptions.Default;
@@ -135,14 +150,64 @@ void main()
         _lastStatusLogMs = Environment.TickCount64;
     }
 
+    /// <summary>
+    /// Headless render loop — uses a tiny visible window so Silk.NET doesn't throttle to ~1fps.
+    /// Skips preview drawing for max performance.
+    /// </summary>
+    private unsafe void RunHeadless()
+    {
+        Console.WriteLine("  [Headless] Creating minimal GL context...");
+
+        // Small but VISIBLE window — Silk.NET throttles hidden/minimized windows to ~1fps
+        var opts = WindowOptions.Default;
+        opts.Size = new Vector2D<int>(10, 10);
+        opts.Title = "ShaderToE131 Headless";
+        opts.FramesPerSecond = 0; // unlimited
+
+        _window = Window.Create(opts);
+        _window.Load += OnLoadHeadless;
+        _window.Render += OnRenderHeadless;
+        _window.Closing += () => { };
+
+        Console.WriteLine("Starting headless render loop...");
+        _window.Run();
+    }
+
+    private unsafe void OnLoadHeadless()
+    {
+        Console.WriteLine("GL loaded — initializing shaders...");
+        _gl = _window!.CreateOpenGL();
+
+        // Disable VSync via wglSwapIntervalEXT
+        try
+        {
+            var hDC = UnsafeNativeMethods.GetDC(_window!.Handle);
+            if (hDC != IntPtr.Zero)
+            {
+                var proc = UnsafeNativeMethods.wglGetProcAddress("wglSwapIntervalEXT");
+                if (proc != IntPtr.Zero)
+                {
+                    var swapFn = Marshal.GetDelegateForFunctionPointer<UnsafeNativeMethods.WglSwapIntervalEXT>(proc);
+                    swapFn(0);
+                }
+                UnsafeNativeMethods.ReleaseDC(_window.Handle, hDC);
+            }
+        }
+        catch { /* VSync already off or extension not available */ }
+
+        string fragShader = DefaultFragmentShader.Replace("{AR}", PixelMapper.AspectRatio.ToString());
+        _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!);
+        Console.WriteLine("Shader program created.");
+    }
+
     private unsafe void OnRender(double deltaTime)
     {
-        if (_shaderProgram == null || _sender == null || _gl == null) return;
+        if (_shaderProgram == null || _sender == null) return;
 
         // Render shader output into the matrix-sized framebuffer.
-        _shaderProgram.Render(_gl, MatW, MatH, _frameBuffer);
+        _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
 
-        // Map to E.1.31 buffer (serpentine layout)
+        // Map to E.1.31 buffer (straight raster layout)
         PixelMapper.MapFrame(_frameBuffer.AsSpan(), _e131Buffer.AsSpan());
 
         // Send to LED matrix — 583 pixels × 3 channels = 1749 slots → needs 4 universes
@@ -164,13 +229,50 @@ void main()
             int r = _e131Buffer.Length > 0 ? _e131Buffer[0] : 0;
             int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;
             int b = _e131Buffer.Length > 2 ? _e131Buffer[2] : 0;
-            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount} | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}");
+            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}");
             _frameCount = 0;
             _lastStatusLogMs = nowMs;
         }
 
-        // Preview in window
+        // Preview in window (windowed mode only)
         DrawPreview();
+    }
+
+
+
+    private unsafe void OnRenderHeadless(double deltaTime)
+    {
+        if (_shaderProgram == null || _sender == null) return;
+
+        // Render shader output into the matrix-sized framebuffer.
+        _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
+
+        // Map to E.1.31 buffer (straight raster layout)
+        PixelMapper.MapFrame(_frameBuffer.AsSpan(), _e131Buffer.AsSpan());
+
+        // Send to LED matrix — 583 pixels × 3 channels = 1749 slots → needs 4 universes
+        try
+        {
+            _sender.SendFrameMultiUniverse(_e131Buffer, UniverseId);
+            _framesSent++;
+        }
+        catch (Exception ex)
+        {
+            _sendErrors++;
+            Console.WriteLine($"[E1.31] Send failed: {ex.Message}");
+        }
+
+        _frameCount++;
+        long nowMs = Environment.TickCount64;
+        if (nowMs - _lastStatusLogMs >= 2000)
+        {
+            int r = _e131Buffer.Length > 0 ? _e131Buffer[0] : 0;
+            int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;
+            int b = _e131Buffer.Length > 2 ? _e131Buffer[2] : 0;
+            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/2s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}");
+            _frameCount = 0;
+            _lastStatusLogMs = nowMs;
+        }
     }
 
     private unsafe void DrawPreview()
