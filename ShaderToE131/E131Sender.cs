@@ -98,9 +98,10 @@ public sealed class E131Sender : IDisposable
             BuildFrame(buffer, universe, effectivePixels.AsSpan(startSlot, maxSlots));
             _sendSocket.SendTo(buffer, SocketFlags.None, _destination);
 
-            // Pace packets to avoid UDP burst drops on Windows.
+            // Small yield between universes — enough to let OS scheduler deliver
+            // without the ~1ms sleep that costs ~12% at 60fps.
             if (u < numUniverses - 1)
-                System.Threading.Thread.Sleep(1);
+                System.Threading.Thread.Yield();
         }
     }
 

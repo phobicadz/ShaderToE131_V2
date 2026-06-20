@@ -15,6 +15,9 @@ class Program : IDisposable
     private const int MatH = PixelMapper.Height;    // 11
     private const ushort UniverseId = 1;            // sACN universe (valid range: 1..63999)
 
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate void SwapIntervalFn(int interval);
+
     private IWindow? _window;
     private GL? _gl;
     private E131Sender? _sender;
@@ -88,8 +91,8 @@ void main()
         int scale = 10;
         opts.Size = new Vector2D<int>(MatW * scale, MatH * scale);
         opts.Title = "ShaderToE131 Preview";
-        opts.FramesPerSecond = 60;
-        opts.UpdatesPerSecond = 60;
+        // FramesPerSecond/UpdatesPerSecond set to high values — VSync disabled in OnLoad
+        opts.FramesPerSecond = 0;
 
         _window = Window.Create(opts);
         _window.Load += OnLoad;
@@ -106,9 +109,28 @@ void main()
         Console.WriteLine("GL loaded — initializing shaders...");
         _gl = _window!.CreateOpenGL();
 
+
+
         string fragShader = DefaultFragmentShader.Replace("{AR}", PixelMapper.AspectRatio.ToString());
         _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!);
         Console.WriteLine("Shader program created.");
+        // Disable VSync via wglSwapIntervalEXT
+        try
+        {
+            var hDC = UnsafeNativeMethods.GetDC(_window!.Handle);
+            if (hDC != IntPtr.Zero)
+            {
+                var proc = UnsafeNativeMethods.wglGetProcAddress("wglSwapIntervalEXT");
+                if (proc != IntPtr.Zero)
+                {
+                    var swapFn = Marshal.GetDelegateForFunctionPointer<UnsafeNativeMethods.WglSwapIntervalEXT>(proc);
+                    swapFn(0);
+                }
+                UnsafeNativeMethods.ReleaseDC(_window.Handle, hDC);
+            }
+        }
+        catch { /* VSync already off or extension not available */ }
+
         _startTime = Environment.TickCount64 / 1000.0;
         _lastStatusLogMs = Environment.TickCount64;
     }
@@ -427,4 +449,19 @@ void main(){ fragColor = texture(tex, UV); }";
         _gl?.DeleteVertexArray(_quadVao);
         _gl?.DeleteBuffer(_quadVbo);
     }
+}
+
+internal static class UnsafeNativeMethods
+{
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetDC(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    public static extern int ReleaseDC(IntPtr hwnd, IntPtr hdc);
+
+    [DllImport("opengl32.dll", SetLastError = true)]
+    public static extern IntPtr wglGetProcAddress(string procName);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    public delegate void WglSwapIntervalEXT(int interval);
 }
