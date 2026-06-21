@@ -24,6 +24,10 @@ class Program : IDisposable
     private bool _demoMode = false;
     private double _demoTimePerShaderSec = 10.0;
     private string? _shaderDirPath = null;
+    private bool _audioEnabled = false;
+    private AudioCapture.AudioSource _audioSource = AudioCapture.AudioSource.Microphone;
+    private int _audioDeviceIndex = 0;
+    private AudioCapture? _audioCapture;
 
     private IWindow? _window;
     private GL? _gl;
@@ -33,6 +37,7 @@ class Program : IDisposable
     private byte[] _e131Buffer = new byte[PixelMapper.TotalChannels];
     private double _startTime;
     private int _frameCount = 0;
+    private int _audioDebugCount = 0;
     private int _demoIndex = -1;            // current shader index in demo mode
     private long _demoShaderStartTimeMs;     // tick when current shader started
     private string[]? _demoShaders;          // resolved paths for all shaders
@@ -45,7 +50,7 @@ class Program : IDisposable
     /// Wraps raw ShaderToy-style mainImage code with required boilerplate,
     /// or returns the built-in default if no custom shader was provided.
     /// </summary>
-    private static string BuildFragmentShader(string rawSource)
+    private string BuildFragmentShader(string rawSource)
     {
         // Check if the source already has #version and void main() — treat as complete
         bool isComplete = rawSource.Contains("#version") && (rawSource.Contains("void main()") || rawSource.Contains("out vec4 FragColor"));
@@ -65,13 +70,17 @@ vec3 HSVtoRGB(vec3 c)
 ";
 
             // Wrap ShaderToy-style source: add defines, uniforms, helpers, and void main()
+            string audioUniforms = _audioEnabled
+                ? "\nuniform float u_bass;\nuniform float u_lowmid;\nuniform float u_mid;\nuniform float u_highmid;\nuniform float u_treble;\nuniform float u_volume;"
+                : "";
+
             string wrapped = @"#version 330 core
 #define iTime u_time
 #define iResolution u_resolution
 uniform float u_time;
 uniform vec2  u_resolution;
 uniform int   u_frame;
-out vec4 FragColor;
+out vec4 FragColor;" + audioUniforms + @"
 
 " + shaderToyHelpers + rawSource + @"
 void main()
@@ -81,8 +90,38 @@ void main()
 }};";
             return wrapped;
         }
-        // Already a complete GLSL fragment shader — replace {AR} placeholder
-        return rawSource.Replace("{AR}", PixelMapper.AspectRatio.ToString());
+        // Already a complete GLSL fragment shader — inject audio uniforms if needed, then replace {AR} placeholder
+        string result = rawSource;
+        if (_audioEnabled)
+        {
+            const string uBass = "uniform float u_bass;";
+            const string uLowmid = "uniform float u_lowmid;";
+            const string uMid = "uniform float u_mid;";
+            const string uHighmid = "uniform float u_highmid;";
+            const string uTreble = "uniform float u_treble;";
+            const string uVolume = "uniform float u_volume;";
+
+            bool hasAudioUniforms = result.Contains(uBass) && result.Contains(uLowmid)
+                && result.Contains(uMid) && result.Contains(uHighmid)
+                && result.Contains(uTreble) && result.Contains(uVolume);
+
+            if (!hasAudioUniforms)
+            {
+                // Inject after the 'out vec4 FragColor' line (with semicolon)
+                string injectPoint = "out vec4 FragColor;";
+                int idx = result.IndexOf(injectPoint);
+                if (idx >= 0)
+                {
+                    int insertPos = idx + injectPoint.Length;
+                    result = result.Insert(insertPos,
+                        "\nuniform float u_bass;\nuniform float u_lowmid;\n"
+                      + "uniform float u_mid;\nuniform float u_highmid;\n"
+                      + "uniform float u_treble;\nuniform float u_volume;");
+                    Console.WriteLine("[BuildFragmentShader] Injected audio uniforms into complete shader.");
+                }
+            }
+        }
+        return result.Replace("{AR}", PixelMapper.AspectRatio.ToString());
     }
 
     /// <summary>
@@ -142,7 +181,41 @@ void main()
                 prog._demoTimePerShaderSec = secs;
             else if (args[i] == "--shader-dir" && i + 1 < args.Length)
                 prog._shaderDirPath = args[++i];
+            else if (args[i] == "--audio") { prog._audioEnabled = true; }
+            else if ((args[i] == "--mic" || args[i] == "--microphone") && i + 1 < args.Length && int.TryParse(args[++i], out var micIdx))
+                { prog._audioSource = AudioCapture.AudioSource.Microphone; prog._audioDeviceIndex = micIdx; }
+            else if ((args[i] == "--loopback" || args[i] == "--playback") && i + 1 < args.Length && int.TryParse(args[++i], out var lbIdx))
+                { prog._audioSource = AudioCapture.AudioSource.Loopback; prog._audioDeviceIndex = lbIdx; }
+            else if (args[i] == "--audio-device" && i + 1 < args.Length && int.TryParse(args[++i], out var devIdx))
+                prog._audioDeviceIndex = devIdx;
         }
+
+        // Show available audio devices when --help, -h, or --list-devices is passed
+        if (args.Contains("--help") || args.Contains("-h"))
+        {
+            Console.WriteLine("Usage: ShaderToE131 [options]");
+            Console.WriteLine();
+            Console.WriteLine("Options:");
+            Console.WriteLine("  --no-preview         Run headless (no OpenGL window)");
+            Console.WriteLine("  --shader <file>      Path to a .glsl shader file");
+            Console.WriteLine("  --demo               Cycle through all shaders in shaders/");
+            Console.WriteLine("  --demo-time <secs>   Seconds per shader in demo mode (default: 10)");
+            Console.WriteLine("  --shader-dir <path>  Directory containing .glsl shaders");
+            Console.WriteLine("  --audio              Enable audio reactivity (microphone by default)");
+            Console.WriteLine("  --mic <idx>          Use microphone at given index (default: 0)");
+            Console.WriteLine("  --loopback [idx]     Capture system playback output (default: 0 = default speakers)");
+            Console.WriteLine("  --audio-device <idx> Fallback device index for either source");
+            Console.WriteLine("  --list-devices       List available audio input devices and exit");
+            Console.WriteLine();
+            return;
+        }
+
+        if (args.Contains("--list-devices"))
+        {
+            AudioCapture.ListAllDevices();
+            return;
+        }
+
         prog.Run();
     }
 
@@ -229,6 +302,23 @@ void main()
         _sender = new E131Sender(TargetIp, 5568);
         Console.WriteLine("E.1.31 sender initialized.");
 
+        // Initialize audio capture if requested
+        if (_audioEnabled)
+        {
+            string sourceLabel = _audioSource == AudioCapture.AudioSource.Loopback ? "loopback" : "microphone";
+            _audioCapture = AudioCapture.Create(_audioSource, _audioDeviceIndex);
+
+            if (_audioCapture != null)
+            {
+                _audioCapture.Start();
+                Console.WriteLine($"Audio capture active ({sourceLabel}, device={_audioDeviceIndex}). Shader uniforms: u_bass, u_lowmid, u_mid, u_highmid, u_treble, u_volume.");
+            }
+            else
+            {
+                Console.WriteLine($"[WARN] No {sourceLabel} device found — audio reactive features disabled.");
+            }
+        }
+
         if (_noPreview)
         {
             Console.WriteLine("Running headless (no preview window). Press Ctrl+C to stop.");
@@ -286,7 +376,7 @@ void main()
         _shaderProgram?.Dispose();
 
         string fragShader = BuildFragmentShader(_shaderSource!);
-        _shaderProgram = new ShaderProgram(_gl, fragShader, MatW, MatH, _window);
+        _shaderProgram = new ShaderProgram(_gl, BuildFragmentShader(_shaderSource!), MatW, MatH, _window, _audioEnabled);
         Console.WriteLine($"[Reload] Shader program created.");
     }
 
@@ -335,7 +425,9 @@ void main()
 
         // Small but VISIBLE window — Silk.NET throttles hidden/minimized windows to ~1fps
         var opts = WindowOptions.Default;
-        opts.Size = new Vector2D<int>(10, 10);
+        // Larger window prevents Silk.NET from throttling to ~1fps.
+        // We don't actually display it — just need it big enough for GL context to run fast.
+        opts.Size = new Vector2D<int>(512, 512);
         opts.Title = "ShaderToE131 Headless";
         opts.FramesPerSecond = 0; // unlimited
 
@@ -384,6 +476,15 @@ void main()
     private unsafe void OnRender(double deltaTime)
     {
         if (_shaderProgram == null || _sender == null) return;
+
+        // Feed audio spectrum into shader uniforms each frame
+        if (_audioCapture != null)
+        {
+            var spectrum = _audioCapture.ReadSpectrum();
+            _shaderProgram?.SetAudioValues(spectrum);
+            if (++_audioDebugCount % 60 == 0)
+                Console.WriteLine($"[Audio] bass={spectrum.Bass:F3} lowmid={spectrum.LowMid:F3} mid={spectrum.Mid:F3} highmid={spectrum.HighMid:F3} treble={spectrum.Treble:F3} vol={spectrum.Volume:F3}");
+        }
 
         // Demo mode: check if it's time to swap shaders
         if (_demoMode && _demoShaders != null && _demoIndex >= 0)
@@ -435,6 +536,15 @@ void main()
     private unsafe void OnRenderHeadless(double deltaTime)
     {
         if (_shaderProgram == null || _sender == null) return;
+
+        // Feed audio spectrum into shader uniforms each frame
+        if (_audioCapture != null)
+        {
+            var spectrum = _audioCapture.ReadSpectrum();
+            _shaderProgram?.SetAudioValues(spectrum);
+            if (++_audioDebugCount % 60 == 0)
+                Console.WriteLine($"[Audio] bass={spectrum.Bass:F3} lowmid={spectrum.LowMid:F3} mid={spectrum.Mid:F3} highmid={spectrum.HighMid:F3} treble={spectrum.Treble:F3} vol={spectrum.Volume:F3}");
+        }
 
         // Demo mode: check if it's time to swap shaders
         if (_demoMode && _demoShaders != null && _demoIndex >= 0)
@@ -488,6 +598,7 @@ void main()
 
     public void Dispose()
     {
+        _audioCapture?.Dispose();
         _sender?.Dispose();
         _window?.Dispose();
         _shaderProgram?.Dispose();
@@ -506,13 +617,16 @@ class ShaderProgram : IDisposable
     private readonly int _matW, _matH;
     private IWindow? _window;
 
-    public unsafe ShaderProgram(GL gl, string fragmentSource, int width, int height, IWindow window)
+    private readonly bool _audioEnabled;
+
+    public unsafe ShaderProgram(GL gl, string fragmentSource, int width, int height, IWindow window, bool audioEnabled = false)
     {
         Console.WriteLine("  [ShaderProg] Starting constructor...");
         _gl = gl;
         _matW = width;
         _matH = height;
         _window = window;
+        _audioEnabled = audioEnabled;
 
         // Vertex shader — outputs pixel coordinates via FragCoord
         string vertSrc = @"#version 330 core
@@ -525,9 +639,10 @@ void main()
 }}";
         vertSrc = string.Format(vertSrc, width, height);
 
-        uint fragShader = Compile(gl, ShaderType.FragmentShader, fragmentSource);
-        Console.WriteLine("  [ShaderProg] Fragment compiled.");
-        uint vertShader = Compile(gl, ShaderType.VertexShader, vertSrc);
+        uint fragShader = Compile(gl, GLEnum.FragmentShader, fragmentSource, _audioEnabled);
+        if (_audioEnabled) Console.WriteLine("  [ShaderProg] Fragment compiled (with audio uniforms).");
+        else Console.WriteLine("  [ShaderProg] Fragment compiled.");
+        uint vertShader = Compile(gl, GLEnum.VertexShader, vertSrc, false);
         Console.WriteLine("  [ShaderProg] Vertex compiled.");
 
         _program = gl.CreateProgram();
@@ -581,7 +696,7 @@ void main()
         Console.WriteLine("  [ShaderProg] Constructor done.");
     }
 
-    private static uint Compile(GL gl, ShaderType type, string source)
+    private static uint Compile(GL gl, GLEnum type, string source, bool audioEnabled)
     {
         var shader = gl.CreateShader(type);
         gl.ShaderSource(shader, source);
@@ -611,6 +726,49 @@ void main()
         int loc = _gl.GetUniformLocation(_program, name);
         if (loc >= 0) _gl.Uniform2(loc, v[0], v[1]);
     }
+
+    /// <summary>
+    /// Set all audio-reactive shader uniforms from captured spectrum data.
+    /// No-op for shaders compiled without the --audio flag (uniforms won't exist).
+    /// </summary>
+    public void SetAudioValues(AudioCapture.SpectrumValues spectrum)
+    {
+        // Check uniform locations on first call to diagnose missing uniforms
+        if (_audioUniformLocations == null)
+        {
+            _audioUniformLocations = new string[] { "u_bass", "u_lowmid", "u_mid", "u_highmid", "u_treble", "u_volume" };
+            _audioUniformLocationCache = new int[6];
+            for (int i = 0; i < 6; i++)
+                _audioUniformLocationCache[i] = _gl.GetUniformLocation(_program, _audioUniformLocations[i]);
+
+            bool anyMissing = false;
+            foreach (var loc in _audioUniformLocationCache)
+                if (loc == -1) { anyMissing = true; break; }
+
+            if (anyMissing)
+            {
+                Console.WriteLine("[Audio] WARNING: Some audio uniforms not found in shader program:");
+                for (int i = 0; i < 6; i++)
+                    Console.WriteLine($"    {_audioUniformLocations[i]} = loc{_audioUniformLocationCache[i]}");
+            }
+        }
+
+        float[] vals = new float[6]
+        {
+            spectrum.Bass, spectrum.LowMid, spectrum.Mid,
+            spectrum.HighMid, spectrum.Treble, spectrum.Volume
+        };
+        for (int i = 0; i < 6; i++)
+        {
+            if (_audioUniformLocationCache[i] >= 0)
+                _gl.Uniform1(_audioUniformLocationCache[i], vals[i]);
+            else
+                Console.WriteLine($"[Audio] Uniform '{_audioUniformLocations[i]}' not found in shader (likely optimized out — shader doesn't reference it).");
+        }
+    }
+
+    private string[]? _audioUniformLocations;
+    private int[]? _audioUniformLocationCache;
 
     /// <summary>
     /// Render directly to default framebuffer at small resolution, then ReadPixels.
@@ -704,8 +862,8 @@ out vec4 fragColor;
 void main(){ fragColor = texture(tex, UV); }";
 
         uint prog = gl.CreateProgram();
-        uint vsObj = Compile(gl, ShaderType.VertexShader, vs);
-        uint fsObj = Compile(gl, ShaderType.FragmentShader, fs);
+        uint vsObj = Compile(gl, GLEnum.VertexShader, vs, false);
+        uint fsObj = Compile(gl, GLEnum.FragmentShader, fs, false);
         gl.AttachShader(prog, vsObj);
         gl.AttachShader(prog, fsObj);
         gl.LinkProgram(prog);
