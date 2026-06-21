@@ -55,12 +55,12 @@ public sealed class AudioCapture : IDisposable
     private readonly float[] _smoothedBands = new float[_bands.Length + 1]; // +1 for volume
     // Lower smoothing (0.15) gives faster transient response; higher (0.3+) is smoother but slower to react.
     // With per-band peak normalization, we need snappier response for visual reactivity.
-    private const float SmoothingFactor = 0.15f;
+    private const float SmoothingFactor = 0.35f;
 
     // Auto-calibration: exponential moving peak per band.
     // Peaks decay slowly (decay=0.97) so the normalization adapts to current signal level
     // rather than being pinned by early transients or initial frames.
-    private const float PeakDecay = 0.97f;
+    private const float PeakDecay = 0.94f;
     private static readonly float[] _peakValues = new float[6];
 
     /// <summary>
