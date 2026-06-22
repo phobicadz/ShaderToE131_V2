@@ -25,6 +25,10 @@ public sealed class WebServer : IDisposable
     public string? PendingShaderFileName { get => _pendingShaderFileName; set => _pendingShaderFileName = value; }
     public Func<bool>? GetAudioEnabled   { get; set; }              // current audio state
     public Action<bool>? SetAudioEnabled { get; set; }              // toggle audio on/off
+    public Action<string>? SetAudioSource { get; set; }            // change audio source (microphone/loopback/off)
+    public Func<string?>? GetCurrentAudioSource { get; set; }       // current audio source label
+    public int CurrentDeviceIndex { get; set; }                     // currently selected audio device index
+    public Action<int>? SetDeviceIndex { get; set; }                // change audio device index via web
 
     private readonly List<ShaderInfo> _shaderList = new();
     internal IReadOnlyList<ShaderInfo> Shaders => _shaderList;
@@ -229,7 +233,7 @@ public sealed class WebServer : IDisposable
   <div class=""subtitle"">LED Matrix Shader Control Panel</div>
 
   <label for=""shaderSelect"">Shader</label>
-  <select id=""shaderSelect""><option value="""">Loading shaders…</option></select>
+  <select id=""shaderSelect""><option value=""off"">Off (blank)</option><option value="""" >Loading shaders…</option></select>
 
   <div class=""toggle-row"" style=""margin-top:20px;"">
     <div class=""toggle-switch"">
@@ -260,7 +264,7 @@ async function loadShaders() {
     const r = await fetch(API + 'api/shaders');
     const data = await r.json();
     const sel = document.getElementById('shaderSelect');
-    sel.innerHTML = '<option value="""">— select shader —</option>';
+    sel.innerHTML = '<option value=""off"">Off (blank)</option><option value="""" >— select shader —</option>';
     audioReactiveNames = (data.audioReactive || []).map(s => s.toLowerCase());
     for (const s of data.shaders) {
       const opt = document.createElement('option');
@@ -327,6 +331,17 @@ setInterval(refreshStatus, 2000);
         if (string.IsNullOrEmpty(name))
         {
             SendJson(ctx.Response, new { ok = false, error = "Missing 'name' field." });
+            return;
+        }
+
+        // Special: "off" renders a blank/black screen
+        string lowerName = name?.ToLowerInvariant();
+        if (lowerName == "off")
+        {
+            PendingShaderSource = null;  // signals render loop to skip shader rendering
+            PendingShaderFileName = "Off";
+            Console.WriteLine("[WebServer] Shader set to Off — blank screen.");
+            SendJson(ctx.Response, new { ok = true, shader = "Off (blank)" });
             return;
         }
 

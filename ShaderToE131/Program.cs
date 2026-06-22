@@ -338,7 +338,6 @@ void main()
             _webServer.SetAudioEnabled = enabled =>
             {
                 _audioEnabled = enabled;
-                // Restart audio capture if toggling on
                 if (enabled && _audioCapture == null)
                 {
                     string sourceLabel = _audioSource == AudioCapture.AudioSource.Loopback ? "loopback" : "microphone";
@@ -352,6 +351,45 @@ void main()
                     Console.WriteLine("Audio capture stopped via web.");
                 }
             };
+            _webServer.SetAudioSource = sourceStr =>
+            {
+                bool wasRunning = _audioEnabled && _audioCapture != null;
+                if (wasRunning) { _audioCapture.Dispose(); _audioCapture = null; }
+                string lower = sourceStr?.ToLowerInvariant();
+                if (lower == "off")
+                {
+                    _audioSource = AudioCapture.AudioSource.Microphone;  // won't matter, capture is stopped
+                }
+                else if (lower == "loopback")
+                {
+                    _audioSource = AudioCapture.AudioSource.Loopback;
+                }
+                else
+                {
+                    _audioSource = AudioCapture.AudioSource.Microphone;
+                }
+                if (wasRunning)
+                {
+                    string sourceLabel = _audioSource == AudioCapture.AudioSource.Loopback ? "loopback" : "microphone";
+                    _audioCapture = AudioCapture.Create(_audioSource, _audioDeviceIndex);
+                    if (_audioCapture != null) { _audioCapture.Start(); Console.WriteLine($"Audio source changed via web to {sourceLabel} (device={_audioDeviceIndex})."); }
+                }
+            };
+            _webServer.SetDeviceIndex = idx =>
+            {
+                _audioDeviceIndex = idx;
+                bool wasRunning = _audioEnabled && _audioCapture != null;
+                if (wasRunning)
+                {
+                    string sourceLabel = _audioSource == AudioCapture.AudioSource.Loopback ? "loopback" : "microphone";
+                    _audioCapture.Dispose();
+                    _audioCapture = AudioCapture.Create(_audioSource, idx);
+                    if (_audioCapture != null) { _audioCapture.Start(); Console.WriteLine($"Audio device index changed via web to {idx} ({sourceLabel})."); }
+                }
+            };
+            _webServer.CurrentDeviceIndex = _audioDeviceIndex;
+                        _webServer.GetCurrentAudioSource = () =>
+                _audioSource == AudioCapture.AudioSource.Loopback ? "loopback" : "microphone";
             _webServer.Start();
         }
 
@@ -484,9 +522,9 @@ void main()
 
         // Small but VISIBLE window — Silk.NET throttles hidden/minimized windows to ~1fps
         var opts = WindowOptions.Default;
-        // Larger window prevents Silk.NET from throttling to ~1fps.
-        // We don't actually display it — just need it big enough for GL context to run fast.
-        opts.Size = new Vector2D<int>(512, 512);
+        // Tiny window prevents Silk.NET from throttling to ~1fps.
+        // We don't actually display it — just need a minimal GL context.
+        opts.Size = new Vector2D<int>(64, 64);
         opts.Title = "ShaderToE131 Headless";
         opts.FramesPerSecond = 0; // unlimited
 
@@ -537,8 +575,17 @@ void main()
         if (_shaderProgram == null || _sender == null) return;
 
         // ─── Pending shader swap from web server (main-thread GL work) ───
-        // ─── Pending shader swap from web server (main-thread GL work) ───
-        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
+        bool _isOff = false;
+        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderFileName) && _webServer.PendingShaderFileName == "Off")
+        {
+            // "Off" — blank screen, no shader rendering
+            _shaderSource = null;
+            _currentShaderFileName = "Off";
+            _webServer.PendingShaderSource = null;  // consume
+            _webServer.PendingShaderFileName = null;
+            _isOff = true;
+        }
+        else if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
         {
             string newSource = _webServer.PendingShaderSource!;
             string? newName = _webServer.PendingShaderFileName;
@@ -580,7 +627,7 @@ void main()
         }
 
         // Feed audio spectrum into shader uniforms each frame
-        if (_audioCapture != null)
+        if (_audioCapture != null && !_isOff)
         {
             var spectrum = _audioCapture.ReadSpectrum();
             _shaderProgram?.SetAudioValues(spectrum);
@@ -600,7 +647,14 @@ void main()
         }
 
         // Render shader output into the matrix-sized framebuffer.
-        _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
+        if (_isOff)
+        {
+            Array.Clear(_frameBuffer);
+        }
+        else
+        {
+            _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
+        }
 
         // Map to E.1.31 buffer (straight raster layout)
         PixelMapper.MapFrame(_frameBuffer.AsSpan(), _e131Buffer.AsSpan());
@@ -640,7 +694,16 @@ void main()
         if (_shaderProgram == null || _sender == null) return;
 
         // Check for pending shader change from web server (thread-safe polling)
-        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
+        bool _isOff = false;
+        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderFileName) && _webServer.PendingShaderFileName == "Off")
+        {
+            _shaderSource = null;
+            _currentShaderFileName = "Off";
+            _webServer.PendingShaderSource = null;  // consume
+            _webServer.PendingShaderFileName = null;
+            _isOff = true;
+        }
+        else if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
         {
             string newSource = _webServer.PendingShaderSource!;
             string? newName = _webServer.PendingShaderFileName;
@@ -682,7 +745,7 @@ void main()
         }
 
         // Feed audio spectrum into shader uniforms each frame
-        if (_audioCapture != null)
+        if (_audioCapture != null && !_isOff)
         {
             var spectrum = _audioCapture.ReadSpectrum();
             _shaderProgram?.SetAudioValues(spectrum);
@@ -702,7 +765,14 @@ void main()
         }
 
         // Render shader output into the matrix-sized framebuffer.
-        _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
+        if (_isOff)
+        {
+            Array.Clear(_frameBuffer);
+        }
+        else
+        {
+            _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
+        }
 
         // Map to E.1.31 buffer (straight raster layout)
         PixelMapper.MapFrame(_frameBuffer.AsSpan(), _e131Buffer.AsSpan());
@@ -907,8 +977,8 @@ void main()
         {
             if (_audioUniformLocationCache[i] >= 0)
                 _gl.Uniform1(_audioUniformLocationCache[i], vals[i]);
-            else
-                Console.WriteLine($"[Audio] Uniform '{_audioUniformLocations[i]}' not found in shader (likely optimized out — shader doesn't reference it).");
+            // Silently skip uniforms that don't exist — the GLSL optimizer removes
+            // unreferenced uniforms, and printing every frame would spam the console.
         }
     }
 
