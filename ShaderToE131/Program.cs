@@ -21,6 +21,9 @@ class Program : IDisposable
 
     private bool _noPreview = false;
     private string? _shaderSource = null;
+    private string? _currentShaderFileName;
+    // Pending shader change from web server (set by HTTP thread, read by render loop)
+    private volatile bool _pendingShaderChange;
     private bool _demoMode = false;
     private double _demoTimePerShaderSec = 10.0;
     private string? _shaderDirPath = null;
@@ -28,6 +31,9 @@ class Program : IDisposable
     private AudioCapture.AudioSource _audioSource = AudioCapture.AudioSource.Microphone;
     private int _audioDeviceIndex = 0;
     private AudioCapture? _audioCapture;
+    private int _webPort = 8080;
+    private WebServer? _webServer;
+    private string? _resolvedShaderDir;
 
     private IWindow? _window;
     private GL? _gl;
@@ -36,6 +42,7 @@ class Program : IDisposable
     private byte[] _frameBuffer = new byte[MatW * MatH * 4];
     private byte[] _e131Buffer = new byte[PixelMapper.TotalChannels];
     private double _startTime;
+    private long _webStartMs;
     private int _frameCount = 0;
     private int _audioDebugCount = 0;
     private int _demoIndex = -1;            // current shader index in demo mode
@@ -188,6 +195,8 @@ void main()
                 { prog._audioSource = AudioCapture.AudioSource.Loopback; prog._audioDeviceIndex = lbIdx; }
             else if (args[i] == "--audio-device" && i + 1 < args.Length && int.TryParse(args[++i], out var devIdx))
                 prog._audioDeviceIndex = devIdx;
+            else if (args[i] == "--web-port" && i + 1 < args.Length && int.TryParse(args[++i], out var wp))
+                prog._webPort = wp;
         }
 
         // Show available audio devices when --help, -h, or --list-devices is passed
@@ -205,6 +214,7 @@ void main()
             Console.WriteLine("  --mic <idx>          Use microphone at given index (default: 0)");
             Console.WriteLine("  --loopback [idx]     Capture system playback output (default: 0 = default speakers)");
             Console.WriteLine("  --audio-device <idx> Fallback device index for either source");
+            Console.WriteLine("  --web-port <port>    Start web control panel on given port (default: 8080)");
             Console.WriteLine("  --list-devices       List available audio input devices and exit");
             Console.WriteLine();
             return;
@@ -217,6 +227,20 @@ void main()
         }
 
         prog.Run();
+    }
+
+    /// <summary>
+    /// Check if a GLSL file contains audio-reactive uniforms.
+    /// </summary>
+    private static bool IsAudioReactiveFile(string filePath)
+    {
+        try
+        {
+            string src = File.ReadAllText(filePath);
+            return src.Contains("u_bass") || src.Contains("u_lowmid") || src.Contains("u_mid")
+                || src.Contains("u_highmid") || src.Contains("u_treble") || src.Contains("u_volume");
+        }
+        catch { return false; }
     }
 
     /// <summary>
@@ -298,6 +322,41 @@ void main()
         {
             _shaderSource = DefaultFragmentShader;
         }
+
+        // Resolve shader directory for web server
+        string resolvedShaderDir;
+        if (!string.IsNullOrEmpty(_shaderDirPath))
+            resolvedShaderDir = Path.IsPathRooted(_shaderDirPath) ? _shaderDirPath : Path.Combine(Directory.GetCurrentDirectory(), _shaderDirPath);
+        else
+            resolvedShaderDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "shaders");
+
+        // Start web control panel (use --web-port 0 to disable)
+        if (_webPort > 0)
+        {
+            _webServer = new WebServer(_webPort, resolvedShaderDir);
+            _webServer.GetAudioEnabled = () => _audioEnabled;
+            _webServer.SetAudioEnabled = enabled =>
+            {
+                _audioEnabled = enabled;
+                // Restart audio capture if toggling on
+                if (enabled && _audioCapture == null)
+                {
+                    string sourceLabel = _audioSource == AudioCapture.AudioSource.Loopback ? "loopback" : "microphone";
+                    _audioCapture = AudioCapture.Create(_audioSource, _audioDeviceIndex);
+                    if (_audioCapture != null) { _audioCapture.Start(); Console.WriteLine($"Audio capture started via web ({sourceLabel}, device={_audioDeviceIndex})."); }
+                }
+                else if (!enabled && _audioCapture != null)
+                {
+                    _audioCapture.Dispose();
+                    _audioCapture = null;
+                    Console.WriteLine("Audio capture stopped via web.");
+                }
+            };
+            _webServer.Start();
+        }
+
+        // Record web server start time for uptime tracking
+        _webStartMs = Environment.TickCount64;
 
         _sender = new E131Sender(TargetIp, 5568);
         Console.WriteLine("E.1.31 sender initialized.");
@@ -477,6 +536,49 @@ void main()
     {
         if (_shaderProgram == null || _sender == null) return;
 
+        // ─── Pending shader swap from web server (main-thread GL work) ───
+        // ─── Pending shader swap from web server (main-thread GL work) ───
+        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
+        {
+            string newSource = _webServer.PendingShaderSource!;
+            string? newName = _webServer.PendingShaderFileName;
+            _webServer.PendingShaderSource = null;  // consume
+            _webServer.PendingShaderFileName = null;
+
+            _shaderSource = newSource;
+            if (!string.IsNullOrEmpty(newName))
+                _currentShaderFileName = newName;
+
+            string fragShader = BuildFragmentShader(_shaderSource!);
+            _shaderProgram?.Dispose();
+            _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
+            _startTime = Environment.TickCount64 / 1000.0;
+            Console.WriteLine($"[Web] Shader changed: {newName ?? "unknown"}");
+        }
+
+        // Update web server status (with live stats)
+        if (_webServer != null && _shaderSource != null)
+        {
+            string selectedName = "built-in default";
+            if (_demoShaders != null && _demoIndex >= 0)
+                selectedName = Path.GetFileName(_demoShaders[_demoIndex]);
+            else if (!string.IsNullOrEmpty(_currentShaderFileName))
+                selectedName = _currentShaderFileName + ".glsl";
+
+            // Re-scan shader dir for accurate counts (handles --shader-dir changes)
+            _webServer.RefreshShaderList();
+            var audioNames = _webServer.Shaders.Where(s => s.IsAudioReactive).Select(s => s.Name!).ToArray()!;
+            _webServer.StatusSnapshot = new WebServer.ApiStatus(
+                selectedName,
+                _audioEnabled,
+                _webServer.Shaders.Count,
+                audioNames,
+                (Environment.TickCount64 - _webStartMs) / 1000.0,
+                _framesSent,
+                _sendErrors
+            );
+        }
+
         // Feed audio spectrum into shader uniforms each frame
         if (_audioCapture != null)
         {
@@ -536,6 +638,48 @@ void main()
     private unsafe void OnRenderHeadless(double deltaTime)
     {
         if (_shaderProgram == null || _sender == null) return;
+
+        // Check for pending shader change from web server (thread-safe polling)
+        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
+        {
+            string newSource = _webServer.PendingShaderSource!;
+            string? newName = _webServer.PendingShaderFileName;
+            _webServer.PendingShaderSource = null;  // consume
+            _webServer.PendingShaderFileName = null;
+
+            _shaderSource = newSource;
+            if (!string.IsNullOrEmpty(newName))
+                _currentShaderFileName = newName;
+
+            string fragShader = BuildFragmentShader(_shaderSource!);
+            _shaderProgram?.Dispose();
+            _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
+            _startTime = Environment.TickCount64 / 1000.0;
+            Console.WriteLine($"[Web] Shader changed: {newName ?? "unknown"}");
+        }
+
+        // Update web server status (with live stats)
+        if (_webServer != null && _shaderSource != null)
+        {
+            string selectedName = "built-in default";
+            if (_demoShaders != null && _demoIndex >= 0)
+                selectedName = Path.GetFileName(_demoShaders[_demoIndex]);
+            else if (!string.IsNullOrEmpty(_currentShaderFileName))
+                selectedName = _currentShaderFileName + ".glsl";
+
+            // Re-scan shader dir for accurate counts (handles --shader-dir changes)
+            _webServer.RefreshShaderList();
+            var audioNames = _webServer.Shaders.Where(s => s.IsAudioReactive).Select(s => s.Name!).ToArray()!;
+            _webServer.StatusSnapshot = new WebServer.ApiStatus(
+                selectedName,
+                _audioEnabled,
+                _webServer.Shaders.Count,
+                audioNames,
+                (Environment.TickCount64 - _webStartMs) / 1000.0,
+                _framesSent,
+                _sendErrors
+            );
+        }
 
         // Feed audio spectrum into shader uniforms each frame
         if (_audioCapture != null)
@@ -598,6 +742,7 @@ void main()
 
     public void Dispose()
     {
+        _webServer?.Stop();
         _audioCapture?.Dispose();
         _sender?.Dispose();
         _window?.Dispose();
