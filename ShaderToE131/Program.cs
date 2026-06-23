@@ -31,7 +31,7 @@ class Program : IDisposable
     private int _audioDeviceIndex = 0;
     private AudioCapture? _audioCapture;
     private int _webPort = 8080;
-    private string _webBindAddress = "localhost";
+    private string _webBindAddress = "0.0.0.0";
     private WebServer? _webServer;
     private string? _resolvedShaderDir;
 
@@ -217,7 +217,7 @@ void main()
             Console.WriteLine("  --loopback [idx]     Capture system playback output (default: 0 = default speakers)");
             Console.WriteLine("  --audio-device <idx> Fallback device index for either source");
             Console.WriteLine("  --web-port <port>      Start web control panel on given port (default: 8080)");
-            Console.WriteLine("  --bind-address <addr>  Bind address for web server (default: localhost, use 0.0.0.0 or + for all interfaces)");
+            Console.WriteLine("  --bind-address <addr>  Bind address for web server (default: 0.0.0.0; use localhost for local-only)");
             Console.WriteLine("  --list-devices         List available audio input devices and exit");
             Console.WriteLine();
             return;

@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -6,15 +7,15 @@ namespace ShaderToE131;
 
 /// <summary>
 /// Lightweight HTTP web server for shader selection and audio control.
-/// Uses HttpListener (no external dependencies). Runs on a configurable port.
+/// Uses raw Socket (no HttpListener, no admin privileges required). Runs on a configurable port.
 /// </summary>
 public sealed class WebServer : IDisposable
 {
     private readonly int _port;
     private readonly string _shaderDirPath;
-    private readonly string _bindAddress;
-    private HttpListener? _listener;
-    private Thread? _serverThread;
+    private readonly IPAddress _bindIp;
+    private TcpListener? _listener;
+    private Thread? _acceptThread;
     private volatile bool _running = false;
 
     // Shared state — set by Program after construction.
@@ -58,8 +59,17 @@ public sealed class WebServer : IDisposable
     {
         _port = port;
         _shaderDirPath = Path.IsPathRooted(shaderDirPath) ? shaderDirPath : Path.Combine(Directory.GetCurrentDirectory(), shaderDirPath);
-        _bindAddress = bindAddress;
+        _bindIp = ResolveBindAddress(bindAddress);
         LoadShaderList();
+    }
+
+    private static IPAddress ResolveBindAddress(string address)
+    {
+        if (address == "+" || address == "0.0.0.0") return IPAddress.Any;
+        if (address.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return IPAddress.Loopback;
+        if (IPAddress.TryParse(address, out var ip)) return ip;
+        // Unknown names fall back to loopback for safety.
+        return IPAddress.Loopback;
     }
 
     private void LoadShaderList()
@@ -90,17 +100,14 @@ public sealed class WebServer : IDisposable
     public void Start()
     {
         _running = true;
-        // "+" or "0.0.0.0" → bind all interfaces; otherwise use the specific address
-        string prefixAddr = (_bindAddress == "+" || _bindAddress == "0.0.0.0") ? "+" : _bindAddress;
-        var url = $"http://{prefixAddr}:{_port}/";
         try
         {
-            _listener = new HttpListener();
-            _listener.Prefixes.Add(url);
+            _listener = new TcpListener(_bindIp, _port);
             _listener.Start();
-            _serverThread = new Thread(ServerLoop) { IsBackground = true };
-            _serverThread.Start();
-            Console.WriteLine($"[WebServer] Started on {url}");
+            _acceptThread = new Thread(AcceptLoop) { IsBackground = true };
+            _acceptThread.Start();
+            var addrStr = (_bindIp == IPAddress.Any) ? "0.0.0.0" : _bindIp.ToString();
+            Console.WriteLine($"[WebServer] Started on http://{addrStr}:{_port}/");
         }
         catch (Exception ex)
         {
@@ -109,35 +116,130 @@ public sealed class WebServer : IDisposable
         }
     }
 
-    private void ServerLoop()
+    private void AcceptLoop()
     {
-        while (_running && _listener?.IsListening == true)
+        while (_running && _listener != null)
         {
             try
             {
-                var ctx = _listener.GetContext(); // blocks until request arrives
-                Task.Run(() => HandleRequest(ctx));
+                var socket = _listener.AcceptSocket();
+                Task.Run(() => HandleClient(socket));
             }
             catch (ObjectDisposedException) { break; }
             catch (InvalidOperationException) { break; }
         }
     }
 
-    private void HandleRequest(HttpListenerContext context)
+    private void HandleClient(Socket clientSocket)
     {
-        var req = context.Request;
-        string path = req.Url?.AbsolutePath ?? "/";
-
-        // CORS header for all responses
-        context.Response.Headers.Add("Access-Control-Allow-Origin", "*");
-        context.Response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        context.Response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
-
-        if (req.HttpMethod == "OPTIONS")
+        try
         {
-            context.Response.StatusCode = 204;
-            context.Response.ContentLength64 = 0;
-            context.Response.Close();
+            var buffer = new byte[65536];
+            int received = 0;
+
+            // Read until we have the full HTTP headers (double CRLF)
+            while (received < buffer.Length)
+            {
+                var bytesRead = clientSocket.Receive(buffer, received, buffer.Length - received, SocketFlags.None);
+                if (bytesRead == 0) break; // connection closed
+
+                received += bytesRead;
+
+                // Check for end of headers: \r\n\r\n
+                int headerEnd = FindDoubleCRLF(buffer, received);
+                if (headerEnd > 0)
+                {
+                    break;
+                }
+            }
+
+            if (received == 0) return;
+
+            string requestLine = System.Text.Encoding.UTF8.GetString(buffer, 0, Math.Min(received, 2048));
+            int firstCRLF = requestLine.IndexOf("\r\n");
+            string methodAndPath = firstCRLF > 0 ? requestLine.Substring(0, firstCRLF) : requestLine;
+            var parts = methodAndPath.Split(' ');
+            string method = parts.Length > 0 ? parts[0] : "GET";
+            string rawPath = parts.Length > 1 ? parts[1] : "/";
+
+            // Parse query string
+            string? queryString = null;
+            int qIdx = rawPath.IndexOf('?');
+            if (qIdx > 0) queryString = rawPath.Substring(qIdx + 1);
+            string path = Uri.UnescapeDataString(qIdx > 0 ? rawPath.Substring(0, qIdx) : rawPath);
+
+            // Read POST body if Content-Length present
+            int contentLength = 0;
+            string body = "";
+            if (method == "POST")
+            {
+                var clMatch = System.Text.RegularExpressions.Regex.Match(requestLine, @"Content-Length:\s*(\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (clMatch.Success)
+                {
+                    var match = System.Text.RegularExpressions.Regex.Match(requestLine, @"Content-Length:\s*(\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (clMatch.Success && int.TryParse(clMatch.Groups[1].Value, out contentLength))
+                    {
+                        int headerEnd = FindDoubleCRLF(buffer, received);
+                        int bodyStart = headerEnd + 4;
+                        int availableBody = Math.Max(0, received - bodyStart);
+
+                        if (availableBody < contentLength)
+                        {
+                            // Read remaining body bytes
+                            var bodyBuf = new byte[contentLength];
+                            Array.Copy(buffer, bodyStart, bodyBuf, 0, availableBody);
+                            int readSoFar = availableBody;
+                            while (readSoFar < contentLength)
+                            {
+                                var bytesRead = clientSocket.Receive(bodyBuf, readSoFar, contentLength - readSoFar, SocketFlags.None);
+                                if (bytesRead == 0) break;
+                                readSoFar += bytesRead;
+                            }
+                            body = System.Text.Encoding.UTF8.GetString(bodyBuf, 0, readSoFar);
+                        }
+                        else
+                        {
+                            body = System.Text.Encoding.UTF8.GetString(buffer, bodyStart, availableBody);
+                        }
+                    }
+                }
+            }
+
+            // Route the request — pass raw method + path + body instead of HttpListenerContext
+            HandleRequest(clientSocket, method, path, queryString, body);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WebServer] Client error: {ex.Message}");
+        }
+        finally
+        {
+            try { clientSocket.Shutdown(SocketShutdown.Both); } catch { }
+            try { clientSocket.Close(); } catch { }
+        }
+    }
+
+    private static int FindDoubleCRLF(byte[] buffer, int length)
+    {
+        for (int i = 3; i < length; i++)
+        {
+            // Match \r\n\r\n with i at the final '\n'.
+            if (buffer[i] == '\n' && buffer[i - 1] == '\r' && buffer[i - 2] == '\n' && buffer[i - 3] == '\r')
+                return i - 3;
+        }
+        return -1;
+    }
+
+    private void HandleRequest(Socket clientSocket, string method, string path, string? queryString, string body)
+    {
+        // CORS headers for all responses
+        var corsHeaders = "Access-Control-Allow-Origin: *\r\n" +
+                          "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
+                          "Access-Control-Allow-Headers: Content-Type\r\n";
+
+        if (method == "OPTIONS")
+        {
+            SendResponse(clientSocket, 204, "", "", corsHeaders);
             return;
         }
 
@@ -146,33 +248,31 @@ public sealed class WebServer : IDisposable
             switch (path)
             {
                 case "/":
-                    ServeIndex(context);
+                    ServeIndex(clientSocket);
                     break;
                 case "/api/shaders":
-                    if (req.HttpMethod == "GET") ServeShadersList(context);
-                    else context.Response.StatusCode = 405;
+                    if (method == "GET") ServeShadersList(clientSocket);
+                    else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
                     break;
                 case "/api/select-shader":
-                    if (req.HttpMethod == "POST") ServeSelectShader(context);
-                    else context.Response.StatusCode = 405;
+                    if (method == "POST") ServeSelectShader(clientSocket, body);
+                    else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
                     break;
                 case "/api/set-audio":
-                    if (req.HttpMethod == "POST") ServeSetAudio(context);
-                    else context.Response.StatusCode = 405;
+                    if (method == "POST") ServeSetAudio(clientSocket, body);
+                    else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
                     break;
                 case "/api/status":
-                    if (req.HttpMethod == "GET") ServeStatus(context);
-                    else context.Response.StatusCode = 405;
+                    if (method == "GET") ServeStatus(clientSocket);
+                    else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
                     break;
                 default:
                     // Try to serve shader files directly for preview
                     if (path.StartsWith("/shaders/") && path.EndsWith(".glsl"))
-                        ServeShaderFile(context, path);
+                        ServeShaderFile(clientSocket, path);
                     else
                     {
-                        context.Response.StatusCode = 404;
-                        context.Response.ContentLength64 = 0;
-                        context.Response.Close();
+                        SendResponse(clientSocket, 404, "", "text/plain; charset=utf-8", corsHeaders);
                     }
                     break;
             }
@@ -180,26 +280,55 @@ public sealed class WebServer : IDisposable
         catch (Exception ex)
         {
             Console.WriteLine($"[WebServer] Error handling {path}: {ex.Message}");
-            try
-            {
-                context.Response.StatusCode = 500;
-                context.Response.ContentLength64 = 0;
-                context.Response.Close();
-            }
-            catch { /* already closed */ }
+            try { SendResponse(clientSocket, 500, "Internal Server Error", "text/plain; charset=utf-8", corsHeaders); } catch { }
         }
     }
 
-    private void SendJson(HttpListenerResponse response, object data)
+    private void SendResponse(Socket clientSocket, int statusCode, string? body = null, string contentType = "text/plain; charset=utf-8", string extraHeaders = "")
     {
-        byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(data, JsonCamelCase);
-        response.ContentType = "application/json; charset=utf-8";
-        response.ContentLength64 = bytes.Length;
-        response.OutputStream.Write(bytes, 0, bytes.Length);
-        response.Close();
+        string reason = statusCode switch
+        {
+            200 => "OK",
+            204 => "No Content",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            500 => "Internal Server Error",
+            _ => "OK"
+        };
+
+        byte[] bodyBytes = string.IsNullOrEmpty(body)
+            ? Array.Empty<byte>()
+            : System.Text.Encoding.UTF8.GetBytes(body);
+
+        var response = $"HTTP/1.1 {statusCode} {reason}\r\n" +
+                       "Connection: close\r\n" +
+                       extraHeaders +
+                       (string.IsNullOrEmpty(contentType) ? "" : $"Content-Type: {contentType}\r\n") +
+                       $"Content-Length: {bodyBytes.Length}\r\n" +
+                       "\r\n";
+
+        byte[] headerBytes = System.Text.Encoding.UTF8.GetBytes(response);
+
+        try
+        {
+            clientSocket.Send(headerBytes, SocketFlags.None);
+            if (bodyBytes.Length > 0)
+                clientSocket.Send(bodyBytes, SocketFlags.None);
+        }
+        catch (Exception ex) { Console.WriteLine($"[WebServer] Send error: {ex.Message}"); }
     }
 
-    private void ServeIndex(HttpListenerContext ctx)
+    private void SendJson(Socket clientSocket, object data, string extraHeaders = "")
+    {
+        string json = JsonSerializer.Serialize(data, JsonCamelCase);
+        var headers = "Access-Control-Allow-Origin: *\r\n"
+                    + "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                    + "Access-Control-Allow-Headers: Content-Type\r\n"
+                    + extraHeaders;
+        SendResponse(clientSocket, 200, json, "application/json; charset=utf-8", headers);
+    }
+
+    private void ServeIndex(Socket clientSocket)
     {
         string html = @"<!DOCTYPE html>
 <html lang=""en"">
@@ -248,6 +377,7 @@ public sealed class WebServer : IDisposable
     <div class=""status-item""><div class=""status-label"">Shader</div><div class=""status-value"" id=""stShader"">—</div></div>
     <div class=""status-item""><div class=""status-label"">Shaders</div><div class=""status-value"" id=""stCount"">0</div></div>
     <div class=""status-item""><div class=""status-label"">Loopback Device</div><div class=""status-value"" id=""stLoopback"">—</div></div>
+
     <div class=""status-item""><div class=""status-label"">Uptime</div><div class=""status-value"" id=""stUptime"">—</div></div>
   </div>
 
@@ -302,41 +432,35 @@ setInterval(refreshStatus, 2000);
 </script>
 </body>
 </html>";
-        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(html);
-        ctx.Response.ContentType = "text/html; charset=utf-8";
-        ctx.Response.ContentLength64 = bytes.Length;
-        ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
-        ctx.Response.Close();
+        SendResponse(clientSocket, 200, html, "text/html; charset=utf-8");
     }
 
-    private void ServeShadersList(HttpListenerContext ctx)
+    private void ServeShadersList(Socket clientSocket)
     {
         LoadShaderList(); // re-scan in case new files appeared
         var data = _shaderList.Select(s => new { s.Name, s.FileName, s.IsAudioReactive }).ToArray();
-        SendJson(ctx.Response, new { shaders = data });
+        SendJson(clientSocket, new { shaders = data });
     }
 
-    private void ServeSelectShader(HttpListenerContext ctx)
+    private void ServeSelectShader(Socket clientSocket, string body)
     {
-        using var reader = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding);
-        string body = reader.ReadToEnd();
-        var json = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object>>(body);
-        string? name = json?.GetValueOrDefault("name")?.ToString();
+        var jsonObj = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object>>(body);
+        string? name = jsonObj?.GetValueOrDefault("name")?.ToString();
 
         if (string.IsNullOrEmpty(name))
         {
-            SendJson(ctx.Response, new { ok = false, error = "Missing 'name' field." });
+            SendJson(clientSocket, new { ok = false, error = "Missing 'name' field." });
             return;
         }
 
         // Special: "off" renders a blank/black screen
-        string lowerName = name?.ToLowerInvariant();
+        string lowerName = name.ToLowerInvariant();
         if (lowerName == "off")
         {
             PendingShaderSource = null;  // signals render loop to skip shader rendering
             PendingShaderFileName = "Off";
             Console.WriteLine("[WebServer] Shader set to Off — blank screen.");
-            SendJson(ctx.Response, new { ok = true, shader = "Off (blank)" });
+            SendJson(clientSocket, new { ok = true, shader = "Off (blank)" });
             return;
         }
 
@@ -344,7 +468,7 @@ setInterval(refreshStatus, 2000);
         string? fullPath = null;
         foreach (var s in _shaderList)
         {
-            if (s.Name.Equals(name, StringComparison.OrdinalIgnoreCase) || s.FileName.Contains(name))
+            if (s.Name.Equals(name!, StringComparison.OrdinalIgnoreCase) || s.FileName.Contains(name!))
             {
                 fullPath = s.FileName;
                 break;
@@ -381,7 +505,7 @@ setInterval(refreshStatus, 2000);
 
         if (fullPath == null || !File.Exists(fullPath))
         {
-            SendJson(ctx.Response, new { ok = false, error = $"Shader '{name}' not found." });
+            SendJson(clientSocket, new { ok = false, error = $"Shader '{name}' not found." });
             return;
         }
 
@@ -390,13 +514,11 @@ setInterval(refreshStatus, 2000);
         PendingShaderSource = source;
         PendingShaderFileName = fileName;
         Console.WriteLine($"[WebServer] Shader changed via web: {fileName}");
-        SendJson(ctx.Response, new { ok = true, shader = Path.GetFileName(fullPath) });
+        SendJson(clientSocket, new { ok = true, shader = Path.GetFileName(fullPath) });
     }
 
-    private void ServeSetAudio(HttpListenerContext ctx)
+    private void ServeSetAudio(Socket clientSocket, string body)
     {
-        using var reader = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding);
-        string body = reader.ReadToEnd();
         var json = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object>>(body);
         bool? enabled = null;
 
@@ -412,10 +534,10 @@ setInterval(refreshStatus, 2000);
             Console.WriteLine($"[WebServer] Audio set to: {enabled}");
         }
 
-        SendJson(ctx.Response, new { ok = true, enabled = enabled ?? GetAudioEnabled!() });
+        SendJson(clientSocket, new { ok = true, enabled = enabled ?? GetAudioEnabled!() });
     }
 
-    private void ServeShaderFile(HttpListenerContext ctx, string path)
+    private void ServeShaderFile(Socket clientSocket, string path)
     {
         try
         {
@@ -427,23 +549,26 @@ setInterval(refreshStatus, 2000);
                 if (s.FileName.EndsWith(fileName, StringComparison.OrdinalIgnoreCase)) { fullPath = s.FileName; break; }
 
             if (fullPath == null || !File.Exists(fullPath))
-            { ctx.Response.StatusCode = 404; ctx.Response.ContentLength64 = 0; ctx.Response.Close(); return; }
+            {
+                SendResponse(clientSocket, 404, "", "text/plain; charset=utf-8");
+                return;
+            }
 
-            byte[] data = File.ReadAllBytes(fullPath);
-            ctx.Response.ContentType = "text/plain";
-            ctx.Response.ContentLength64 = data.Length;
-            ctx.Response.OutputStream.Write(data, 0, data.Length);
-            ctx.Response.Close();
+            string source = File.ReadAllText(fullPath);
+            SendResponse(clientSocket, 200, source, "text/plain; charset=utf-8");
         }
-        catch { ctx.Response.StatusCode = 500; ctx.Response.ContentLength64 = 0; ctx.Response.Close(); }
+        catch
+        {
+            SendResponse(clientSocket, 500, "Internal Server Error", "text/plain; charset=utf-8");
+        }
     }
 
     public void Stop()
     {
         _running = false;
         _listener?.Stop();
-        _listener?.Close();
-        _serverThread?.Join(2000);
+        _listener?.Dispose();
+        _acceptThread?.Join(2000);
         Console.WriteLine("[WebServer] Stopped.");
     }
 
@@ -463,12 +588,12 @@ setInterval(refreshStatus, 2000);
         LoadShaderList();
     }
 
-    private void ServeStatus(HttpListenerContext ctx)
+    private void ServeStatus(Socket clientSocket)
     {
         if (_statusSnapshot != null)
-            SendJson(ctx.Response, _statusSnapshot);
+            SendJson(clientSocket, _statusSnapshot);
         else
-            SendJson(ctx.Response,
+            SendJson(clientSocket,
                 new ApiStatus("—", (GetAudioEnabled != null ? GetAudioEnabled() : false), _shaderList.Count,
                     _shaderList.Where(s => s.IsAudioReactive).Select(s => s.Name!).ToArray()!, 0, 0, 0,
                     GetLoopbackDeviceName?.Invoke()));
