@@ -1,5 +1,4 @@
 using System.Runtime.InteropServices;
-using System.Linq;
 using Silk.NET.Maths;
 using Silk.NET.OpenGL;
 using Silk.NET.Windowing;
@@ -190,9 +189,9 @@ void main()
                 prog._shaderDirPath = args[++i];
             else if (args[i] == "--audio") { prog._audioEnabled = true; }
             else if ((args[i] == "--mic" || args[i] == "--microphone") && i + 1 < args.Length && int.TryParse(args[++i], out var micIdx))
-                { prog._audioSource = AudioCapture.AudioSource.Microphone; prog._audioDeviceIndex = micIdx; }
+            { prog._audioSource = AudioCapture.AudioSource.Microphone; prog._audioDeviceIndex = micIdx; }
             else if ((args[i] == "--loopback" || args[i] == "--playback") && i + 1 < args.Length && int.TryParse(args[++i], out var lbIdx))
-                { prog._audioSource = AudioCapture.AudioSource.Loopback; prog._audioDeviceIndex = lbIdx; }
+            { prog._audioSource = AudioCapture.AudioSource.Loopback; prog._audioDeviceIndex = lbIdx; }
             else if (args[i] == "--audio-device" && i + 1 < args.Length && int.TryParse(args[++i], out var devIdx))
                 prog._audioDeviceIndex = devIdx;
             else if (args[i] == "--web-port" && i + 1 < args.Length && int.TryParse(args[++i], out var wp))
@@ -388,8 +387,8 @@ void main()
                 }
             };
             _webServer.CurrentDeviceIndex = _audioDeviceIndex;
-                        _webServer.GetCurrentAudioSource = () =>
-                _audioSource == AudioCapture.AudioSource.Loopback ? "loopback" : "microphone";
+            _webServer.GetCurrentAudioSource = () =>
+    _audioSource == AudioCapture.AudioSource.Loopback ? "loopback" : "microphone";
             _webServer.Start();
         }
 
@@ -572,24 +571,13 @@ void main()
 
     private unsafe void OnRender(double deltaTime)
     {
-        if (_shaderProgram == null || _sender == null) return;
-
-        // ─── Pending shader swap from web server (main-thread GL work) ───
-        bool _isOff = false;
-        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderFileName) && _webServer.PendingShaderFileName == "Off")
-        {
-            // "Off" — blank screen, no shader rendering
-            _shaderSource = null;
-            _currentShaderFileName = "Off";
-            _webServer.PendingShaderSource = null;  // consume
-            _webServer.PendingShaderFileName = null;
-            _isOff = true;
-        }
-        else if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
+        // Check for pending shader change BEFORE null guard — when coming from "Off",
+        // _shaderProgram is null and we need to reload it before the guard would bail out.
+        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
         {
             string newSource = _webServer.PendingShaderSource!;
             string? newName = _webServer.PendingShaderFileName;
-            _webServer.PendingShaderSource = null;  // consume
+            _webServer.PendingShaderSource = null;
             _webServer.PendingShaderFileName = null;
 
             _shaderSource = newSource;
@@ -601,6 +589,23 @@ void main()
             _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
             _startTime = Environment.TickCount64 / 1000.0;
             Console.WriteLine($"[Web] Shader changed: {newName ?? "unknown"}");
+        }
+
+        if (_shaderProgram == null || _sender == null) return;
+
+        // ─── Pending shader swap from web server (main-thread GL work) ───
+        bool _isOff = false;
+        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderFileName) && _webServer.PendingShaderFileName == "Off")
+        {
+            // "Off" — blank screen, dispose shader to stop GPU rendering
+            Console.WriteLine("[Web] Shader stopped — Off (blank).");
+            _shaderProgram?.Dispose();
+            _shaderProgram = null;
+            _shaderSource = null;
+            _currentShaderFileName = "Off";
+            _webServer.PendingShaderSource = null;  // consume
+            _webServer.PendingShaderFileName = null;
+            _isOff = true;
         }
 
         // Update web server status (with live stats)
@@ -691,23 +696,13 @@ void main()
 
     private unsafe void OnRenderHeadless(double deltaTime)
     {
-        if (_shaderProgram == null || _sender == null) return;
-
-        // Check for pending shader change from web server (thread-safe polling)
-        bool _isOff = false;
-        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderFileName) && _webServer.PendingShaderFileName == "Off")
-        {
-            _shaderSource = null;
-            _currentShaderFileName = "Off";
-            _webServer.PendingShaderSource = null;  // consume
-            _webServer.PendingShaderFileName = null;
-            _isOff = true;
-        }
-        else if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
+        // Check for pending shader change BEFORE null guard — when coming from "Off",
+        // _shaderProgram is null and we need to reload it before the guard would bail out.
+        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
         {
             string newSource = _webServer.PendingShaderSource!;
             string? newName = _webServer.PendingShaderFileName;
-            _webServer.PendingShaderSource = null;  // consume
+            _webServer.PendingShaderSource = null;
             _webServer.PendingShaderFileName = null;
 
             _shaderSource = newSource;
@@ -719,6 +714,23 @@ void main()
             _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
             _startTime = Environment.TickCount64 / 1000.0;
             Console.WriteLine($"[Web] Shader changed: {newName ?? "unknown"}");
+        }
+
+        if (_shaderProgram == null || _sender == null) return;
+
+        // Check for pending shader change from web server (thread-safe polling)
+        bool _isOff = false;
+        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderFileName) && _webServer.PendingShaderFileName == "Off")
+        {
+            // "Off" — blank screen, dispose shader to stop GPU rendering
+            Console.WriteLine("[Web] Shader stopped — Off (blank).");
+            _shaderProgram?.Dispose();
+            _shaderProgram = null;
+            _shaderSource = null;
+            _currentShaderFileName = "Off";
+            _webServer.PendingShaderSource = null;  // consume
+            _webServer.PendingShaderFileName = null;
+            _isOff = true;
         }
 
         // Update web server status (with live stats)

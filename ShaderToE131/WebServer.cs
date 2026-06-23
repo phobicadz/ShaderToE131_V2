@@ -23,7 +23,7 @@ public sealed class WebServer : IDisposable
 
     public string? PendingShaderSource { get => _pendingShaderSource; set => _pendingShaderSource = value; }
     public string? PendingShaderFileName { get => _pendingShaderFileName; set => _pendingShaderFileName = value; }
-    public Func<bool>? GetAudioEnabled   { get; set; }              // current audio state
+    public Func<bool>? GetAudioEnabled { get; set; }              // current audio state
     public Action<bool>? SetAudioEnabled { get; set; }              // toggle audio on/off
     public Action<string>? SetAudioSource { get; set; }            // change audio source (microphone/loopback/off)
     public Func<string?>? GetCurrentAudioSource { get; set; }       // current audio source label
@@ -179,7 +179,8 @@ public sealed class WebServer : IDisposable
                 context.Response.StatusCode = 500;
                 context.Response.ContentLength64 = 0;
                 context.Response.Close();
-            } catch { /* already closed */ }
+            }
+            catch { /* already closed */ }
         }
     }
 
@@ -235,19 +236,10 @@ public sealed class WebServer : IDisposable
   <label for=""shaderSelect"">Shader</label>
   <select id=""shaderSelect""><option value=""off"">Off (blank)</option><option value="""" >Loading shaders…</option></select>
 
-  <div class=""toggle-row"" style=""margin-top:20px;"">
-    <div class=""toggle-switch"">
-      <input type=""checkbox"" id=""audioToggle"">
-      <span class=""toggle-slider""></span>
-    </div>
-    <label for=""audioToggle"" style=""margin-bottom:0"">Audio Reactive</label>
-  </div>
-
-  <button class=""primary"" id=""applyBtn"">Apply &amp; Restart Shader</button>
+  <button class=""primary"" id=""applyBtn"" style=""margin-top:12px"">Apply &amp; Restart Shader</button>
 
   <div class=""status-grid"">
     <div class=""status-item""><div class=""status-label"">Shader</div><div class=""status-value"" id=""stShader"">—</div></div>
-    <div class=""status-item""><div class=""status-label"">Audio</div><div class=""status-value"" id=""stAudio"">—</div></div>
     <div class=""status-item""><div class=""status-label"">Shaders</div><div class=""status-value"" id=""stCount"">0</div></div>
     <div class=""status-item""><div class=""status-label"">Uptime</div><div class=""status-value"" id=""stUptime"">—</div></div>
   </div>
@@ -257,7 +249,6 @@ public sealed class WebServer : IDisposable
 
 <script>
 const API = '';
-let audioReactiveNames = [];
 
 async function loadShaders() {
   try {
@@ -265,7 +256,6 @@ async function loadShaders() {
     const data = await r.json();
     const sel = document.getElementById('shaderSelect');
     sel.innerHTML = '<option value=""off"">Off (blank)</option><option value="""" >— select shader —</option>';
-    audioReactiveNames = (data.audioReactive || []).map(s => s.toLowerCase());
     for (const s of data.shaders) {
       const opt = document.createElement('option');
       opt.value = s.name;
@@ -277,11 +267,9 @@ async function loadShaders() {
 
 async function apply() {
   const shaderName = document.getElementById('shaderSelect').value;
-  const audioOn = document.getElementById('audioToggle').checked;
   if (!shaderName) return alert('Please select a shader.');
   try {
     await fetch(API + 'api/select-shader', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:shaderName}) });
-    await fetch(API + 'api/set-audio',   { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled:audioOn}) });
     document.getElementById('applyBtn').textContent = '✓ Applied!';
     setTimeout(() => document.getElementById('applyBtn').textContent = 'Apply & Restart Shader', 1500);
   } catch(e) { alert('Failed to apply changes.'); console.error(e); }
@@ -292,7 +280,6 @@ async function refreshStatus() {
     const r = await fetch(API + 'api/status');
     const d = await r.json();
     document.getElementById('stShader').textContent = d.selectedShader || '—';
-    document.getElementById('stAudio').innerHTML = d.audioEnabled ? '<span style=color:#2ea043>ON</span>' : 'OFF';
     document.getElementById('stCount').textContent = d.totalShaders;
     const s = Math.floor(d.uptimeSecs);
     const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
@@ -475,7 +462,7 @@ setInterval(refreshStatus, 2000);
         else
             SendJson(ctx.Response,
                 new ApiStatus("—", (GetAudioEnabled != null ? GetAudioEnabled() : false), _shaderList.Count,
-                    _shaderList.Where(s => s.IsAudioReactive).Select(s=>s.Name!).ToArray()!, 0, 0, 0));
+                    _shaderList.Where(s => s.IsAudioReactive).Select(s => s.Name!).ToArray()!, 0, 0, 0));
     }
 
     public void Dispose() => Stop();
