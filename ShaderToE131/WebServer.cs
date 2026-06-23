@@ -29,6 +29,7 @@ public sealed class WebServer : IDisposable
     public Func<string?>? GetCurrentAudioSource { get; set; }       // current audio source label
     public int CurrentDeviceIndex { get; set; }                     // currently selected audio device index
     public Action<int>? SetDeviceIndex { get; set; }                // change audio device index via web
+    public Func<string?>? GetLoopbackDeviceName { get; set; }       // current loopback device friendly name
 
     private readonly List<ShaderInfo> _shaderList = new();
     internal IReadOnlyList<ShaderInfo> Shaders => _shaderList;
@@ -42,7 +43,8 @@ public sealed class WebServer : IDisposable
         string[] AudioReactiveNames,
         double UptimeSecs,
         int FramesSent,
-        int SendErrors
+        int SendErrors,
+        string? LoopbackDeviceName
     );
 
     private static readonly JsonSerializerOptions JsonCamelCase = new()
@@ -241,6 +243,7 @@ public sealed class WebServer : IDisposable
   <div class=""status-grid"">
     <div class=""status-item""><div class=""status-label"">Shader</div><div class=""status-value"" id=""stShader"">—</div></div>
     <div class=""status-item""><div class=""status-label"">Shaders</div><div class=""status-value"" id=""stCount"">0</div></div>
+    <div class=""status-item""><div class=""status-label"">Loopback Device</div><div class=""status-value"" id=""stLoopback"">—</div></div>
     <div class=""status-item""><div class=""status-label"">Uptime</div><div class=""status-value"" id=""stUptime"">—</div></div>
   </div>
 
@@ -281,6 +284,7 @@ async function refreshStatus() {
     const d = await r.json();
     document.getElementById('stShader').textContent = d.selectedShader || '—';
     document.getElementById('stCount').textContent = d.totalShaders;
+    document.getElementById('stLoopback').textContent = d.loopbackDeviceName || '—';
     const s = Math.floor(d.uptimeSecs);
     const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
     document.getElementById('stUptime').textContent = `${h}h ${m.toString().padStart(2,'0')}m ${sec}s`;
@@ -462,7 +466,8 @@ setInterval(refreshStatus, 2000);
         else
             SendJson(ctx.Response,
                 new ApiStatus("—", (GetAudioEnabled != null ? GetAudioEnabled() : false), _shaderList.Count,
-                    _shaderList.Where(s => s.IsAudioReactive).Select(s => s.Name!).ToArray()!, 0, 0, 0));
+                    _shaderList.Where(s => s.IsAudioReactive).Select(s => s.Name!).ToArray()!, 0, 0, 0,
+                    GetLoopbackDeviceName?.Invoke()));
     }
 
     public void Dispose() => Stop();

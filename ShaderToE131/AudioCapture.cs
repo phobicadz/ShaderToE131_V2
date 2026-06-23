@@ -53,6 +53,7 @@ public sealed class AudioCapture : IDisposable
     private readonly ConcurrentQueue<short[]> _fftBuffers = new();
     private volatile bool _isRunning = false;
     private readonly float[] _smoothedBands = new float[_bands.Length + 1]; // +1 for volume
+    private string? _loopbackDeviceName;
     // Lower smoothing (0.15) gives faster transient response; higher (0.3+) is smoother but slower to react.
     // With per-band peak normalization, we need snappier response for visual reactivity.
     private const float SmoothingFactor = 0.35f;
@@ -157,6 +158,15 @@ public sealed class AudioCapture : IDisposable
         _loopback = new WasapiLoopbackCapture(loopbackDevice);
         _loopback.WaveFormat = new NAudio.Wave.WaveFormat(SampleRate, Channels);
         _loopback.DataAvailable += OnDataAvailable;
+        _loopbackDeviceName = loopbackDevice.FriendlyName;
+    }
+
+    /// <summary>
+    /// Get the friendly name of the current loopback device, or null if not using loopback.
+    /// </summary>
+    public string? GetCurrentLoopbackDeviceName()
+    {
+        return _loopbackDeviceName;
     }
 
     /// <summary>

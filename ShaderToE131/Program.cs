@@ -389,6 +389,10 @@ void main()
             _webServer.CurrentDeviceIndex = _audioDeviceIndex;
             _webServer.GetCurrentAudioSource = () =>
     _audioSource == AudioCapture.AudioSource.Loopback ? "loopback" : "microphone";
+            _webServer.GetLoopbackDeviceName = () =>
+    (_audioSource == AudioCapture.AudioSource.Loopback && _audioCapture != null)
+        ? _audioCapture.GetCurrentLoopbackDeviceName()
+        : null;
             _webServer.Start();
         }
 
@@ -627,7 +631,8 @@ void main()
                 audioNames,
                 (Environment.TickCount64 - _webStartMs) / 1000.0,
                 _framesSent,
-                _sendErrors
+                _sendErrors,
+                _audioCapture?.GetCurrentLoopbackDeviceName()
             );
         }
 
@@ -752,7 +757,8 @@ void main()
                 audioNames,
                 (Environment.TickCount64 - _webStartMs) / 1000.0,
                 _framesSent,
-                _sendErrors
+                _sendErrors,
+                _audioCapture?.GetCurrentLoopbackDeviceName()
             );
         }
 
