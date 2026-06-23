@@ -31,6 +31,7 @@ class Program : IDisposable
     private int _audioDeviceIndex = 0;
     private AudioCapture? _audioCapture;
     private int _webPort = 8080;
+    private string _webBindAddress = "localhost";
     private WebServer? _webServer;
     private string? _resolvedShaderDir;
 
@@ -196,6 +197,8 @@ void main()
                 prog._audioDeviceIndex = devIdx;
             else if (args[i] == "--web-port" && i + 1 < args.Length && int.TryParse(args[++i], out var wp))
                 prog._webPort = wp;
+            else if (args[i] == "--bind-address" && i + 1 < args.Length)
+                prog._webBindAddress = args[++i];
         }
 
         // Show available audio devices when --help, -h, or --list-devices is passed
@@ -213,8 +216,9 @@ void main()
             Console.WriteLine("  --mic <idx>          Use microphone at given index (default: 0)");
             Console.WriteLine("  --loopback [idx]     Capture system playback output (default: 0 = default speakers)");
             Console.WriteLine("  --audio-device <idx> Fallback device index for either source");
-            Console.WriteLine("  --web-port <port>    Start web control panel on given port (default: 8080)");
-            Console.WriteLine("  --list-devices       List available audio input devices and exit");
+            Console.WriteLine("  --web-port <port>      Start web control panel on given port (default: 8080)");
+            Console.WriteLine("  --bind-address <addr>  Bind address for web server (default: localhost, use 0.0.0.0 or + for all interfaces)");
+            Console.WriteLine("  --list-devices         List available audio input devices and exit");
             Console.WriteLine();
             return;
         }
@@ -332,7 +336,7 @@ void main()
         // Start web control panel (use --web-port 0 to disable)
         if (_webPort > 0)
         {
-            _webServer = new WebServer(_webPort, resolvedShaderDir);
+            _webServer = new WebServer(_webPort, resolvedShaderDir, _webBindAddress);
             _webServer.GetAudioEnabled = () => _audioEnabled;
             _webServer.SetAudioEnabled = enabled =>
             {

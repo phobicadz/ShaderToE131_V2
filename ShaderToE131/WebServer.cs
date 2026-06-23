@@ -12,6 +12,7 @@ public sealed class WebServer : IDisposable
 {
     private readonly int _port;
     private readonly string _shaderDirPath;
+    private readonly string _bindAddress;
     private HttpListener? _listener;
     private Thread? _serverThread;
     private volatile bool _running = false;
@@ -53,10 +54,11 @@ public sealed class WebServer : IDisposable
         DefaultIgnoreCondition = JsonIgnoreCondition.Never,
     };
 
-    public WebServer(int port, string shaderDirPath)
+    public WebServer(int port, string shaderDirPath, string bindAddress = "localhost")
     {
         _port = port;
         _shaderDirPath = Path.IsPathRooted(shaderDirPath) ? shaderDirPath : Path.Combine(Directory.GetCurrentDirectory(), shaderDirPath);
+        _bindAddress = bindAddress;
         LoadShaderList();
     }
 
@@ -88,7 +90,9 @@ public sealed class WebServer : IDisposable
     public void Start()
     {
         _running = true;
-        var url = $"http://localhost:{_port}/";
+        // "+" or "0.0.0.0" → bind all interfaces; otherwise use the specific address
+        string prefixAddr = (_bindAddress == "+" || _bindAddress == "0.0.0.0") ? "+" : _bindAddress;
+        var url = $"http://{prefixAddr}:{_port}/";
         try
         {
             _listener = new HttpListener();
