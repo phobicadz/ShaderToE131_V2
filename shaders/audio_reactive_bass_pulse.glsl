@@ -16,6 +16,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     float baseRadius = 0.08 + u_bass * 0.15;
 
     float pixel = 0.;
+    vec3 col = vec3(1.0);
     for (int i = 0; i < 16; i++)
     {
         if (float(i) > numCircles) break;
@@ -25,7 +26,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
 
         // Mid frequencies shift the color hue
         float hue = fract(u_mid * 3.0 + iTime / 10.0);
-        vec3 col = HSVtoRGB(vec3(hue, 0.8, 0.9));
+        col = HSVtoRGB(vec3(hue, 0.8, 0.9));
 
         pixel += GetCircle(uv, pos, baseRadius) * (0.5 + u_treble * 0.5);
     }

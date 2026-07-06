@@ -32,6 +32,8 @@ public sealed class WebServer : IDisposable
     public int CurrentDeviceIndex { get; set; }                     // currently selected audio device index
     public Action<int>? SetDeviceIndex { get; set; }                // change audio device index via web
     public Func<string?>? GetLoopbackDeviceName { get; set; }       // current loopback device friendly name
+    public Action<int>? SetAudioDeviceIndex { get; set; }         // change audio device index via web
+    public Func<List<(int Index, string Name)>>? GetAvailableDevices { get; set; }  // list available devices for selection UI
 
     private readonly List<ShaderInfo> _shaderList = new();
     internal IReadOnlyList<ShaderInfo> Shaders => _shaderList;
@@ -46,7 +48,8 @@ public sealed class WebServer : IDisposable
         double UptimeSecs,
         int FramesSent,
         int SendErrors,
-        string? LoopbackDeviceName
+        string? LoopbackDeviceName,
+        List<(int Index, string Name)> AvailableDevices
     );
 
     private static readonly JsonSerializerOptions JsonCamelCase = new()
@@ -262,6 +265,14 @@ public sealed class WebServer : IDisposable
                     if (method == "POST") ServeSetAudio(clientSocket, body);
                     else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
                     break;
+                case "/api/audio-devices":
+                    if (method == "GET") ServeGetAudioDevices(clientSocket);
+                    else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
+                    break;
+                case "/api/set-audio-device":
+                    if (method == "POST") ServeSetAudioDevice(clientSocket, body);
+                    else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
+                    break;
                 case "/api/status":
                     if (method == "GET") ServeStatus(clientSocket);
                     else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
@@ -373,10 +384,12 @@ public sealed class WebServer : IDisposable
 
   <button class=""primary"" id=""applyBtn"" style=""margin-top:12px"">Apply &amp; Restart Shader</button>
 
+  <label for=""audioDeviceSelect"">Loopback Device</label>
+  <select id=""audioDeviceSelect""><option value=""-1"">Loading devices…</option></select>
+
   <div class=""status-grid"">
     <div class=""status-item""><div class=""status-label"">Shader</div><div class=""status-value"" id=""stShader"">—</div></div>
     <div class=""status-item""><div class=""status-label"">Shaders</div><div class=""status-value"" id=""stCount"">0</div></div>
-    <div class=""status-item""><div class=""status-label"">Loopback Device</div><div class=""status-value"" id=""stLoopback"">—</div></div>
 
     <div class=""status-item""><div class=""status-label"">Uptime</div><div class=""status-value"" id=""stUptime"">—</div></div>
   </div>
@@ -386,6 +399,24 @@ public sealed class WebServer : IDisposable
 
 <script>
 const API = '';
+
+function ensureCurrentDeviceElement() {
+    let curDeviceEl = document.getElementById('stCurDevice');
+    if (!curDeviceEl) {
+        const devDiv = document.createElement('div');
+        devDiv.className = 'status-item';
+        devDiv.innerHTML = '<div class=""status-label"">Current Device</div><div class=""status-value"" id=""stCurDevice""></div>';
+        document.querySelector('.status-grid').appendChild(devDiv);
+        curDeviceEl = document.getElementById('stCurDevice');
+    }
+    return curDeviceEl;
+}
+
+function setCurrentDeviceText(name) {
+    const curDeviceEl = ensureCurrentDeviceElement();
+    const text = (name && name.length > 25) ? (name.substring(0, 23) + '..') : (name || '');
+    curDeviceEl.textContent = text;
+}
 
 async function loadShaders() {
   try {
@@ -412,21 +443,57 @@ async function apply() {
   } catch(e) { alert('Failed to apply changes.'); console.error(e); }
 }
 
+async function loadDevices() {
+  try {
+    const r = await fetch(API + 'api/audio-devices');
+    const data = await r.json();
+    const sel = document.getElementById('audioDeviceSelect');
+    // Clear existing options first
+    sel.innerHTML = '';
+    if (!data.devices || data.devices.length === 0) {
+      sel.innerHTML = '<option value=""-1"">No loopback devices found</option>';
+      return;
+    }
+    for (const dev of data.devices) {
+      const opt = document.createElement('option');
+      opt.value = dev.index;
+      opt.textContent = `${dev.name}`;
+      sel.appendChild(opt);
+    }
+  } catch(e) { console.error('Failed to load audio devices', e); }
+}
+
 async function refreshStatus() {
   try {
     const r = await fetch(API + 'api/status');
     const d = await r.json();
     document.getElementById('stShader').textContent = d.selectedShader || '—';
     document.getElementById('stCount').textContent = d.totalShaders;
-    document.getElementById('stLoopback').textContent = d.loopbackDeviceName || '—';
+        setCurrentDeviceText(d.loopbackDeviceName || '');
+    
     const s = Math.floor(d.uptimeSecs);
     const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
     document.getElementById('stUptime').textContent = `${h}h ${m.toString().padStart(2,'0')}m ${sec}s`;
   } catch(e) { /* ignore transient errors */ }
 }
 
+// Device selection handler
+document.getElementById('audioDeviceSelect')?.addEventListener('change', async (e) => {
+  const idx = parseInt(e.target.value);
+  if (!isNaN(idx)) {
+    try {
+      await fetch(API + 'api/set-audio-device', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({deviceIndex:idx}) });
+            const selectedText = e.target.options[e.target.selectedIndex]?.text || '';
+            setCurrentDeviceText(selectedText);
+      // Refresh status to show new device
+      refreshStatus();
+    } catch(err) { console.error('Failed to change audio device', err); }
+  }
+});
+
 document.getElementById('applyBtn').addEventListener('click', apply);
 loadShaders();
+loadDevices();
 refreshStatus();
 setInterval(refreshStatus, 2000);
 </script>
@@ -526,6 +593,15 @@ setInterval(refreshStatus, 2000);
         {
             if (val is bool b) enabled = b;
             else if (val is string s && bool.TryParse(s, out bool pb)) enabled = pb;
+            else if (val is JsonElement je)
+            {
+                if (je.ValueKind == JsonValueKind.True || je.ValueKind == JsonValueKind.False)
+                    enabled = je.GetBoolean();
+                else if (je.ValueKind == JsonValueKind.String && bool.TryParse(je.GetString(), out bool pje))
+                    enabled = pje;
+                else if (je.ValueKind == JsonValueKind.Number && je.TryGetInt32(out int num))
+                    enabled = num != 0;
+            }
         }
 
         if (enabled.HasValue)
@@ -537,6 +613,39 @@ setInterval(refreshStatus, 2000);
         SendJson(clientSocket, new { ok = true, enabled = enabled ?? GetAudioEnabled!() });
     }
 
+    private void ServeGetAudioDevices(Socket clientSocket)
+    {
+        var devicesRaw = GetAvailableDevices?.Invoke() ?? new List<(int Index, string Name)>();
+
+        var devices = devicesRaw.Select(d => new { Index = d.Index, Name = d.Name }).ToList();
+        SendJson(clientSocket, new { devices = devices });
+    }
+    private void ServeSetAudioDevice(Socket clientSocket, string body)
+    {
+        var json = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object>>(body);
+        int? deviceIndex = null;
+
+        if (json?.TryGetValue("deviceIndex", out var val) == true)
+        {
+            if (val is int i) deviceIndex = i;
+            else if (val is string s && int.TryParse(s, out int pi)) deviceIndex = pi;
+            else if (val is JsonElement je)
+            {
+                if (je.ValueKind == JsonValueKind.Number && je.TryGetInt32(out int pje))
+                    deviceIndex = pje;
+                else if (je.ValueKind == JsonValueKind.String && int.TryParse(je.GetString(), out int ps))
+                    deviceIndex = ps;
+            }
+        }
+
+        if (deviceIndex.HasValue)
+        {
+            SetAudioDeviceIndex?.Invoke(deviceIndex.Value);
+            Console.WriteLine($"[WebServer] Audio device index set to: {deviceIndex}");
+        }
+
+        SendJson(clientSocket, new { ok = true, deviceIndex = deviceIndex ?? CurrentDeviceIndex });
+    }
     private void ServeShaderFile(Socket clientSocket, string path)
     {
         try
@@ -591,12 +700,34 @@ setInterval(refreshStatus, 2000);
     private void ServeStatus(Socket clientSocket)
     {
         if (_statusSnapshot != null)
-            SendJson(clientSocket, _statusSnapshot);
+        {
+            var snap = _statusSnapshot;
+            var devicesRaw = GetAvailableDevices?.Invoke() ?? snap!.AvailableDevices;
+            var devices = devicesRaw.Select(d => new { Index = d.Index, Name = d.Name }).ToList();
+            var loopbackName = GetLoopbackDeviceName?.Invoke() ?? snap!.LoopbackDeviceName;
+
+            SendJson(clientSocket, new
+            {
+                snap!.SelectedShader,
+                snap.AudioEnabled,
+                snap.TotalShaders,
+                snap.AudioReactiveNames,
+                snap.UptimeSecs,
+                snap.FramesSent,
+                snap.SendErrors,
+                LoopbackDeviceName = loopbackName,
+                AvailableDevices = devices
+            });
+        }
         else
+        {
+            var devicesRaw = GetAvailableDevices?.Invoke() ?? new List<(int Index, string Name)>();
+            var devices = devicesRaw.Select(d => new { Index = d.Index, Name = d.Name }).ToList();
             SendJson(clientSocket,
                 new ApiStatus("—", (GetAudioEnabled != null ? GetAudioEnabled() : false), _shaderList.Count,
                     _shaderList.Where(s => s.IsAudioReactive).Select(s => s.Name!).ToArray()!, 0, 0, 0,
-                    GetLoopbackDeviceName?.Invoke()));
+                    GetLoopbackDeviceName?.Invoke(), devicesRaw));
+        }
     }
 
     public void Dispose() => Stop();

@@ -93,6 +93,29 @@ public sealed class AudioCapture : IDisposable
     }
 
     /// <summary>
+    /// Initialize loopback capture by matching friendly device name.
+    /// Returns null when no active render endpoint matches.
+    /// </summary>
+    public static AudioCapture? CreateLoopbackByName(string? deviceName)
+    {
+        if (string.IsNullOrWhiteSpace(deviceName))
+            return Create(AudioSource.Loopback, 0);
+
+        var enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
+        var renderDevices = enumerator.EnumerateAudioEndPoints(NAudio.CoreAudioApi.DataFlow.Render, NAudio.CoreAudioApi.DeviceState.Active).ToList();
+        if (renderDevices.Count == 0)
+            return null;
+
+        var match = renderDevices.FirstOrDefault(d =>
+            d.FriendlyName.Equals(deviceName, StringComparison.OrdinalIgnoreCase));
+
+        if (match == null)
+            return null;
+
+        return new AudioCapture(AudioSource.Loopback, loopbackDevice: match);
+    }
+
+    /// <summary>
     /// List all available microphone input devices.
     /// </summary>
     public static IEnumerable<(int index, string name)> ListMicrophones()
@@ -107,7 +130,7 @@ public sealed class AudioCapture : IDisposable
     /// <summary>
     /// List all available render (speaker/headphone) endpoints for loopback capture.
     /// </summary>
-    public static IEnumerable<(int index, string name)> ListLoopbackDevices()
+    public static IEnumerable<(int Index, string Name)> ListLoopbackDevices()
     {
         var enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
         int i = 0;

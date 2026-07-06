@@ -10,7 +10,7 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord )
 {
     const int zoom = 40;
     const float brightness = 0.975;
-	float time = iTime * 1.25;
+	float time = iTime * 0.20; // Reduced from 1.25 for slower animation
 	vec2 uv = fragCoord.xy / iResolution.xy;
 	vec2 p  = (2.0*fragCoord.xy-iResolution.xy)/max(iResolution.x,iResolution.y);
 	float ct = cosRange(time*5.0, 3.0, 1.1);

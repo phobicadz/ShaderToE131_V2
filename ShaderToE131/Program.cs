@@ -30,6 +30,7 @@ class Program : IDisposable
     private AudioCapture.AudioSource _audioSource = AudioCapture.AudioSource.Microphone;
     private int _audioDeviceIndex = 0;
     private AudioCapture? _audioCapture;
+    private string? _selectedLoopbackDeviceName;
     private int _webPort = 8080;
     private string _webBindAddress = "0.0.0.0";
     private WebServer? _webServer;
@@ -366,6 +367,9 @@ void main()
                 else if (lower == "loopback")
                 {
                     _audioSource = AudioCapture.AudioSource.Loopback;
+                    var devices = AudioCapture.ListLoopbackDevices().ToList();
+                    if (_audioDeviceIndex >= 0 && _audioDeviceIndex < devices.Count)
+                        _selectedLoopbackDeviceName = devices[_audioDeviceIndex].Name;
                 }
                 else
                 {
@@ -394,9 +398,38 @@ void main()
             _webServer.GetCurrentAudioSource = () =>
     _audioSource == AudioCapture.AudioSource.Loopback ? "loopback" : "microphone";
             _webServer.GetLoopbackDeviceName = () =>
-    (_audioSource == AudioCapture.AudioSource.Loopback && _audioCapture != null)
-        ? _audioCapture.GetCurrentLoopbackDeviceName()
+    (_audioSource == AudioCapture.AudioSource.Loopback)
+        ? (_audioCapture?.GetCurrentLoopbackDeviceName() ?? _selectedLoopbackDeviceName)
         : null;
+            _webServer.GetAvailableDevices = () => AudioCapture.ListLoopbackDevices().ToList();
+            _webServer.SetAudioDeviceIndex = idx =>
+            {
+                _audioSource = AudioCapture.AudioSource.Loopback;
+                _audioDeviceIndex = idx;
+                _webServer.CurrentDeviceIndex = idx;
+
+                var listedDevices = AudioCapture.ListLoopbackDevices().ToList();
+                if (idx >= 0 && idx < listedDevices.Count)
+                    _selectedLoopbackDeviceName = listedDevices[idx].Name;
+
+                bool wasRunning = _audioEnabled && _audioCapture != null;
+                if (wasRunning) { _audioCapture.Dispose(); _audioCapture = null; }
+
+                if (_audioEnabled)
+                {
+                    if (!string.IsNullOrWhiteSpace(_selectedLoopbackDeviceName))
+                    {
+                        _audioCapture = AudioCapture.CreateLoopbackByName(_selectedLoopbackDeviceName)
+                            ?? AudioCapture.Create(AudioCapture.AudioSource.Loopback, idx);
+                        if (_audioCapture != null)
+                        {
+                            _audioCapture.Start();
+                            _selectedLoopbackDeviceName = _audioCapture.GetCurrentLoopbackDeviceName() ?? _selectedLoopbackDeviceName;
+                            Console.WriteLine($"Loopback device index changed via web to {idx} ({_selectedLoopbackDeviceName}).");
+                        }
+                    }
+                }
+            };
             _webServer.Start();
         }
 
@@ -415,6 +448,8 @@ void main()
             if (_audioCapture != null)
             {
                 _audioCapture.Start();
+                if (_audioSource == AudioCapture.AudioSource.Loopback)
+                    _selectedLoopbackDeviceName = _audioCapture.GetCurrentLoopbackDeviceName();
                 Console.WriteLine($"Audio capture active ({sourceLabel}, device={_audioDeviceIndex}). Shader uniforms: u_bass, u_lowmid, u_mid, u_highmid, u_treble, u_volume.");
             }
             else
@@ -597,6 +632,35 @@ void main()
             _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
             _startTime = Environment.TickCount64 / 1000.0;
             Console.WriteLine($"[Web] Shader changed: {newName ?? "unknown"}");
+
+            // Reinitialize audio capture with current loopback device index if enabled
+            if (_audioEnabled && _audioSource == AudioCapture.AudioSource.Loopback)
+            {
+                try
+                {
+                    Console.WriteLine($"[Web] Shader reload: disposing old audio, reinitializing with deviceIndex={_audioDeviceIndex}");
+                    if (_audioCapture != null)
+                    {
+                        _audioCapture.Dispose();
+                        Console.WriteLine("[Web] Old audio capture disposed.");
+                    }
+                    var newAudio = AudioCapture.Create(AudioCapture.AudioSource.Loopback, _audioDeviceIndex);
+                    if (newAudio != null)
+                    {
+                        newAudio.Start();
+                        _audioCapture = newAudio;
+                        Console.WriteLine($"[Web] Reinitialized audio capture with device index={_audioDeviceIndex}, name='{newAudio.GetCurrentLoopbackDeviceName() ?? "unknown"}'");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[WARN] AudioCapture.Create returned null for deviceIndex={_audioDeviceIndex}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ERROR] Failed to reinitialize audio: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
         }
 
         if (_shaderProgram == null || _sender == null) return;
@@ -636,7 +700,8 @@ void main()
                 (Environment.TickCount64 - _webStartMs) / 1000.0,
                 _framesSent,
                 _sendErrors,
-                _audioCapture?.GetCurrentLoopbackDeviceName()
+                (_audioCapture?.GetCurrentLoopbackDeviceName() ?? (_audioSource == AudioCapture.AudioSource.Loopback ? _selectedLoopbackDeviceName : null)),
+                []
             );
         }
 
@@ -701,8 +766,6 @@ void main()
         DrawPreview();
     }
 
-
-
     private unsafe void OnRenderHeadless(double deltaTime)
     {
         // Check for pending shader change BEFORE null guard — when coming from "Off",
@@ -762,7 +825,8 @@ void main()
                 (Environment.TickCount64 - _webStartMs) / 1000.0,
                 _framesSent,
                 _sendErrors,
-                _audioCapture?.GetCurrentLoopbackDeviceName()
+                (_audioCapture?.GetCurrentLoopbackDeviceName() ?? (_audioSource == AudioCapture.AudioSource.Loopback ? _selectedLoopbackDeviceName : null)),
+                []
             );
         }
 
