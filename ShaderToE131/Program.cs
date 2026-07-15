@@ -417,16 +417,22 @@ void main()
 
                 if (_audioEnabled)
                 {
+                    // Always create a fresh capture with the requested device index.
+                    AudioCapture? newCapture = null;
                     if (!string.IsNullOrWhiteSpace(_selectedLoopbackDeviceName))
+                        newCapture = AudioCapture.CreateLoopbackByName(_selectedLoopbackDeviceName);
+                    if (newCapture == null)
+                        newCapture = AudioCapture.Create(AudioCapture.AudioSource.Loopback, idx);
+
+                    _audioCapture = newCapture;
+                    if (_audioCapture != null)
                     {
-                        _audioCapture = AudioCapture.CreateLoopbackByName(_selectedLoopbackDeviceName)
-                            ?? AudioCapture.Create(AudioCapture.AudioSource.Loopback, idx);
-                        if (_audioCapture != null)
-                        {
-                            _audioCapture.Start();
-                            _selectedLoopbackDeviceName = _audioCapture.GetCurrentLoopbackDeviceName() ?? _selectedLoopbackDeviceName;
-                            Console.WriteLine($"Loopback device index changed via web to {idx} ({_selectedLoopbackDeviceName}).");
-                        }
+                        _audioCapture.Start();
+                        var actualName = _audioCapture.GetCurrentLoopbackDeviceName() ?? _selectedLoopbackDeviceName;
+                        Console.WriteLine($"Loopback device index changed via web to {idx} ({actualName}).");
+                        // Persist the actual name in case CreateLoopbackByName picked a different one.
+                        if (!string.IsNullOrWhiteSpace(actualName))
+                            _selectedLoopbackDeviceName = actualName;
                     }
                 }
             };
@@ -531,7 +537,7 @@ void main()
         }
 
         string fragShader = BuildFragmentShader(_shaderSource!);
-        _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!);
+        _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
         Console.WriteLine("Shader program created.");
         // Disable VSync via wglSwapIntervalEXT
         try
@@ -608,7 +614,7 @@ void main()
         catch { /* VSync already off or extension not available */ }
 
         string fragShader = BuildFragmentShader(_shaderSource);
-        _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!);
+        _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
         Console.WriteLine("Shader program created.");
     }
 

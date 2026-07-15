@@ -21,12 +21,17 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord )
     positions[5] = vec3(tan(Time * 1.1) * 1.2, cos(iTime * 1.3) * 0.2, 0.15);
     positions[6] = vec3(tan(Time * 1.7) * 1.4, cos(iTime * 2.4) * 0.3, 0.11);
     positions[7] = vec3(tan(Time * 2.8) * 1.5, cos(iTime * 1.1) * 0.4, 0.21);
+	// Scale bubble radii based on bass level for audio reactivity.
+    float radiusScale = mix(1.0, 2.5 + u_bass*3.0, 0.4);
 
     for	(int i = 0; i < 8; i++)
-        pixel += GetCircle(uv, positions[i].xy, positions[i].z);
+        pixel += GetCircle(uv, positions[i].xy, positions[i].z * radiusScale);
 
     pixel = smoothstep(.8, 1., pixel) * smoothstep(1.5, .9, pixel);
 
     vec3 col = 0.5 + 0.5*cos(iTime+uv.xyx+vec3(0,2,4));
+    // Modulate brightness with overall volume for more responsive look.
+    float volMod = clamp(u_volume * 1.8, 0., 1.);
+    col *= volMod;
     fragColor = vec4(vec3(pixel) * col, 1.0);
 }
