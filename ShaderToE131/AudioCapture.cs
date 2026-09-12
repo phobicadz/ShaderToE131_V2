@@ -320,9 +320,9 @@ public sealed class AudioCapture : IDisposable
 
             // Use as much data as we need for a full FFT, or the whole buffer
             int fftLen = Math.Min(FftSize, pcm.Length);
-            float[] magnitudes = ComputeFftMagnitudes(pcm, fftLen);
+            ReadOnlySpan<float> magnitudes = ComputeFftMagnitudes(pcm, fftLen);
 
-            if (magnitudes != null && magnitudes.Length > 0)
+            if (magnitudes.Length > 0)
             {
                 AccumulateBands(magnitudes, SampleRate, ref rawBands);
                 processedCount++;
@@ -381,16 +381,18 @@ public sealed class AudioCapture : IDisposable
     }
 
     /// <summary>
-    /// Apply a Hamming window and compute FFT, returning magnitude values for the first half of bins.
+    /// Apply a Hamming window and compute FFT, returning a view of exactly the
+    /// current bin count (pow2/2) of magnitude values. Returns an empty span
+    /// when the input is too small for a useful FFT.
     /// </summary>
-    private float[]? ComputeFftMagnitudes(short[] pcm, int fftLen)
+    private ReadOnlySpan<float> ComputeFftMagnitudes(short[] pcm, int fftLen)
     {
-        if (fftLen == 0 || fftLen > FftSize) return null;
+        if (fftLen == 0 || fftLen > FftSize) return default;
 
         // Round down to nearest power of 2 for NAudio FFT requirement
         int pow2 = 1;
         while (pow2 * 2 <= fftLen) pow2 *= 2;
-        if (pow2 < 64) return null; // minimum useful FFT size is 64
+        if (pow2 < 64) return default; // minimum useful FFT size is 64
 
         // Reuse the FFT buffer, growing it only if needed.
         if (_fftComplex.Length < pow2)
@@ -421,14 +423,17 @@ public sealed class AudioCapture : IDisposable
             magnitudes[i] = (float)Math.Sqrt(fftComplex[i].X * fftComplex[i].X + fftComplex[i].Y * fftComplex[i].Y);
         }
 
-        return magnitudes;
+        // Return only the valid bins, never the (possibly larger) backing buffer,
+        // so consumers derive frequency resolution from the current FFT size.
+        return magnitudes.AsSpan(0, numBins);
     }
 
     /// <summary>
     /// Map FFT bin magnitudes to spectral bands based on frequency resolution.
     /// Each magnitude bin i corresponds to freq = i * sampleRate / (2 * numBins).
+    /// The span length is the current FFT's bin count (pow2/2).
     /// </summary>
-    private static void AccumulateBands(float[] magnitudes, int sampleRate, ref float[] bandAccum)
+    private static void AccumulateBands(ReadOnlySpan<float> magnitudes, int sampleRate, ref float[] bandAccum)
     {
         // magnitudes has pow2/2 entries; each bin spans sampleRate/pow2 Hz
         double freqPerBin = (double)sampleRate / (magnitudes.Length * 2);
