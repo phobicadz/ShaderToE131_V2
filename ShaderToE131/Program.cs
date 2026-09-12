@@ -49,13 +49,23 @@ class Program : IDisposable
     private int _framesSent;
     private int _sendErrors;
 
+    private static readonly string[] AudioUniformNames =
+        { "u_bass", "u_lowmid", "u_mid", "u_highmid", "u_treble", "u_volume" };
+
     /// <summary>
-    /// Audio-reactive uniform declarations injected when --audio is enabled.
+    /// Returns the audio uniform declarations missing from <paramref name="source"/>,
+    /// joined by newlines (empty string if none are missing).
     /// </summary>
-    private const string AudioUniformsBlock =
-        "\nuniform float u_bass;\nuniform float u_lowmid;\n"
-      + "uniform float u_mid;\nuniform float u_highmid;\n"
-      + "uniform float u_treble;\nuniform float u_volume;";
+    private static string GetMissingAudioUniforms(string source)
+    {
+        var missing = new List<string>();
+        foreach (string name in AudioUniformNames)
+        {
+            if (!source.Contains($"uniform float {name};"))
+                missing.Add($"uniform float {name};");
+        }
+        return string.Join("\n", missing);
+    }
 
     /// <summary>
     /// Build the final GLSL fragment shader source.
@@ -76,16 +86,21 @@ class Program : IDisposable
         {
             // Complete GLSL fragment shader — inject audio uniforms if needed, then replace {AR}
             string result = rawSource;
-            if (_audioEnabled && !result.Contains("uniform float u_bass;"))
+            if (_audioEnabled)
             {
-                // Inject after the 'out vec4 FragColor' line (with semicolon)
-                string injectPoint = "out vec4 FragColor;";
-                int idx = result.IndexOf(injectPoint);
-                if (idx >= 0)
+                // Inject only the audio uniforms the shader doesn't already declare,
+                // after the 'out vec4 FragColor' line (with semicolon)
+                string missing = GetMissingAudioUniforms(result);
+                if (missing.Length > 0)
                 {
-                    int insertPos = idx + injectPoint.Length;
-                    result = result.Insert(insertPos, AudioUniformsBlock);
-                    Console.WriteLine("[BuildFragmentShader] Injected audio uniforms into complete shader.");
+                    string injectPoint = "out vec4 FragColor;";
+                    int idx = result.IndexOf(injectPoint);
+                    if (idx >= 0)
+                    {
+                        int insertPos = idx + injectPoint.Length;
+                        result = result.Insert(insertPos, "\n" + missing);
+                        Console.WriteLine("[BuildFragmentShader] Injected missing audio uniforms into complete shader.");
+                    }
                 }
             }
             return result.Replace("{AR}", arValue);
@@ -131,7 +146,7 @@ vec3 HSVtoRGB(vec3 c)
             + (rawSource.Contains("uniform vec2  u_resolution") || rawSource.Contains("uniform vec2 u_resolution") ? "" : "uniform vec2  u_resolution;\n")
             + (rawSource.Contains("uniform int   u_frame") || rawSource.Contains("uniform int u_frame") ? "" : "uniform int   u_frame;\n")
             + (rawSource.Contains("out vec4 FragColor") ? "" : "out vec4 FragColor;\n")
-            + (_audioEnabled ? AudioUniformsBlock : "");
+            + (_audioEnabled ? GetMissingAudioUniforms(rawSource) : "");
 
         string wrapped = header + shaderToyHelpers + body + @"
 void main()
