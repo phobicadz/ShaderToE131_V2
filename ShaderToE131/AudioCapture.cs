@@ -106,7 +106,9 @@ public sealed class AudioCapture : IDisposable
                 var renderDevices = enumerator.EnumerateAudioEndPoints(NAudio.CoreAudioApi.DataFlow.Render, NAudio.CoreAudioApi.DeviceState.Active).ToList();
                 if (renderDevices.Count == 0) return null;
 
-                int idx = Math.Max(0, Math.Min(deviceIndex, renderDevices.Count - 1));
+                // Index N (N >= 1) selects the Nth enumerated device (1-based), so
+                // the index printed by ListLoopbackDevices matches the selected endpoint.
+                int idx = Math.Max(0, Math.Min(deviceIndex - 1, renderDevices.Count - 1));
                 return new AudioCapture(source, loopbackDevice: renderDevices[idx]);
 
             default:
@@ -151,11 +153,17 @@ public sealed class AudioCapture : IDisposable
 
     /// <summary>
     /// List all available render (speaker/headphone) endpoints for loopback capture.
+    /// Index 0 is reserved for the system default endpoint; enumerated devices start at index 1.
     /// </summary>
     public static IEnumerable<(int Index, string Name)> ListLoopbackDevices()
     {
         var enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
-        int i = 0;
+
+        // Index 0 is the system default render endpoint (matches the selection contract
+        // in Create(), where deviceIndex == 0 resolves via GetDefaultAudioEndpoint).
+        yield return (0, "(system default)");
+
+        int i = 1;
         foreach (var device in enumerator.EnumerateAudioEndPoints(NAudio.CoreAudioApi.DataFlow.Render, NAudio.CoreAudioApi.DeviceState.Active))
             yield return (i++, device.FriendlyName);
     }
