@@ -62,7 +62,13 @@ public sealed class AudioCapture : IDisposable
     // Peaks decay slowly (decay=0.97) so the normalization adapts to current signal level
     // rather than being pinned by early transients or initial frames.
     private const float PeakDecay = 0.94f;
-    private static readonly float[] _peakValues = new float[6];
+    private readonly float[] _peakValues = new float[6];
+
+    // Reused per-frame buffers (grown only if the FFT size increases), so the
+    // render-thread spectrum path allocates nothing after the first frame.
+    private float[] _rawBands = Array.Empty<float>();
+    private Complex[] _fftComplex = Array.Empty<Complex>();
+    private float[] _magnitudes = Array.Empty<float>();
 
     /// <summary>
     /// Initialize audio capture with the given source type and optional device selection.
@@ -79,12 +85,30 @@ public sealed class AudioCapture : IDisposable
                 return new AudioCapture(source, micDeviceIndex: deviceIndex);
 
             case AudioSource.Loopback:
-                // Enumerate render endpoints; try the requested index, fall back to default.
                 var enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
+
+                // Index 0 means the system default render endpoint (not the first
+                // enumerated device, which is arbitrary). Fall back to the first
+                // enumerated device if no default endpoint is available.
+                if (deviceIndex == 0)
+                {
+                    try
+                    {
+                        var defaultDevice = enumerator.GetDefaultAudioEndpoint(NAudio.CoreAudioApi.DataFlow.Render, NAudio.CoreAudioApi.Role.Multimedia);
+                        return new AudioCapture(source, loopbackDevice: defaultDevice);
+                    }
+                    catch
+                    {
+                        // No default endpoint; fall through to the enumerated list below.
+                    }
+                }
+
                 var renderDevices = enumerator.EnumerateAudioEndPoints(NAudio.CoreAudioApi.DataFlow.Render, NAudio.CoreAudioApi.DeviceState.Active).ToList();
                 if (renderDevices.Count == 0) return null;
 
-                int idx = Math.Max(0, Math.Min(deviceIndex, renderDevices.Count - 1));
+                // Index N (N >= 1) selects the Nth enumerated device (1-based), so
+                // the index printed by ListLoopbackDevices matches the selected endpoint.
+                int idx = Math.Max(0, Math.Min(deviceIndex - 1, renderDevices.Count - 1));
                 return new AudioCapture(source, loopbackDevice: renderDevices[idx]);
 
             default:
@@ -129,11 +153,17 @@ public sealed class AudioCapture : IDisposable
 
     /// <summary>
     /// List all available render (speaker/headphone) endpoints for loopback capture.
+    /// Index 0 is reserved for the system default endpoint; enumerated devices start at index 1.
     /// </summary>
     public static IEnumerable<(int Index, string Name)> ListLoopbackDevices()
     {
         var enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
-        int i = 0;
+
+        // Index 0 is the system default render endpoint (matches the selection contract
+        // in Create(), where deviceIndex == 0 resolves via GetDefaultAudioEndpoint).
+        yield return (0, "(system default)");
+
+        int i = 1;
         foreach (var device in enumerator.EnumerateAudioEndPoints(NAudio.CoreAudioApi.DataFlow.Render, NAudio.CoreAudioApi.DeviceState.Active))
             yield return (i++, device.FriendlyName);
     }
@@ -227,6 +257,12 @@ public sealed class AudioCapture : IDisposable
     private int _dataAvailableCount;
     private static readonly int DebugEventLimit = 5;
 
+    // Pool of PCM buffers cycled by the (single-threaded) audio callback, so the
+    // hot OnDataAvailable path allocates nothing after the first callback.
+    private const int PcmPoolSize = 8;
+    private short[][]? _pcmPool;
+    private int _pcmPoolIndex;
+
     private void OnDataAvailable(object? sender, NAudio.Wave.WaveInEventArgs e)
     {
         if (!_isRunning || e.BytesRecorded == 0) return;
@@ -234,8 +270,20 @@ public sealed class AudioCapture : IDisposable
         _dataAvailableCount++;
         int samplesCount = e.BytesRecorded / 2; // 16-bit = 2 bytes per sample
 
+        // Reuse a pooled buffer (lazily allocated on the first callback, when the
+        // buffer size is known). The audio callback is single-threaded, so the
+        // pool index needs no synchronization.
+        if (_pcmPool == null || _pcmPool[0].Length < samplesCount)
+        {
+            _pcmPool = new short[PcmPoolSize][];
+            for (int i = 0; i < PcmPoolSize; i++)
+                _pcmPool[i] = new short[samplesCount];
+            _pcmPoolIndex = 0;
+        }
+        short[] pcm = _pcmPool[_pcmPoolIndex];
+        _pcmPoolIndex = (_pcmPoolIndex + 1) % PcmPoolSize;
+
         // Convert byte[] → short[] (little-endian PCM16)
-        var pcm = new short[samplesCount];
         float maxAbs = 0f;
         for (int i = 0; i < samplesCount; i++)
         {
@@ -258,7 +306,11 @@ public sealed class AudioCapture : IDisposable
     /// </summary>
     public SpectrumValues ReadSpectrum()
     {
-        float[] rawBands = new float[_bands.Length + 1]; // +1 for volume
+        // Reuse the rawBands buffer (grown only if needed) and clear it for this frame.
+        if (_rawBands.Length < _bands.Length + 1)
+            _rawBands = new float[_bands.Length + 1];
+        float[] rawBands = _rawBands;
+        Array.Clear(rawBands, 0, rawBands.Length);
 
         // Drain all available buffers and combine FFT results
         int processedCount = 0;
@@ -268,9 +320,9 @@ public sealed class AudioCapture : IDisposable
 
             // Use as much data as we need for a full FFT, or the whole buffer
             int fftLen = Math.Min(FftSize, pcm.Length);
-            float[] magnitudes = ComputeFftMagnitudes(pcm, fftLen);
+            ReadOnlySpan<float> magnitudes = ComputeFftMagnitudes(pcm, fftLen);
 
-            if (magnitudes != null && magnitudes.Length > 0)
+            if (magnitudes.Length > 0)
             {
                 AccumulateBands(magnitudes, SampleRate, ref rawBands);
                 processedCount++;
@@ -329,19 +381,23 @@ public sealed class AudioCapture : IDisposable
     }
 
     /// <summary>
-    /// Apply a Hamming window and compute FFT, returning magnitude values for the first half of bins.
+    /// Apply a Hamming window and compute FFT, returning a view of exactly the
+    /// current bin count (pow2/2) of magnitude values. Returns an empty span
+    /// when the input is too small for a useful FFT.
     /// </summary>
-    private static float[]? ComputeFftMagnitudes(short[] pcm, int fftLen)
+    private ReadOnlySpan<float> ComputeFftMagnitudes(short[] pcm, int fftLen)
     {
-        if (fftLen == 0 || fftLen > FftSize) return null;
+        if (fftLen == 0 || fftLen > FftSize) return default;
 
         // Round down to nearest power of 2 for NAudio FFT requirement
         int pow2 = 1;
         while (pow2 * 2 <= fftLen) pow2 *= 2;
-        if (pow2 < 64) return null; // minimum useful FFT size is 64
+        if (pow2 < 64) return default; // minimum useful FFT size is 64
 
-        // NAudio's FFT requires a power-of-2 size and uses Complex structs
-        var fftComplex = new Complex[pow2];
+        // Reuse the FFT buffer, growing it only if needed.
+        if (_fftComplex.Length < pow2)
+            _fftComplex = new Complex[pow2];
+        Complex[] fftComplex = _fftComplex;
 
         // Apply Hamming window and load samples (zero-pad remainder)
         for (int i = 0; i < pow2; i++)
@@ -358,25 +414,26 @@ public sealed class AudioCapture : IDisposable
 
         // Compute magnitudes for first half of bins (Nyquist limit)
         int numBins = pow2 / 2;
-        var magnitudes = new float[numBins];
-        float maxMag = 0f;
+        if (_magnitudes.Length < numBins)
+            _magnitudes = new float[numBins];
+        float[] magnitudes = _magnitudes;
         for (int i = 0; i < numBins; i++)
         {
             // |X| = sqrt(Re² + Im²)
             magnitudes[i] = (float)Math.Sqrt(fftComplex[i].X * fftComplex[i].X + fftComplex[i].Y * fftComplex[i].Y);
-            if (magnitudes[i] > maxMag) maxMag = magnitudes[i];
         }
 
-        // No per-frame logging in static method; caller handles it
-
-        return magnitudes;
+        // Return only the valid bins, never the (possibly larger) backing buffer,
+        // so consumers derive frequency resolution from the current FFT size.
+        return magnitudes.AsSpan(0, numBins);
     }
 
     /// <summary>
     /// Map FFT bin magnitudes to spectral bands based on frequency resolution.
     /// Each magnitude bin i corresponds to freq = i * sampleRate / (2 * numBins).
+    /// The span length is the current FFT's bin count (pow2/2).
     /// </summary>
-    private static void AccumulateBands(float[] magnitudes, int sampleRate, ref float[] bandAccum)
+    private static void AccumulateBands(ReadOnlySpan<float> magnitudes, int sampleRate, ref float[] bandAccum)
     {
         // magnitudes has pow2/2 entries; each bin spans sampleRate/pow2 Hz
         double freqPerBin = (double)sampleRate / (magnitudes.Length * 2);

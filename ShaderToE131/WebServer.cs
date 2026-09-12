@@ -531,11 +531,15 @@ setInterval(refreshStatus, 2000);
             return;
         }
 
-        // Search for the shader file by name
+        // Search for the shader file by name. Match exactly on the display name
+        // (filename without extension) or the full filename — never a substring,
+        // so "fire" won't accidentally select "fireworks.glsl".
         string? fullPath = null;
         foreach (var s in _shaderList)
         {
-            if (s.Name.Equals(name!, StringComparison.OrdinalIgnoreCase) || s.FileName.Contains(name!))
+            string fileNameWithExt = Path.GetFileName(s.FileName);
+            if (s.Name.Equals(name!, StringComparison.OrdinalIgnoreCase)
+                || fileNameWithExt.Equals(name!, StringComparison.OrdinalIgnoreCase))
             {
                 fullPath = s.FileName;
                 break;
