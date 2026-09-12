@@ -1275,8 +1275,11 @@ void main(){ fragColor = texture(tex, UV); }";
         gl.BindVertexArray(_previewVao);
         gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
 
-        // Restore quad VAO for next render pass
+        // Restore quad VAO and the main program for the next render pass.
+        // Without restoring the program, the next frame's SetAudioValues
+        // (called before Render binds _program) would target _previewProgram.
         gl.BindVertexArray(_quadVao);
+        gl.UseProgram(_program);
     }
 
     public void Dispose()
