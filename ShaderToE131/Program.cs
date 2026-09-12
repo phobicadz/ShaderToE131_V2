@@ -929,8 +929,11 @@ void main()
         _webServer?.Stop();
         _audioCapture?.Dispose();
         _sender?.Dispose();
-        _window?.Dispose();
+        // Dispose the shader program before the window: its GL deletion calls
+        // (DeleteProgram, DeleteTexture, DeleteBuffer, DeleteVertexArray, ...)
+        // require a live GL context, which the window owns.
         _shaderProgram?.Dispose();
+        _window?.Dispose();
     }
 }
 
