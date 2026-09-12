@@ -21,8 +21,6 @@ class Program : IDisposable
     private bool _noPreview = false;
     private string? _shaderSource = null;
     private string? _currentShaderFileName;
-    // Pending shader change from web server (set by HTTP thread, read by render loop)
-    private volatile bool _pendingShaderChange;
     private bool _demoMode = false;
     private double _demoTimePerShaderSec = 10.0;
     private string? _shaderDirPath = null;
@@ -34,7 +32,6 @@ class Program : IDisposable
     private int _webPort = 8080;
     private string _webBindAddress = "0.0.0.0";
     private WebServer? _webServer;
-    private string? _resolvedShaderDir;
 
     private IWindow? _window;
     private GL? _gl;
@@ -42,7 +39,6 @@ class Program : IDisposable
     private ShaderProgram? _shaderProgram;
     private byte[] _frameBuffer = new byte[MatW * MatH * 4];
     private byte[] _e131Buffer = new byte[PixelMapper.TotalChannels];
-    private double _startTime;
     private long _webStartMs;
     private int _frameCount = 0;
     private int _audioDebugCount = 0;
@@ -54,19 +50,51 @@ class Program : IDisposable
     private int _sendErrors;
 
     /// <summary>
+    /// Audio-reactive uniform declarations injected when --audio is enabled.
+    /// </summary>
+    private const string AudioUniformsBlock =
+        "\nuniform float u_bass;\nuniform float u_lowmid;\n"
+      + "uniform float u_mid;\nuniform float u_highmid;\n"
+      + "uniform float u_treble;\nuniform float u_volume;";
+
+    /// <summary>
     /// Build the final GLSL fragment shader source.
     /// Wraps raw ShaderToy-style mainImage code with required boilerplate,
     /// or returns the built-in default if no custom shader was provided.
     /// </summary>
     private string BuildFragmentShader(string rawSource)
     {
-        // Check if the source already has #version and void main() — treat as complete
-        bool isComplete = rawSource.Contains("#version") && (rawSource.Contains("void main()") || rawSource.Contains("out vec4 FragColor"));
-        if (!isComplete)
+        string arValue = PixelMapper.AspectRatio.ToString();
+
+        // A shader is "complete" only if it provides its own entry point (void main()).
+        // ShaderToy-style shaders define mainImage(...) and rely on us adding void main().
+        // Keying on void main() (rather than 'out vec4 FragColor') avoids misclassifying
+        // ShaderToy shaders that declare their own output but have no entry point.
+        bool hasMain = rawSource.Contains("void main()");
+
+        if (hasMain)
         {
-            // Common ShaderToy built-in helpers that aren't in standard GLSL.
-            // Injected once at the top so all wrapped shaders can use them.
-            string shaderToyHelpers = @"
+            // Complete GLSL fragment shader — inject audio uniforms if needed, then replace {AR}
+            string result = rawSource;
+            if (_audioEnabled && !result.Contains("uniform float u_bass;"))
+            {
+                // Inject after the 'out vec4 FragColor' line (with semicolon)
+                string injectPoint = "out vec4 FragColor;";
+                int idx = result.IndexOf(injectPoint);
+                if (idx >= 0)
+                {
+                    int insertPos = idx + injectPoint.Length;
+                    result = result.Insert(insertPos, AudioUniformsBlock);
+                    Console.WriteLine("[BuildFragmentShader] Injected audio uniforms into complete shader.");
+                }
+            }
+            return result.Replace("{AR}", arValue);
+        }
+
+        // ShaderToy-style source (mainImage, no void main()) — wrap with required boilerplate.
+        // Common ShaderToy built-in helpers that aren't in standard GLSL.
+        // Injected once at the top so all wrapped shaders can use them.
+        string shaderToyHelpers = @"
 vec3 HSVtoRGB(vec3 c)
 {{
     vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
@@ -77,59 +105,23 @@ vec3 HSVtoRGB(vec3 c)
 #define HSVToRGB HSVtoRGB
 ";
 
-            // Wrap ShaderToy-style source: add defines, uniforms, helpers, and void main()
-            string audioUniforms = _audioEnabled
-                ? "\nuniform float u_bass;\nuniform float u_lowmid;\nuniform float u_mid;\nuniform float u_highmid;\nuniform float u_treble;\nuniform float u_volume;"
-                : "";
+        // Only add directives the source doesn't already declare, to avoid duplicate definitions.
+        string header = (rawSource.Contains("#version") ? "" : "#version 330 core\n")
+            + (rawSource.Contains("#define iTime") ? "" : "#define iTime u_time\n")
+            + (rawSource.Contains("#define iResolution") ? "" : "#define iResolution u_resolution\n")
+            + (rawSource.Contains("uniform float u_time") ? "" : "uniform float u_time;\n")
+            + (rawSource.Contains("uniform vec2  u_resolution") || rawSource.Contains("uniform vec2 u_resolution") ? "" : "uniform vec2  u_resolution;\n")
+            + (rawSource.Contains("uniform int   u_frame") || rawSource.Contains("uniform int u_frame") ? "" : "uniform int   u_frame;\n")
+            + (rawSource.Contains("out vec4 FragColor") ? "" : "out vec4 FragColor;\n")
+            + (_audioEnabled ? AudioUniformsBlock : "");
 
-            string wrapped = @"#version 330 core
-#define iTime u_time
-#define iResolution u_resolution
-uniform float u_time;
-uniform vec2  u_resolution;
-uniform int   u_frame;
-out vec4 FragColor;" + audioUniforms + @"
-
-" + shaderToyHelpers + rawSource + @"
+        string wrapped = header + shaderToyHelpers + rawSource + @"
 void main()
 {{
     vec2 fragCoord = gl_FragCoord.xy;
     mainImage(FragColor, fragCoord);
 }};";
-            return wrapped;
-        }
-        // Already a complete GLSL fragment shader — inject audio uniforms if needed, then replace {AR} placeholder
-        string result = rawSource;
-        if (_audioEnabled)
-        {
-            const string uBass = "uniform float u_bass;";
-            const string uLowmid = "uniform float u_lowmid;";
-            const string uMid = "uniform float u_mid;";
-            const string uHighmid = "uniform float u_highmid;";
-            const string uTreble = "uniform float u_treble;";
-            const string uVolume = "uniform float u_volume;";
-
-            bool hasAudioUniforms = result.Contains(uBass) && result.Contains(uLowmid)
-                && result.Contains(uMid) && result.Contains(uHighmid)
-                && result.Contains(uTreble) && result.Contains(uVolume);
-
-            if (!hasAudioUniforms)
-            {
-                // Inject after the 'out vec4 FragColor' line (with semicolon)
-                string injectPoint = "out vec4 FragColor;";
-                int idx = result.IndexOf(injectPoint);
-                if (idx >= 0)
-                {
-                    int insertPos = idx + injectPoint.Length;
-                    result = result.Insert(insertPos,
-                        "\nuniform float u_bass;\nuniform float u_lowmid;\n"
-                      + "uniform float u_mid;\nuniform float u_highmid;\n"
-                      + "uniform float u_treble;\nuniform float u_volume;");
-                    Console.WriteLine("[BuildFragmentShader] Injected audio uniforms into complete shader.");
-                }
-            }
-        }
-        return result.Replace("{AR}", PixelMapper.AspectRatio.ToString());
+        return wrapped.Replace("{AR}", arValue);
     }
 
     /// <summary>
@@ -178,7 +170,7 @@ void main()
 }};";
     static void Main(string[] args)
     {
-        var prog = new Program();
+        using var prog = new Program();
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--no-preview") { prog._noPreview = true; }
@@ -192,8 +184,13 @@ void main()
             else if (args[i] == "--audio") { prog._audioEnabled = true; }
             else if ((args[i] == "--mic" || args[i] == "--microphone") && i + 1 < args.Length && int.TryParse(args[++i], out var micIdx))
             { prog._audioSource = AudioCapture.AudioSource.Microphone; prog._audioDeviceIndex = micIdx; }
-            else if ((args[i] == "--loopback" || args[i] == "--playback") && i + 1 < args.Length && int.TryParse(args[++i], out var lbIdx))
-            { prog._audioSource = AudioCapture.AudioSource.Loopback; prog._audioDeviceIndex = lbIdx; }
+            else if (args[i] == "--loopback" || args[i] == "--playback")
+            {
+                prog._audioSource = AudioCapture.AudioSource.Loopback;
+                prog._audioDeviceIndex = 0;
+                if (i + 1 < args.Length && int.TryParse(args[i + 1], out var lbIdx))
+                { prog._audioDeviceIndex = lbIdx; i++; }
+            }
             else if (args[i] == "--audio-device" && i + 1 < args.Length && int.TryParse(args[++i], out var devIdx))
                 prog._audioDeviceIndex = devIdx;
             else if (args[i] == "--web-port" && i + 1 < args.Length && int.TryParse(args[++i], out var wp))
@@ -504,8 +501,7 @@ void main()
         // Reload the shader program with the new source
         ReloadShader();
 
-        // Reset time so the animation starts fresh for each shader
-        _startTime = Environment.TickCount64 / 1000.0;
+        // Time resets per shader automatically (ShaderProgram tracks its own start).
         _demoShaderStartTimeMs = Environment.TickCount64;
     }
 
@@ -521,7 +517,7 @@ void main()
         _shaderProgram?.Dispose();
 
         string fragShader = BuildFragmentShader(_shaderSource!);
-        _shaderProgram = new ShaderProgram(_gl, BuildFragmentShader(_shaderSource!), MatW, MatH, _window, _audioEnabled);
+        _shaderProgram = new ShaderProgram(_gl, fragShader, MatW, MatH, _window, _audioEnabled);
         Console.WriteLine($"[Reload] Shader program created.");
     }
 
@@ -530,15 +526,19 @@ void main()
         Console.WriteLine("GL loaded — initializing shaders...");
         _gl = _window!.CreateOpenGL();
 
-        // In demo mode, load the first shader and set start time
+        // In demo mode, load the first shader (which creates the program via ReloadShader).
+        // Otherwise, create the program for the current source. The two are mutually
+        // exclusive to avoid creating (and leaking) a second ShaderProgram.
         if (_demoMode && _demoShaders != null && _demoShaders.Length > 0)
         {
             LoadDemoShader(0);
         }
-
-        string fragShader = BuildFragmentShader(_shaderSource!);
-        _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
-        Console.WriteLine("Shader program created.");
+        else
+        {
+            string fragShader = BuildFragmentShader(_shaderSource!);
+            _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
+            Console.WriteLine("Shader program created.");
+        }
         // Disable VSync via wglSwapIntervalEXT
         try
         {
@@ -556,7 +556,6 @@ void main()
         }
         catch { /* VSync already off or extension not available */ }
 
-        _startTime = Environment.TickCount64 / 1000.0;
         _lastStatusLogMs = Environment.TickCount64;
     }
 
@@ -590,10 +589,14 @@ void main()
         Console.WriteLine("GL loaded — initializing shaders...");
         _gl = _window!.CreateOpenGL();
 
-        // In demo mode, load the first shader and set start time
+        // In demo mode, load the first shader (which creates the program via ReloadShader).
+        // Otherwise, create the program for the current source. Mutually exclusive to
+        // avoid creating (and leaking) a second ShaderProgram.
+        bool demoLoaded = false;
         if (_demoMode && _demoShaders != null && _demoShaders.Length > 0)
         {
             LoadDemoShader(0);
+            demoLoaded = true;
         }
 
         // Disable VSync via wglSwapIntervalEXT
@@ -613,9 +616,12 @@ void main()
         }
         catch { /* VSync already off or extension not available */ }
 
-        string fragShader = BuildFragmentShader(_shaderSource);
-        _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
-        Console.WriteLine("Shader program created.");
+        if (!demoLoaded)
+        {
+            string fragShader = BuildFragmentShader(_shaderSource!);
+            _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
+            Console.WriteLine("Shader program created.");
+        }
     }
 
     private unsafe void OnRender(double deltaTime)
@@ -636,7 +642,6 @@ void main()
             string fragShader = BuildFragmentShader(_shaderSource!);
             _shaderProgram?.Dispose();
             _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
-            _startTime = Environment.TickCount64 / 1000.0;
             Console.WriteLine($"[Web] Shader changed: {newName ?? "unknown"}");
 
             // Reinitialize audio capture with current loopback device index if enabled
@@ -790,7 +795,6 @@ void main()
             string fragShader = BuildFragmentShader(_shaderSource!);
             _shaderProgram?.Dispose();
             _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
-            _startTime = Environment.TickCount64 / 1000.0;
             Console.WriteLine($"[Web] Shader changed: {newName ?? "unknown"}");
         }
 
@@ -921,10 +925,16 @@ class ShaderProgram : IDisposable
     private readonly uint _program;
     private readonly uint _quadVao, _quadVbo;
     private readonly uint _renderFbo, _renderTex;
+    private readonly uint _previewProgram, _previewVao, _previewVbo, _previewTex;
+    private readonly int _previewTexLoc;
     private readonly int _matW, _matH;
+    private byte[] _readPixels = Array.Empty<byte>();
     private IWindow? _window;
 
     private readonly bool _audioEnabled;
+
+    // Time base so u_time starts at 0 when this program is created (fresh per shader).
+    private readonly long _startMs = Environment.TickCount64;
 
     public unsafe ShaderProgram(GL gl, string fragmentSource, int width, int height, IWindow window, bool audioEnabled = false)
     {
@@ -996,6 +1006,53 @@ void main()
             Console.WriteLine($"  [ShaderProg] FBO not complete: {fboStatus}");
         gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
 
+        // Preview resources — built once here and reused every frame by DrawPreview
+        // (previously the texture, program, VBO and VAO were rebuilt per frame).
+        _previewTex = gl.GenTexture();
+        gl.BindTexture(TextureTarget.Texture2D, _previewTex);
+        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)GLEnum.Nearest);
+        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)GLEnum.Nearest);
+        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)GLEnum.ClampToEdge);
+        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)GLEnum.ClampToEdge);
+        gl.TexImage2D(TextureTarget.Texture2D, 0, (int)InternalFormat.Rgba, (uint)_matW, (uint)_matH, 0, PixelFormat.Rgba, PixelType.UnsignedByte, null);
+
+        const string previewVs = @"#version 330 core
+layout(location=0) in vec2 a_pos;
+out vec2 UV;
+void main(){ UV = a_pos * 0.5 + 0.5; gl_Position = vec4(a_pos, 0, 1); }";
+
+        const string previewFs = @"#version 330 core
+in vec2 UV;
+uniform sampler2D tex;
+out vec4 fragColor;
+void main(){ fragColor = texture(tex, UV); }";
+
+        _previewProgram = gl.CreateProgram();
+        uint previewVsObj = Compile(gl, GLEnum.VertexShader, previewVs, false);
+        uint previewFsObj = Compile(gl, GLEnum.FragmentShader, previewFs, false);
+        gl.AttachShader(_previewProgram, previewVsObj);
+        gl.AttachShader(_previewProgram, previewFsObj);
+        gl.LinkProgram(_previewProgram);
+        _previewTexLoc = gl.GetUniformLocation(_previewProgram, "tex");
+        gl.DetachShader(_previewProgram, previewVsObj);
+        gl.DetachShader(_previewProgram, previewFsObj);
+        gl.DeleteShader(previewVsObj);
+        gl.DeleteShader(previewFsObj);
+
+        // Clip-space quad; UV in the vertex shader handles texture mapping.
+        float[] previewQuad = { -1f, -1f, 1f, -1f, -1f, 1f, -1f, 1f, 1f, -1f, 1f, 1f };
+        _previewVbo = gl.GenBuffer();
+        gl.BindBuffer(BufferTargetARB.ArrayBuffer, _previewVbo);
+        fixed (float* buf = previewQuad)
+            gl.BufferData(BufferTargetARB.ArrayBuffer, (nuint)(previewQuad.Length * sizeof(float)), buf, BufferUsageARB.StaticDraw);
+
+        _previewVao = gl.GenVertexArray();
+        gl.BindVertexArray(_previewVao);
+        gl.BindBuffer(BufferTargetARB.ArrayBuffer, _previewVbo);
+        gl.EnableVertexAttribArray(0);
+        gl.VertexAttribPointer(0, 2, VertexAttribPointerType.Float, false, 2 * sizeof(float), (void*)0);
+        gl.BindVertexArray(0);
+
         gl.DetachShader(_program, vertShader);
         gl.DetachShader(_program, fragShader);
         gl.DeleteShader(vertShader);
@@ -1017,21 +1074,20 @@ void main()
 
     public void SetUniform(string name, float value)
     {
-        int loc = _gl.GetUniformLocation(_program, name);
+        int loc = GetUniformLocation(name);
         if (loc >= 0) _gl.Uniform1(loc, value);
     }
 
     public void SetUniform(string name, int value)
     {
-        int loc = _gl.GetUniformLocation(_program, name);
+        int loc = GetUniformLocation(name);
         if (loc >= 0) _gl.Uniform1(loc, value);
     }
 
     public void SetUniform(string name, int w, int h)
     {
-        float[] v = { (float)w, (float)h };
-        int loc = _gl.GetUniformLocation(_program, name);
-        if (loc >= 0) _gl.Uniform2(loc, v[0], v[1]);
+        int loc = GetUniformLocation(name);
+        if (loc >= 0) _gl.Uniform2(loc, (float)w, (float)h);
     }
 
     /// <summary>
@@ -1076,15 +1132,29 @@ void main()
 
     private string[]? _audioUniformLocations;
     private int[]? _audioUniformLocationCache;
+    private Dictionary<string, int>? _uniformLocationCache;
+
+    /// <summary>
+    /// Cached uniform locations. GetUniformLocation is a driver round-trip, so
+    /// locations are resolved once per uniform name and reused every frame.
+    /// </summary>
+    private int GetUniformLocation(string name)
+    {
+        if (_uniformLocationCache == null)
+            _uniformLocationCache = new Dictionary<string, int>();
+        if (!_uniformLocationCache.TryGetValue(name, out int loc))
+        {
+            loc = _gl.GetUniformLocation(_program, name);
+            _uniformLocationCache[name] = loc;
+        }
+        return loc;
+    }
 
     /// <summary>
     /// Render directly to default framebuffer at small resolution, then ReadPixels.
     /// </summary>
     public unsafe void Render(GL gl, int width, int height, byte[] framebuffer)
     {
-        // Drain any stale GL errors from prior calls so diagnostics reflect this frame.
-        while (gl.GetError() != GLEnum.NoError) { }
-
         // Render into offscreen FBO at matrix resolution.
         gl.BindFramebuffer(FramebufferTarget.Framebuffer, _renderFbo);
         gl.Viewport(0, 0, (uint)width, (uint)height);
@@ -1095,17 +1165,23 @@ void main()
 
         // Use shader program and set uniforms while it is bound.
         gl.UseProgram(_program);
-        SetUniform("u_time", (float)(Environment.TickCount64 / 1000.0));
+        // u_time is relative to when this program was created, so each shader starts at t=0.
+        SetUniform("u_time", (float)((Environment.TickCount64 - _startMs) / 1000.0));
         SetUniform("u_frame", 0);
         SetUniform("u_resolution", width, height);
 
         DrawQuad(gl);
 
         // Read back from the offscreen color attachment.
-        byte[] readPixels = new byte[width * height * 4];
+        int readSize = width * height * 4;
+        if (_readPixels.Length < readSize)
+            _readPixels = new byte[readSize];
+        byte[] readPixels = _readPixels;
         gl.PixelStore(PixelStoreParameter.PackAlignment, 1);
         gl.ReadBuffer(ReadBufferMode.ColorAttachment0);
-        gl.Finish();
+        // ReadPixels synchronizes with the GPU for the data it returns, so a
+        // blocking gl.Finish() here is unnecessary; gl.Flush() is sufficient.
+        gl.Flush();
         fixed (byte* readPtr = readPixels)
         {
             gl.ReadPixels(0, 0, (uint)width, (uint)height, PixelFormat.Rgba, PixelType.UnsignedByte, readPtr);
@@ -1134,16 +1210,14 @@ void main()
     }
 
     /// <summary>
-    /// Preview: draw texture scaled to window.
+    /// Preview: draw the latest framebuffer scaled to the window.
+    /// The texture, program, VBO and VAO are created once in the constructor;
+    /// only the texture data is re-uploaded each frame.
     /// </summary>
     public unsafe void DrawPreview(GL gl, int winWidth, int winHeight, byte[] frameBuffer)
     {
-        uint tex = gl.GenTexture();
-        gl.BindTexture(TextureTarget.Texture2D, tex);
-        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)GLEnum.Nearest);
-        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)GLEnum.Nearest);
-        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)GLEnum.ClampToEdge);
-        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)GLEnum.ClampToEdge);
+        // Upload the latest framebuffer into the cached preview texture.
+        gl.BindTexture(TextureTarget.Texture2D, _previewTex);
         GCHandle fh = GCHandle.Alloc(frameBuffer, GCHandleType.Pinned);
         try
         {
@@ -1157,55 +1231,13 @@ void main()
             fh.Free();
         }
 
-        const string vs = @"#version 330 core
-layout(location=0) in vec2 a_pos;
-out vec2 UV;
-void main(){ UV = a_pos * 0.5 + 0.5; gl_Position = vec4(a_pos, 0, 1); }";
-
-        const string fs = @"#version 330 core
-in vec2 UV;
-uniform sampler2D tex;
-out vec4 fragColor;
-void main(){ fragColor = texture(tex, UV); }";
-
-        uint prog = gl.CreateProgram();
-        uint vsObj = Compile(gl, GLEnum.VertexShader, vs, false);
-        uint fsObj = Compile(gl, GLEnum.FragmentShader, fs, false);
-        gl.AttachShader(prog, vsObj);
-        gl.AttachShader(prog, fsObj);
-        gl.LinkProgram(prog);
-
-        int texLoc = gl.GetUniformLocation(prog, "tex");
-
-        // Clip-space quad; UV in vertex shader handles texture mapping.
-        float[] previewQuad = { -1f, -1f, 1f, -1f, -1f, 1f, -1f, 1f, 1f, -1f, 1f, 1f };
-
-        uint pbo = gl.GenBuffer();
-        gl.BindBuffer(BufferTargetARB.ArrayBuffer, pbo);
-        fixed (float* buf = previewQuad)
-            gl.BufferData(BufferTargetARB.ArrayBuffer, (nuint)(previewQuad.Length * sizeof(float)), buf, BufferUsageARB.StaticDraw);
-
-        uint pvao = gl.GenVertexArray();
-        gl.BindVertexArray(pvao);
-        gl.BindBuffer(BufferTargetARB.ArrayBuffer, pbo);
-        gl.EnableVertexAttribArray(0);
-        gl.VertexAttribPointer(0, 2, VertexAttribPointerType.Float, false, 2 * sizeof(float), (void*)0);
-
-        gl.UseProgram(prog);
+        gl.UseProgram(_previewProgram);
         gl.ActiveTexture(TextureUnit.Texture0);
-        gl.BindTexture(TextureTarget.Texture2D, tex);
-        gl.Uniform1(texLoc, 0);
-        gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
+        gl.BindTexture(TextureTarget.Texture2D, _previewTex);
+        gl.Uniform1(_previewTexLoc, 0);
 
-        // Cleanup preview resources
-        gl.DeleteVertexArray(pvao);
-        gl.DeleteBuffer(pbo);
-        gl.DeleteTexture(tex);
-        gl.DetachShader(prog, vsObj);
-        gl.DetachShader(prog, fsObj);
-        gl.DeleteProgram(prog);
-        gl.DeleteShader(vsObj);
-        gl.DeleteShader(fsObj);
+        gl.BindVertexArray(_previewVao);
+        gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
 
         // Restore quad VAO for next render pass
         gl.BindVertexArray(_quadVao);
@@ -1218,6 +1250,10 @@ void main(){ fragColor = texture(tex, UV); }";
         _gl?.DeleteProgram(_program);
         _gl?.DeleteVertexArray(_quadVao);
         _gl?.DeleteBuffer(_quadVbo);
+        _gl?.DeleteTexture(_previewTex);
+        _gl?.DeleteProgram(_previewProgram);
+        _gl?.DeleteVertexArray(_previewVao);
+        _gl?.DeleteBuffer(_previewVbo);
     }
 }
 

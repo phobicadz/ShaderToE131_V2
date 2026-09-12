@@ -33,6 +33,11 @@ public sealed class E131Sender : IDisposable
     // Per-universe sequence numbers (matching Haukcode.sACN's Dictionary<ushort, byte>)
     private readonly Dictionary<ushort, byte> _seqNums = new();
 
+    // Reused per-frame buffers (grown only if the channel count increases), so the
+    // hot send path allocates nothing after the first frame.
+    private byte[] _effectivePixels = Array.Empty<byte>();
+    private byte[] _packetBuffer = Array.Empty<byte>();
+
     // Source name — null-padded to 64 bytes
     private static readonly byte[] _sourceNameBytes;
 
@@ -72,23 +77,24 @@ public sealed class E131Sender : IDisposable
 
         // Pad pixel data to a full multiple of maxSlots so every universe sends exactly 510 channels.
         int paddedLength = numUniverses * maxSlots;
-        byte[] effectivePixels;
-        if (totalChannels < paddedLength)
-        {
-            effectivePixels = new byte[paddedLength];
-            pixels.CopyTo(new Span<byte>(effectivePixels));
-        }
-        else
-        {
-            effectivePixels = pixels.ToArray();
-        }
 
-        // Pre-allocate one buffer sized for a full 510-channel universe.
+        // Reuse the padding buffer (grown only if the channel count increased).
+        if (_effectivePixels.Length < paddedLength)
+            _effectivePixels = new byte[paddedLength];
+        pixels.CopyTo(_effectivePixels.AsSpan());
+        // Zero the padding region so trailing channels are always 0.
+        if (totalChannels < paddedLength)
+            _effectivePixels.AsSpan(totalChannels).Clear();
+        byte[] effectivePixels = _effectivePixels;
+
+        // One buffer sized for a full 510-channel universe, reused every frame.
         // Root(38) + framing flags/len field(2) + framing payload(75+dmp)+DMP data portion
         const int dmpLayerDataLen = 11 + maxSlots;
         const int totalPacketSize = 38 + 77 + dmpLayerDataLen;
 
-        byte[] buffer = new byte[totalPacketSize];
+        if (_packetBuffer.Length < totalPacketSize)
+            _packetBuffer = new byte[totalPacketSize];
+        byte[] buffer = _packetBuffer;
 
         for (int u = 0; u < numUniverses; u++)
         {
