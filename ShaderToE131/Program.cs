@@ -105,8 +105,26 @@ vec3 HSVtoRGB(vec3 c)
 #define HSVToRGB HSVtoRGB
 ";
 
+        // GLSL requires #version to be the first line of the shader. If the source
+        // already declares a version, hoist that line to the top of the header and
+        // remove it from the body so it isn't duplicated; otherwise default to
+        // #version 330 core.
+        string body = rawSource;
+        string versionDirective = "#version 330 core";
+        int versionIdx = rawSource.IndexOf("#version", StringComparison.Ordinal);
+        if (versionIdx >= 0)
+        {
+            int lineStart = versionIdx;
+            while (lineStart > 0 && rawSource[lineStart - 1] != '\n' && rawSource[lineStart - 1] != '\r')
+                lineStart--;
+            int lineEnd = rawSource.IndexOfAny(new[] { '\n', '\r' }, versionIdx);
+            int lineLength = lineEnd >= 0 ? lineEnd - lineStart : rawSource.Length - lineStart;
+            versionDirective = rawSource.Substring(lineStart, lineLength).TrimEnd();
+            body = rawSource.Remove(lineStart, lineLength);
+        }
+
         // Only add directives the source doesn't already declare, to avoid duplicate definitions.
-        string header = (rawSource.Contains("#version") ? "" : "#version 330 core\n")
+        string header = versionDirective + "\n"
             + (rawSource.Contains("#define iTime") ? "" : "#define iTime u_time\n")
             + (rawSource.Contains("#define iResolution") ? "" : "#define iResolution u_resolution\n")
             + (rawSource.Contains("uniform float u_time") ? "" : "uniform float u_time;\n")
@@ -115,7 +133,7 @@ vec3 HSVtoRGB(vec3 c)
             + (rawSource.Contains("out vec4 FragColor") ? "" : "out vec4 FragColor;\n")
             + (_audioEnabled ? AudioUniformsBlock : "");
 
-        string wrapped = header + shaderToyHelpers + rawSource + @"
+        string wrapped = header + shaderToyHelpers + body + @"
 void main()
 {{
     vec2 fragCoord = gl_FragCoord.xy;
