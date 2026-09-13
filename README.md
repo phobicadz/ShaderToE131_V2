@@ -12,6 +12,7 @@ ShaderToE131 takes [ShaderToy-style](https://www.shadertoy.com/) GLSL shaders (`
 - 🔊 **Audio reactivity** — FFT spectral analysis (2048-point, ~21.5 Hz resolution) feeds bass/mid/treble bands as shader uniforms
 - 🌐 **Web control panel** — select shaders, view status, toggle audio without restarting
 - 📡 **E.1.31/sACN output** — UDP multicast/unicast to LED matrix controllers (4 universes: 583 pixels × 3 channels = 1749 DMX slots)
+- 🧵 **Optional LED string output** — stream a separate N-LED string (default 50) in parallel with the matrix, mirroring a matrix row
 - 🎭 **Demo mode** — auto-cycle through all shaders in directory
 - 🔇 **"Off" blank** — dispose shader program to stop GPU rendering entirely
 
@@ -101,6 +102,12 @@ dotnet run --audio --loopback 0 --demo --web-port 8080
 # Run headless (no OpenGL preview window — useful for server environments)
 dotnet run --no-preview --shader shaders/balatro.glsl
 
+# Also stream an LED string (default 50 LEDs) in parallel with the matrix
+dotnet run --string
+
+# 100-LED string on a different controller, universe 7, sampled from matrix row 2
+dotnet run --string --string-size 100 --string-ip 192.168.2.151 --string-universe 7 --string-row 2
+
 # List available audio devices and exit
 dotnet run --list-devices
 
@@ -122,6 +129,11 @@ dotnet run --help
 | `--loopback [idx]` | Capture system playback output (default: 0 = default speakers) |
 | `--audio-device <idx>` | Fallback device index for either source |
 | `--web-port <port>` | Start web control panel on given port (default: 8080) |
+| `--string` | Also stream an LED string in parallel with the matrix |
+| `--string-size <n>` | LED string length (default: 50) |
+| `--string-row <y>` | Matrix row to sample the string from (default: center row) |
+| `--string-ip <ip>` | Target IP for the string (default: same as matrix) |
+| `--string-universe <n>` | Universe for the string (default: first after the matrix's universes) |
 | `--list-devices` | List available audio input devices and exit |
 | `--help, -h` | Show usage help |
 
@@ -248,6 +260,21 @@ int redChannel   = ledIndex * 3;         // DMX slot N
 int greenChannel = ledIndex * 3 + 1;     // DMX slot N+1
 int blueChannel  = ledIndex * 3 + 2;     // DMX slot N+2
 ```
+
+### LED String (optional)
+
+An LED string can be streamed in parallel with the matrix via `--string`:
+
+| Parameter | Default | Option |
+|-----------|---------|--------|
+| LED count | 50 (150 channels → 1 universe) | `--string-size <n>` |
+| Sample row | center row (5 of 0–10) | `--string-row <y>` |
+| Target IP | matrix IP (`192.168.2.150`) | `--string-ip <ip>` |
+| Universe | 5 (first after the matrix's 1–4) | `--string-universe <n>` |
+
+Pixels are nearest-neighbor sampled from the chosen matrix row (LED *i* takes matrix pixel at `x = i × 53 / n`), so the string mirrors what the matrix shows and stays perfectly in sync — no extra GPU work. Counts above the matrix width (53) reuse row pixels via nearest-neighbor; very long strings span multiple universes automatically.
+
+Universe numbers follow the sACN contract (1..63999): at startup the string's base universe and the last universe the string occupies are validated, and `--string-size` is bounded by the channel capacity available from the base universe. Out-of-range settings abort startup with a clear error before any buffer is allocated.
 
 ## Audio Capture Details
 

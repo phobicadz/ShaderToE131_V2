@@ -57,6 +57,26 @@ public static class PixelMapper
     }
 
     /// <summary>
+    /// Fill an E.1.31 string buffer (ledCount LEDs × 3 channels) by nearest-
+    /// sampling a single row of the matrix framebuffer.
+    /// LED i takes the matrix pixel at x = i * Width / ledCount, so the string
+    /// mirrors the row across any LED count (duplicates when ledCount &gt; Width).
+    /// </summary>
+    public static void MapRowToString(ReadOnlySpan<byte> framebuffer, int row, int ledCount, Span<byte> e131Buffer)
+    {
+        if (row < 0 || row >= Height) row = Height / 2;
+
+        for (int i = 0; i < ledCount; i++)
+        {
+            int x = i * Width / ledCount; // always in [0, Width) since i < ledCount
+            int srcIdx = (row * Width + x) * 4; // RGBA in framebuffer
+            e131Buffer[i * 3]     = framebuffer[srcIdx];     // R
+            e131Buffer[i * 3 + 1] = framebuffer[srcIdx + 1]; // G
+            e131Buffer[i * 3 + 2] = framebuffer[srcIdx + 2]; // B
+        }
+    }
+
+    /// <summary>
     /// Aspect ratio of the matrix: width / height.
     /// ShaderToys expect u_resolution.x/u_resolution.y ≈ 1:1 (or near-square).
     /// The shader's UV X coordinate needs to be compressed by this factor so it sees a square canvas.
