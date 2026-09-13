@@ -49,6 +49,19 @@ class Program : IDisposable
     private int _framesSent;
     private int _sendErrors;
 
+    // ─── LED string output (in parallel with the matrix) ───
+    private bool _stringEnabled = false;
+    private int _stringSize = 50;          // LED count
+    private int _stringRow = -1;           // -1 = center row of the matrix
+    private string? _stringIp = null;      // null = same IP as the matrix
+    private int _stringUniverse = 0;       // 0 = auto (first universe after the matrix's)
+    private E131Sender? _stringSender;
+    private byte[] _stringBuffer = Array.Empty<byte>();
+    private int _stringUniverseResolved;
+    private int _stringRowResolved;
+    private int _stringFramesSent;
+    private int _stringSendErrors;
+
     private static readonly string[] AudioUniformNames =
         { "u_bass", "u_lowmid", "u_mid", "u_highmid", "u_treble", "u_volume" };
 
@@ -230,6 +243,15 @@ void main()
                 prog._webPort = wp;
             else if (args[i] == "--bind-address" && i + 1 < args.Length)
                 prog._webBindAddress = args[++i];
+            else if (args[i] == "--string") { prog._stringEnabled = true; }
+            else if (args[i] == "--string-size" && i + 1 < args.Length && int.TryParse(args[++i], out var ss))
+                prog._stringSize = ss;
+            else if (args[i] == "--string-row" && i + 1 < args.Length && int.TryParse(args[++i], out var sr))
+                prog._stringRow = sr;
+            else if (args[i] == "--string-ip" && i + 1 < args.Length)
+                prog._stringIp = args[++i];
+            else if (args[i] == "--string-universe" && i + 1 < args.Length && int.TryParse(args[++i], out var su))
+                prog._stringUniverse = su;
         }
 
         // Show available audio devices when --help, -h, or --list-devices is passed
@@ -249,6 +271,11 @@ void main()
             Console.WriteLine("  --audio-device <idx> Fallback device index for either source");
             Console.WriteLine("  --web-port <port>      Start web control panel on given port (default: 8080)");
             Console.WriteLine("  --bind-address <addr>  Bind address for web server (default: 0.0.0.0; use localhost for local-only)");
+            Console.WriteLine("  --string               Also stream an LED string in parallel with the matrix");
+            Console.WriteLine("  --string-size <n>      LED string length (default: 50)");
+            Console.WriteLine("  --string-row <y>       Matrix row to sample the string from (default: center row)");
+            Console.WriteLine("  --string-ip <ip>       Target IP for the string (default: same as matrix)");
+            Console.WriteLine("  --string-universe <n>  Universe for the string (default: first after the matrix's universes)");
             Console.WriteLine("  --list-devices         List available audio input devices and exit");
             Console.WriteLine();
             return;
@@ -307,6 +334,25 @@ void main()
         Console.WriteLine($"  Matrix: {MatW}×{MatH} ({PixelMapper.TotalPixels} pixels, {PixelMapper.TotalChannels} channels)");
         Console.WriteLine($"  Target: {TargetIp}:5568 (unicast, universe={UniverseId})");
         Console.WriteLine($"  Aspect ratio: {PixelMapper.AspectRatio:F3}");
+
+        // Resolve LED string settings (if enabled)
+        if (_stringEnabled)
+        {
+            if (_stringSize < 1)
+            {
+                Console.WriteLine($"[ERROR] --string-size must be >= 1 (got {_stringSize}).");
+                return;
+            }
+            int matrixUniverses = (PixelMapper.TotalChannels + 509) / 510; // 4 for the 53×11 matrix
+            _stringUniverseResolved = _stringUniverse > 0 ? _stringUniverse : UniverseId + matrixUniverses;
+            _stringRowResolved = _stringRow >= 0 ? _stringRow : (MatH - 1) / 2;
+            if (_stringRowResolved < 0 || _stringRowResolved >= MatH)
+            {
+                Console.WriteLine($"[ERROR] --string-row must be 0..{MatH - 1} (got {_stringRow}).");
+                return;
+            }
+            Console.WriteLine($"  String: {_stringSize} LEDs, row={_stringRowResolved}, universe={_stringUniverseResolved}, target={_stringIp ?? TargetIp}");
+        }
         Console.WriteLine();
 
         // Resolve shader source(s) — file override, demo mode, or built-in default
@@ -474,6 +520,14 @@ void main()
 
         _sender = new E131Sender(TargetIp, 5568);
         Console.WriteLine("E.1.31 sender initialized.");
+
+        if (_stringEnabled)
+        {
+            string strIp = _stringIp ?? TargetIp;
+            _stringSender = new E131Sender(strIp, 5568);
+            _stringBuffer = new byte[_stringSize * 3];
+            Console.WriteLine($"LED string sender initialized ({_stringSize} LEDs → {strIp}:5568, universe={_stringUniverseResolved}).");
+        }
 
         // Initialize audio capture if requested
         if (_audioEnabled)
@@ -794,6 +848,22 @@ void main()
             Console.WriteLine($"[E1.31] Send failed: {ex.Message}");
         }
 
+        // Send to LED string — mirrors a matrix row (default: center row)
+        if (_stringSender != null)
+        {
+            PixelMapper.MapRowToString(_frameBuffer.AsSpan(), _stringRowResolved, _stringSize, _stringBuffer.AsSpan());
+            try
+            {
+                _stringSender.SendFrameMultiUniverse(_stringBuffer, (ushort)_stringUniverseResolved);
+                _stringFramesSent++;
+            }
+            catch (Exception ex)
+            {
+                _stringSendErrors++;
+                Console.WriteLine($"[String] Send failed: {ex.Message}");
+            }
+        }
+
         _frameCount++;
         long nowMs = Environment.TickCount64;
         if (nowMs - _lastStatusLogMs >= 1000)
@@ -801,7 +871,8 @@ void main()
             int r = _e131Buffer.Length > 0 ? _e131Buffer[0] : 0;
             int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;
             int b = _e131Buffer.Length > 2 ? _e131Buffer[2] : 0;
-            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}");
+            string strStats = _stringSender != null ? $" | stringSent={_stringFramesSent} | stringErr={_stringSendErrors}" : "";
+            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}{strStats}");
             _frameCount = 0;
             _lastStatusLogMs = nowMs;
         }
@@ -918,6 +989,22 @@ void main()
             Console.WriteLine($"[E1.31] Send failed: {ex.Message}");
         }
 
+        // Send to LED string — mirrors a matrix row (default: center row)
+        if (_stringSender != null)
+        {
+            PixelMapper.MapRowToString(_frameBuffer.AsSpan(), _stringRowResolved, _stringSize, _stringBuffer.AsSpan());
+            try
+            {
+                _stringSender.SendFrameMultiUniverse(_stringBuffer, (ushort)_stringUniverseResolved);
+                _stringFramesSent++;
+            }
+            catch (Exception ex)
+            {
+                _stringSendErrors++;
+                Console.WriteLine($"[String] Send failed: {ex.Message}");
+            }
+        }
+
         _frameCount++;
         long nowMs = Environment.TickCount64;
         if (nowMs - _lastStatusLogMs >= 2000)
@@ -925,7 +1012,8 @@ void main()
             int r = _e131Buffer.Length > 0 ? _e131Buffer[0] : 0;
             int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;
             int b = _e131Buffer.Length > 2 ? _e131Buffer[2] : 0;
-            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/2s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}");
+            string strStats = _stringSender != null ? $" | stringSent={_stringFramesSent} | stringErr={_stringSendErrors}" : "";
+            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/2s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}{strStats}");
             _frameCount = 0;
             _lastStatusLogMs = nowMs;
         }
@@ -944,6 +1032,7 @@ void main()
         _webServer?.Stop();
         _audioCapture?.Dispose();
         _sender?.Dispose();
+        _stringSender?.Dispose();
         // Dispose the shader program before the window: its GL deletion calls
         // (DeleteProgram, DeleteTexture, DeleteBuffer, DeleteVertexArray, ...)
         // require a live GL context, which the window owns.
