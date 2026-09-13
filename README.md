@@ -274,6 +274,8 @@ An LED string can be streamed in parallel with the matrix via `--string`:
 
 Pixels are nearest-neighbor sampled from the chosen matrix row (LED *i* takes matrix pixel at `x = i × 53 / n`), so the string mirrors what the matrix shows and stays perfectly in sync — no extra GPU work. Counts above the matrix width (53) reuse row pixels via nearest-neighbor; very long strings span multiple universes automatically.
 
+Universe numbers follow the sACN contract (1..63999): at startup the string's base universe and the last universe the string occupies are validated, and `--string-size` is bounded by the channel capacity available from the base universe. Out-of-range settings abort startup with a clear error before any buffer is allocated.
+
 ## Audio Capture Details
 
 ### FFT Configuration

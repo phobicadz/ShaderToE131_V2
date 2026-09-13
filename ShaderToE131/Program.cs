@@ -338,13 +338,18 @@ void main()
         // Resolve LED string settings (if enabled)
         if (_stringEnabled)
         {
-            if (_stringSize < 1)
+            int matrixUniverses = (PixelMapper.TotalChannels + 509) / 510; // 4 for the 53×11 matrix
+            int baseUniverse = _stringUniverse > 0 ? _stringUniverse : UniverseId + matrixUniverses;
+            // Bounds --string-size by the channel capacity from the base universe and
+            // validates the base/last universes against the 1..63999 sACN contract
+            // before the string buffer is allocated or anything is sent.
+            string? error = StringOutput.Validate(_stringSize, baseUniverse);
+            if (error != null)
             {
-                Console.WriteLine($"[ERROR] --string-size must be >= 1 (got {_stringSize}).");
+                Console.WriteLine($"[ERROR] {error}");
                 return;
             }
-            int matrixUniverses = (PixelMapper.TotalChannels + 509) / 510; // 4 for the 53×11 matrix
-            _stringUniverseResolved = _stringUniverse > 0 ? _stringUniverse : UniverseId + matrixUniverses;
+            _stringUniverseResolved = baseUniverse;
             _stringRowResolved = _stringRow >= 0 ? _stringRow : (MatH - 1) / 2;
             if (_stringRowResolved < 0 || _stringRowResolved >= MatH)
             {
