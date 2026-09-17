@@ -277,7 +277,7 @@ void main()
             Console.WriteLine("  --string               Also stream an LED string in parallel with the matrix");
             Console.WriteLine("  --string-size <n>      LED string length (default: 50)");
             Console.WriteLine("  --string-row <y>       Matrix row to sample the string from (default: center row)");
-            Console.WriteLine("  --string-ip <ip>       Target IP for the string (default: same as matrix)");
+            Console.WriteLine("  --string-ip <ip|host>  Target IP or hostname for the string (default: same as matrix)");
             Console.WriteLine("  --string-universe <n>  Universe for the string (default: first after the matrix's universes)");
             Console.WriteLine("  --list-devices         List available audio input devices and exit");
             Console.WriteLine();
@@ -784,9 +784,22 @@ void main()
             return;
         }
 
-        _stringSender?.Dispose();
+        // Create the new sender before disposing the old one so a resolution
+        // failure (e.g. an mDNS name that dropped off the network) keeps the
+        // previous sender running instead of killing the render thread.
         string strIp = effectiveIp ?? TargetIp;
-        _stringSender = new E131Sender(strIp, 5568);
+        E131Sender newSender;
+        try
+        {
+            newSender = new E131Sender(strIp, 5568);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Web] LED string sender failed for target '{strIp}': {ex.Message} (previous sender left running).");
+            return;
+        }
+        _stringSender?.Dispose();
+        _stringSender = newSender;
         _stringBuffer = new byte[size * 3];
         _stringFramesSent = 0;
         _stringSendErrors = 0;

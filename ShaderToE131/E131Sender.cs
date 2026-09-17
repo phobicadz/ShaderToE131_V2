@@ -51,7 +51,7 @@ public sealed class E131Sender : IDisposable
 
     public E131Sender(string targetIp, int port = 5568)
     {
-        var targetAddress = IPAddress.Parse(targetIp);
+        var targetAddress = ParseOrResolve(targetIp);
         _destination = new IPEndPoint(targetAddress, port);
 
         // Find best local address for the target subnet.
@@ -62,6 +62,32 @@ public sealed class E131Sender : IDisposable
         _sendSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         _sendSocket.Bind(new IPEndPoint(localAddr, 0));
         _sendSocket.SendBufferSize = 2720000;
+    }
+
+    /// <summary>
+    /// Parse a literal IPv4/IPv6 address, or resolve a hostname (e.g. an mDNS
+    /// name like 'ledstring.local') to an address. IPv4 is preferred.
+    /// </summary>
+    private static IPAddress ParseOrResolve(string target)
+    {
+        if (IPAddress.TryParse(target, out var literal))
+            return literal;
+
+        IPAddress? resolved;
+        try
+        {
+            var addresses = Dns.GetHostAddresses(target);
+            resolved = addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)
+                     ?? addresses.FirstOrDefault();
+        }
+        catch (Exception ex) when (ex is not ArgumentException)
+        {
+            throw new ArgumentException($"Could not resolve host '{target}': {ex.Message}", ex);
+        }
+        if (resolved == null)
+            throw new ArgumentException($"Could not resolve host '{target}'.");
+        Console.WriteLine($"[E131] Resolved host '{target}' -> {resolved}");
+        return resolved;
     }
 
     /// <summary>

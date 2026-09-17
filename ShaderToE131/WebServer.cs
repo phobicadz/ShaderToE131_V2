@@ -484,8 +484,8 @@ public sealed class WebServer : IDisposable
         <input type=""number"" id=""stringRow"" min=""0"" max=""10"" placeholder=""5 (center)"">
       </div>
       <div>
-        <label for=""stringIp"">Target IP</label>
-        <input type=""text"" id=""stringIp"" placeholder=""same as matrix"">
+        <label for=""stringIp"">Target IP / hostname</label>
+        <input type=""text"" id=""stringIp"" placeholder=""same as matrix"" title=""IPv4/IPv6 address or hostname (e.g. ledstring.local); blank = matrix IP"">
       </div>
       <div>
         <label for=""stringUniverse"">Universe</label>
@@ -994,7 +994,15 @@ setInterval(refreshStatus, 2000);
                 ip = ipe.GetString();
                 ipProvided = true;
                 if (!string.IsNullOrEmpty(ip) && !IPAddress.TryParse(ip, out _))
-                    error = $"'ip' is not a valid IP address: '{ip}'. Leave it blank to target the matrix IP.";
+                {
+                    // Not a literal IP: treat it as a hostname (e.g. mDNS 'ledstring.local').
+                    // Verify it resolves now so a typo is reported here, not at sender startup.
+                    bool resolved = false;
+                    try { resolved = Dns.GetHostAddresses(ip).Length > 0; }
+                    catch { resolved = false; }
+                    if (!resolved)
+                        error = $"'ip' is neither a valid IP address nor a resolvable hostname: '{ip}'. Leave it blank to target the matrix IP.";
+                }
             }
             else if (ipe.ValueKind == JsonValueKind.Null)
             {

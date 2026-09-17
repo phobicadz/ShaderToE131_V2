@@ -132,7 +132,7 @@ dotnet run --help
 | `--string` | Also stream an LED string in parallel with the matrix |
 | `--string-size <n>` | LED string length (default: 50) |
 | `--string-row <y>` | Matrix row to sample the string from (default: center row) |
-| `--string-ip <ip>` | Target IP for the string (default: same as matrix) |
+| `--string-ip <ip\|host>` | Target IP or hostname (e.g. `ledstring.local`) for the string (default: same as matrix) |
 | `--string-universe <n>` | Universe for the string (default: first after the matrix's universes) |
 | `--list-devices` | List available audio input devices and exit |
 | `--help, -h` | Show usage help |
@@ -162,7 +162,7 @@ http://localhost:<port>
 | `/api/set-audio-source` | POST | Set source: `off`, `microphone`, or `loopback` | `{"ok": true, "source", "enabled"}` |
 | `/api/audio-devices` | GET | List available loopback devices | `{devices: [{index, name}]}` |
 | `/api/set-audio-device` | POST | Select loopback device by index | `{"ok": true/false}` |
-| `/api/set-string` | POST | Configure LED string: `{enabled, size, row, ip, universe}` (omit fields to keep current values; `ip: ""` resets to the matrix IP; `universe: 0` = auto) | `{"ok": true/false}` |
+| `/api/set-string` | POST | Configure LED string: `{enabled, size, row, ip, universe}` (omit fields to keep current values; `ip` accepts an IP or a hostname, e.g. `ledstring.local`; `ip: ""` resets to the matrix IP; `universe: 0` = auto) | `{"ok": true/false}` |
 | `/api/string-config` | GET | Current LED string config + live stats | JSON object (see below) |
 | `/api/status` | GET | Get current status and stats | JSON object (see below) |
 
@@ -298,7 +298,7 @@ An LED string can be streamed in parallel with the matrix via `--string`:
 |-----------|---------|--------|
 | LED count | 50 (150 channels → 1 universe) | `--string-size <n>` |
 | Sample row | center row (5 of 0–10) | `--string-row <y>` |
-| Target IP | matrix IP (`192.168.2.150`) | `--string-ip <ip>` |
+| Target IP / hostname | matrix IP (`192.168.2.150`) | `--string-ip <ip\|host>` |
 | Universe | 5 (first after the matrix's 1–4) | `--string-universe <n>` |
 
 Pixels are nearest-neighbor sampled from the chosen matrix row (LED *i* takes matrix pixel at `x = i × 53 / n`), so the string mirrors what the matrix shows and stays perfectly in sync — no extra GPU work. Counts above the matrix width (53) reuse row pixels via nearest-neighbor; very long strings span multiple universes automatically.
