@@ -469,10 +469,10 @@ public sealed class WebServer : IDisposable
     <h2>LED String</h2>
     <div class=""toggle-row"">
       <label class=""toggle-switch"">
-        <input type=""checkbox"" id=""stringEnabled"">
+        <input type=""checkbox"" id=""stringEnabled"" aria-labelledby=""stringEnabledDesc"">
         <span class=""toggle-slider""></span>
       </label>
-      <span class=""desc"">Stream an LED string in parallel with the matrix (mirrors a matrix row)</span>
+      <span class=""desc"" id=""stringEnabledDesc"">Stream an LED string in parallel with the matrix (mirrors a matrix row)</span>
     </div>
     <div class=""grid2"">
       <div>
@@ -577,6 +577,15 @@ function syncAudioUi(d) {
   const sel = $('audioSourceSelect');
   if (d.audioSource && sel.value !== d.audioSource) sel.value = d.audioSource;
   $('audioDeviceSelect').disabled = d.audioSource !== 'loopback';
+  if (d.audioSource === 'loopback' && d.loopbackDeviceName) {
+    const devSel = $('audioDeviceSelect');
+    for (const opt of devSel.options) {
+      if (opt.text === d.loopbackDeviceName) {
+        if (devSel.value !== opt.value) devSel.value = opt.value;
+        break;
+      }
+    }
+  }
   let label;
   if (!d.audioEnabled) label = 'off';
   else if (d.audioSource === 'loopback') label = 'loopback' + (d.loopbackDeviceName ? ' · ' + truncate(d.loopbackDeviceName, 24) : '');
@@ -689,11 +698,21 @@ async function refreshStatus() {
     syncAudioUi(d);
 
     // Keep the shader dropdown in sync with the server without clobbering a
-    // shader the user just picked but hasn't applied yet.
-    if (d.selectedShader && $('shaderSelect').value !== d.selectedShader) {
-      const match = [...$('shaderSelect').options].find(o => o.value === d.selectedShader || o.value + '.glsl' === d.selectedShader);
-      if (match) $('shaderSelect').value = match.value;
+    // shader (or 'off') the user just picked but hasn't applied yet. We only
+    // sync when the dropdown still matches what the server reported on the
+    // previous poll (or on the first poll); otherwise the user is staging a
+    // manual selection and we leave it alone.
+    const sel = $('shaderSelect');
+    const prevServer = window._shaderServerSel;
+    if (prevServer === undefined || sel.value === prevServer) {
+      if (d.selectedShader === 'off') {
+        sel.value = 'off';
+      } else {
+        const match = [...sel.options].find(o => o.value === d.selectedShader || o.value + '.glsl' === d.selectedShader);
+        if (match) sel.value = match.value;
+      }
     }
+    window._shaderServerSel = d.selectedShader;
 
     $('stString').textContent = !d.stringEnabled ? 'off'
       : (d.stringSize + ' LEDs · uni ' + (d.stringUniverse > 0 ? d.stringUniverse : 'auto') + ' → ' + (d.stringIp || 'matrix IP'));
@@ -924,7 +943,12 @@ setInterval(refreshStatus, 2000);
         static int? GetIntValue(JsonElement e, out string? err)
         {
             err = null;
-            if (e.ValueKind == JsonValueKind.Number) return e.GetInt32();
+            if (e.ValueKind == JsonValueKind.Number)
+            {
+                if (e.TryGetInt32(out int nv)) return nv;
+                err = "must be an integer";
+                return null;
+            }
             if (e.ValueKind == JsonValueKind.String && int.TryParse(e.GetString(), out int v)) return v;
             err = "must be an integer";
             return null;
@@ -941,7 +965,8 @@ setInterval(refreshStatus, 2000);
         {
             if (e.ValueKind == JsonValueKind.True) enabled = true;
             else if (e.ValueKind == JsonValueKind.False) enabled = false;
-            else if (e.ValueKind == JsonValueKind.Number) enabled = e.GetInt32() != 0;
+            else if (e.ValueKind == JsonValueKind.Number && e.TryGetInt32(out int iv)) enabled = iv != 0;
+            else if (e.ValueKind == JsonValueKind.Number) error = "'enabled' must be a boolean.";
             else if (e.ValueKind == JsonValueKind.String && bool.TryParse(e.GetString(), out bool b)) enabled = b;
             else error = "'enabled' must be a boolean.";
         }
@@ -1056,6 +1081,7 @@ setInterval(refreshStatus, 2000);
     /// </summary>
     public ApiStatus? StatusSnapshot
     {
+        get => _statusSnapshot;
         set { _statusSnapshot = value; }
     }
 
@@ -1103,7 +1129,7 @@ setInterval(refreshStatus, 2000);
             var devices = devicesRaw.Select(d => new { Index = d.Index, Name = d.Name }).ToList();
             bool audioOn = GetAudioEnabled != null && GetAudioEnabled()!;
             SendJson(clientSocket,
-                new ApiStatus("—", audioOn, audioOn ? (GetCurrentAudioSource?.Invoke() ?? "microphone") : "off", _shaderList.Count,
+                new ApiStatus("off", audioOn, audioOn ? (GetCurrentAudioSource?.Invoke() ?? "microphone") : "off", _shaderList.Count,
                     _shaderList.Where(s => s.IsAudioReactive).Select(s => s.Name!).ToArray()!, 0, 0, 0,
                     GetLoopbackDeviceName?.Invoke(), devicesRaw,
                     false, 50, (PixelMapper.Height - 1) / 2, null, 0, 0, 0));

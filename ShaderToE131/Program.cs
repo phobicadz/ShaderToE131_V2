@@ -61,6 +61,9 @@ class Program : IDisposable
     private int _stringRowResolved;
     private int _stringFramesSent;
     private int _stringSendErrors;
+    // Thread-safe hand-off from the web server's single volatile slot to the render
+    // thread, so a change arriving between a read and clear is never lost.
+    private readonly System.Collections.Concurrent.ConcurrentQueue<WebServer.StringConfigChange> _pendingStringChanges = new();
 
     private static readonly string[] AudioUniformNames =
         { "u_bass", "u_lowmid", "u_mid", "u_highmid", "u_treble", "u_volume" };
@@ -739,17 +742,6 @@ void main()
         string? ip = change.Ip;              // null = keep; "" = reset to matrix IP
         int universe = change.Universe ?? _stringUniverse;
 
-        if (!enabled)
-        {
-            _stringSender?.Dispose();
-            _stringSender = null;
-            _stringBuffer = Array.Empty<byte>();
-            _stringFramesSent = 0;
-            _stringSendErrors = 0;
-            Console.WriteLine("[Web] LED string disabled.");
-            return;
-        }
-
         string? effectiveIp = ip == null ? _stringIp : (ip.Length == 0 ? null : ip);
         int effectiveUniverse = universe;
         int effectiveRow = row >= 0 ? row : (MatH - 1) / 2;
@@ -757,6 +749,9 @@ void main()
         int matrixUniverses = (PixelMapper.TotalChannels + 509) / 510;
         int baseUniverse = effectiveUniverse > 0 ? effectiveUniverse : UniverseId + matrixUniverses;
 
+        // Validate the requested configuration before touching anything, so an
+        // invalid request is rejected wholesale and a disabled string can still
+        // be preconfigured (its configured fields are committed below).
         string? error = StringOutput.Validate(size, baseUniverse);
         if (error != null)
         {
@@ -769,16 +764,30 @@ void main()
             return;
         }
 
-        _stringSender?.Dispose();
-        string strIp = effectiveIp ?? TargetIp;
-        _stringSender = new E131Sender(strIp, 5568);
-        _stringBuffer = new byte[size * 3];
+        // Commit the configured (and resolved) values regardless of enabled state,
+        // so a request that only preconfigures a disabled string is not discarded.
         _stringSize = size;
         _stringRow = row;
         _stringIp = effectiveIp;
         _stringUniverse = effectiveUniverse;
         _stringUniverseResolved = baseUniverse;
         _stringRowResolved = effectiveRow;
+
+        if (!enabled)
+        {
+            _stringSender?.Dispose();
+            _stringSender = null;
+            _stringBuffer = Array.Empty<byte>();
+            _stringFramesSent = 0;
+            _stringSendErrors = 0;
+            Console.WriteLine("[Web] LED string disabled.");
+            return;
+        }
+
+        _stringSender?.Dispose();
+        string strIp = effectiveIp ?? TargetIp;
+        _stringSender = new E131Sender(strIp, 5568);
+        _stringBuffer = new byte[size * 3];
         _stringFramesSent = 0;
         _stringSendErrors = 0;
         Console.WriteLine($"[Web] LED string configured: {size} LEDs, row={effectiveRow}, universe={baseUniverse}, target={strIp}");
@@ -786,12 +795,21 @@ void main()
 
     private unsafe void OnRender(double deltaTime)
     {
-        // Apply a pending LED string configuration change from the web UI (render thread).
-        if (_webServer != null && _webServer.PendingStringChange != null)
+        // Apply pending LED string configuration changes from the web UI (render thread).
+        // Pull everything out of the web server's single volatile slot into a
+        // thread-safe queue so no change is lost if requests arrive between read and clear.
+        if (_webServer != null)
         {
-            var change = _webServer.PendingStringChange!;
-            _webServer.PendingStringChange = null;
-            ApplyStringChange(change);
+            while (_webServer.PendingStringChange is { } change)
+            {
+                _webServer.PendingStringChange = null;
+                _pendingStringChanges.Enqueue(change);
+            }
+        }
+        // Apply all queued changes in order.
+        while (_pendingStringChanges.TryDequeue(out var queued))
+        {
+            ApplyStringChange(queued);
         }
 
         // Check for pending shader change BEFORE null guard — when coming from "Off",
@@ -857,6 +875,13 @@ void main()
             _webServer.PendingShaderSource = null;  // consume
             _webServer.PendingShaderFileName = null;
             _isOff = true;
+
+            // Publish an explicit "off" in the snapshot so the web UI never sees a
+            // stale shader name while no shader is loaded (the snapshot update below
+            // is skipped once the shader is null).
+            var currentSnapshot = _webServer.StatusSnapshot;
+            if (currentSnapshot != null)
+                _webServer.StatusSnapshot = currentSnapshot with { SelectedShader = "off" };
         }
 
         // Update web server status (with live stats)
@@ -886,7 +911,7 @@ void main()
                 _stringSize,
                 _stringRow >= 0 ? _stringRow : (MatH - 1) / 2,
                 _stringIp,
-                _stringUniverseResolved,
+                _stringUniverse,
                 _stringFramesSent,
                 _stringSendErrors
             );
@@ -972,12 +997,21 @@ void main()
 
     private unsafe void OnRenderHeadless(double deltaTime)
     {
-        // Apply a pending LED string configuration change from the web UI (render thread).
-        if (_webServer != null && _webServer.PendingStringChange != null)
+        // Apply pending LED string configuration changes from the web UI (render thread).
+        // Pull everything out of the web server's single volatile slot into a
+        // thread-safe queue so no change is lost if requests arrive between read and clear.
+        if (_webServer != null)
         {
-            var change = _webServer.PendingStringChange!;
-            _webServer.PendingStringChange = null;
-            ApplyStringChange(change);
+            while (_webServer.PendingStringChange is { } change)
+            {
+                _webServer.PendingStringChange = null;
+                _pendingStringChanges.Enqueue(change);
+            }
+        }
+        // Apply all queued changes in order.
+        while (_pendingStringChanges.TryDequeue(out var queued))
+        {
+            ApplyStringChange(queued);
         }
 
         // Check for pending shader change BEFORE null guard — when coming from "Off",
@@ -1014,6 +1048,13 @@ void main()
             _webServer.PendingShaderSource = null;  // consume
             _webServer.PendingShaderFileName = null;
             _isOff = true;
+
+            // Publish an explicit "off" in the snapshot so the web UI never sees a
+            // stale shader name while no shader is loaded (the snapshot update below
+            // is skipped once the shader is null).
+            var currentSnapshot = _webServer.StatusSnapshot;
+            if (currentSnapshot != null)
+                _webServer.StatusSnapshot = currentSnapshot with { SelectedShader = "off" };
         }
 
         // Update web server status (with live stats)
@@ -1043,7 +1084,7 @@ void main()
                 _stringSize,
                 _stringRow >= 0 ? _stringRow : (MatH - 1) / 2,
                 _stringIp,
-                _stringUniverseResolved,
+                _stringUniverse,
                 _stringFramesSent,
                 _stringSendErrors
             );
