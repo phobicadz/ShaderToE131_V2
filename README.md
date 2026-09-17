@@ -10,7 +10,7 @@ ShaderToE131 takes [ShaderToy-style](https://www.shadertoy.com/) GLSL shaders (`
 
 - 🎨 **ShaderToy-compatible GLSL shaders** — auto-wrapped with uniforms (`u_time`, `u_resolution`, `u_frame`)
 - 🔊 **Audio reactivity** — FFT spectral analysis (2048-point, ~21.5 Hz resolution) feeds bass/mid/treble bands as shader uniforms
-- 🌐 **Web control panel** — select shaders, view status, toggle audio without restarting
+- 🌐 **Web control panel** — select shaders, switch audio source/devices, configure the LED string, and view live status — all without restarting
 - 📡 **E.1.31/sACN output** — UDP multicast/unicast to LED matrix controllers (4 universes: 583 pixels × 3 channels = 1749 DMX slots)
 - 🧵 **Optional LED string output** — stream a separate N-LED string (default 50) in parallel with the matrix, mirroring a matrix row
 - 🎭 **Demo mode** — auto-cycle through all shaders in directory
@@ -147,17 +147,23 @@ http://localhost:<port>
 
 ### Features
 
-- **Shader dropdown** — browse and select from all `.glsl` files in shader directory
-- 🔊 **Audio-reactive badges** — shaders with audio uniforms are marked
-- **Loopback device name** — displays current loopback capture device friendly name
-- **Status grid** — shows selected shader, total shader count, uptime, frames sent, send errors
+- **Shader section** — browse and select from all `.glsl` files in shader directory, including an "Off (blank)" option; 🔊 marks audio-reactive shaders
+- **Audio section** — choose the audio source (off / microphone / loopback system audio) and pick a specific loopback capture device; changes apply without restarting
+- **LED String section** — enable/disable a parallel LED string stream and configure LED count, source matrix row, target IP, and sACN universe; settings apply on the next frame
+- **Status grid** — shows current shader, audio source, string state, uptime, matrix frames sent, and send errors (auto-refreshes every 2 s)
 
 ### API Endpoints
 
 | Endpoint | Method | Description | Response |
 |----------|--------|-------------|----------|
 | `/api/shaders` | GET | List all available shaders | JSON array of `{name, fileName, isAudioReactive}` |
-| `/api/select-shader` | POST | Select a shader by filename | `{"success": true/false}` |
+| `/api/select-shader` | POST | Select a shader by filename (`"off"` for blank) | `{"ok": true/false}` |
+| `/api/set-audio` | POST | Enable/disable audio capture | `{"ok": true/false}` |
+| `/api/set-audio-source` | POST | Set source: `off`, `microphone`, or `loopback` | `{"ok": true, "source", "enabled"}` |
+| `/api/audio-devices` | GET | List available loopback devices | `{devices: [{index, name}]}` |
+| `/api/set-audio-device` | POST | Select loopback device by index | `{"ok": true/false}` |
+| `/api/set-string` | POST | Configure LED string: `{enabled, size, row, ip, universe}` (omit fields to keep current values; `ip: ""` resets to the matrix IP; `universe: 0` = auto) | `{"ok": true/false}` |
+| `/api/string-config` | GET | Current LED string config + live stats | JSON object (see below) |
 | `/api/status` | GET | Get current status and stats | JSON object (see below) |
 
 #### Status Response
@@ -166,12 +172,35 @@ http://localhost:<port>
 {
   "selectedShader": "neon.glsl",
   "audioEnabled": false,
+  "audioSource": "off",
   "totalShaders": 31,
   "audioReactiveNames": ["audio_reactive_bass_pulse.glsl", ...],
   "uptimeSecs": 123.456,
   "framesSent": 7407,
   "sendErrors": 0,
-  "loopbackDeviceName": "Speakers (Realtek Audio)"
+  "loopbackDeviceName": "Speakers (Realtek Audio)",
+  "stringEnabled": true,
+  "stringSize": 50,
+  "stringRow": 5,
+  "stringIp": null,
+  "stringUniverse": 0,
+  "stringFramesSent": 1234,
+  "stringSendErrors": 0
+}
+```
+
+#### String Config Response
+
+```json
+{
+  "enabled": true,
+  "size": 50,
+  "row": 5,
+  "ip": null,
+  "universe": 0,
+  "framesSent": 1234,
+  "sendErrors": 0,
+  "matrixHeight": 11
 }
 ```
 
@@ -314,7 +343,7 @@ Universe numbers follow the sACN contract (1..63999): at startup the string's ba
 ```
 ShaderToE131/
   Program.cs          ← Entry point, render loop, OpenGL init, shader lifecycle
-  WebServer.cs        ← HttpListener web UI + REST API endpoints
+  WebServer.cs        ← web UI + REST API endpoints (shaders, audio, string config)
   E131Sender.cs       ← E.1.31/sACN UDP packet builder and sender
   PixelMapper.cs      ← Framebuffer → LED channel mapping (53×11 matrix)
   AudioCapture.cs     ← NAudio audio capture, FFT, spectral band analysis

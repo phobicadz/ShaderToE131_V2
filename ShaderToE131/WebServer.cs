@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -35,21 +35,56 @@ public sealed class WebServer : IDisposable
     public Action<int>? SetAudioDeviceIndex { get; set; }         // change audio device index via web
     public Func<List<(int Index, string Name)>>? GetAvailableDevices { get; set; }  // list available devices for selection UI
 
+    // ─── LED string output state ───
+    // A pending config change posted by the web UI; consumed (and cleared) by the
+    // render loop once it has been applied on the GL thread.
+    private volatile StringConfigChange? _pendingStringChange;
+    public StringConfigChange? PendingStringChange { get => _pendingStringChange; set => _pendingStringChange = value; }
+    public Func<LiveStringState>? GetLiveStringState { get; set; }  // current string config + live stats
+
     private readonly List<ShaderInfo> _shaderList = new();
     internal IReadOnlyList<ShaderInfo> Shaders => _shaderList;
     private volatile ApiStatus? _statusSnapshot;
 
     public record ShaderInfo(string Name, string FileName, bool IsAudioReactive);
+
+    /// <summary>
+    /// Pending LED string config change posted from the web UI.
+    /// A null field means "leave unchanged". For <see cref="Ip"/> an empty string
+    /// means "reset to the matrix IP"; for <see cref="Universe"/> 0 means "auto".
+    /// </summary>
+    public record StringConfigChange(bool? Enabled, int? Size, int? Row, string? Ip, int? Universe);
+
+    /// <summary>Current LED string configuration plus live send stats.</summary>
+    public record LiveStringState(
+        bool Enabled,
+        int Size,
+        int Row,
+        string? Ip,          // null = same as matrix
+        int Universe,        // 0 = auto
+        int FramesSent,
+        int SendErrors,
+        int MatrixHeight
+    );
+
     public record ApiStatus(
         string SelectedShader,
         bool AudioEnabled,
+        string? AudioSource,   // "off" | "microphone" | "loopback"
         int TotalShaders,
         string[] AudioReactiveNames,
         double UptimeSecs,
         int FramesSent,
         int SendErrors,
         string? LoopbackDeviceName,
-        List<(int Index, string Name)> AvailableDevices
+        List<(int Index, string Name)> AvailableDevices,
+        bool StringEnabled,
+        int StringSize,
+        int StringRow,
+        string? StringIp,
+        int StringUniverse,
+        int StringFramesSent,
+        int StringSendErrors
     );
 
     private static readonly JsonSerializerOptions JsonCamelCase = new()
@@ -273,6 +308,18 @@ public sealed class WebServer : IDisposable
                     if (method == "POST") ServeSetAudioDevice(clientSocket, body);
                     else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
                     break;
+                case "/api/set-audio-source":
+                    if (method == "POST") ServeSetAudioSource(clientSocket, body);
+                    else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
+                    break;
+                case "/api/set-string":
+                    if (method == "POST") ServeSetString(clientSocket, body);
+                    else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
+                    break;
+                case "/api/string-config":
+                    if (method == "GET") ServeStringConfig(clientSocket);
+                    else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
+                    break;
                 case "/api/status":
                     if (method == "GET") ServeStatus(clientSocket);
                     else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
@@ -341,7 +388,8 @@ public sealed class WebServer : IDisposable
 
     private void ServeIndex(Socket clientSocket)
     {
-        string html = @"<!DOCTYPE html>
+        string html = @"
+<!DOCTYPE html>
 <html lang=""en"">
 <head>
 <meta charset=""UTF-8"">
@@ -350,28 +398,38 @@ public sealed class WebServer : IDisposable
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; min-height: 100vh; display: flex; justify-content: center; align-items: flex-start; padding-top: 40px; }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 32px; width: 520px; max-width: 95vw; box-shadow: 0 8px 32px rgba(0,0,0,.4); }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 28px; width: 580px; max-width: 95vw; box-shadow: 0 8px 32px rgba(0,0,0,.4); }
   h1 { font-size: 1.6rem; margin-bottom: 4px; color: #58a6ff; }
-  .subtitle { font-size: 0.85rem; color: #8b949e; margin-bottom: 24px; }
-  label { display: block; font-weight: 600; font-size: 0.9rem; margin-bottom: 6px; color: #c9d1d9; }
-  select, button { width: 100%; padding: 10px 14px; border-radius: 8px; font-size: 0.95rem; border: 1px solid #30363d; background: #21262d; color: #c9d1d9; cursor: pointer; }
-  select:focus, button:focus { outline: none; border-color: #58a6ff; box-shadow: 0 0 0 3px rgba(88,166,255,.15); }
+  .subtitle { font-size: 0.85rem; color: #8b949e; margin-bottom: 20px; }
+  .section { margin-bottom: 20px; padding-bottom: 18px; border-bottom: 1px solid #21262d; }
+  .section:last-of-type { border-bottom: none; margin-bottom: 0; }
+  h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; margin-bottom: 12px; }
+  label { display: block; font-weight: 600; font-size: 0.85rem; margin-bottom: 6px; color: #c9d1d9; }
+  select, input[type=number], input[type=text], button { width: 100%; padding: 9px 12px; border-radius: 8px; font-size: 0.9rem; border: 1px solid #30363d; background: #21262d; color: #c9d1d9; }
+  select:focus, input:focus, button:focus { outline: none; border-color: #58a6ff; box-shadow: 0 0 0 3px rgba(88,166,255,.15); }
   select:hover, button:hover { background: #292e36; }
+  select:disabled { opacity: 0.45; cursor: not-allowed; }
+  button { cursor: pointer; margin-top: 10px; }
   button.primary { background: #238636; border-color: #2ea043; color: #fff; font-weight: 600; }
   button.primary:hover { background: #2ea043; }
-  .toggle-row { display: flex; align-items: center; gap: 14px; margin-bottom: 20px; }
-  .toggle-switch { position: relative; width: 52px; height: 28px; flex-shrink: 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .toggle-row { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .toggle-row .desc { font-size: 0.85rem; color: #8b949e; }
+  .toggle-switch { position: relative; width: 52px; height: 28px; flex-shrink: 0; display: inline-block; }
   .toggle-switch input { opacity: 0; width: 0; height: 0; }
   .toggle-slider { position: absolute; inset: 0; background: #30363d; border-radius: 14px; cursor: pointer; transition: .2s; }
   .toggle-slider::before { content: ''; position: absolute; width: 22px; height: 22px; left: 3px; top: 3px; background: #c9d1d9; border-radius: 50%; transition: .2s; }
   .toggle-switch input:checked + .toggle-slider { background: #238636; }
   .toggle-switch input:checked + .toggle-slider::before { transform: translateX(24px); }
-  .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-top: 20px; padding-top: 20px; border-top: 1px solid #21262d; }
-  .status-item { background: #0d1117; border-radius: 8px; padding: 10px 14px; text-align: center; }
-  .status-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: .5px; color: #8b949e; margin-bottom: 2px; }
-  .status-value { font-size: 1.05rem; font-weight: 600; color: #58a6ff; word-break: break-all; }
-  .audio-badge { display: inline-block; background: #da3633; color: #fff; font-size: 0.65rem; padding: 2px 7px; border-radius: 4px; margin-left: 8px; vertical-align: middle; }
-  .notice { font-size: 0.8rem; color: #8b949e; margin-top: 12px; text-align: center; }
+  .banner { border-radius: 8px; padding: 10px 14px; font-size: 0.85rem; margin-bottom: 16px; }
+  .banner.ok { background: rgba(35,134,54,.15); border: 1px solid #238636; color: #3fb950; }
+  .banner.error { background: rgba(218,54,51,.15); border: 1px solid #da3633; color: #f85149; }
+  .hint { font-size: 0.75rem; color: #8b949e; margin-top: 8px; }
+  .status-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .status-item { background: #0d1117; border-radius: 8px; padding: 10px 12px; text-align: center; }
+  .status-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: .5px; color: #8b949e; margin-bottom: 2px; }
+  .status-value { font-size: 0.9rem; font-weight: 600; color: #58a6ff; word-break: break-all; }
+  .notice { font-size: 0.75rem; color: #8b949e; margin-top: 14px; text-align: center; }
 </style>
 </head>
 <body>
@@ -379,121 +437,283 @@ public sealed class WebServer : IDisposable
   <h1>ShaderToE131</h1>
   <div class=""subtitle"">LED Matrix Shader Control Panel</div>
 
-  <label for=""shaderSelect"">Shader</label>
-  <select id=""shaderSelect""><option value=""off"">Off (blank)</option><option value="""" >Loading shaders…</option></select>
+  <div id=""banner"" class=""banner ok"" style=""display:none""></div>
 
-  <button class=""primary"" id=""applyBtn"" style=""margin-top:12px"">Apply &amp; Restart Shader</button>
-
-  <label for=""audioDeviceSelect"">Loopback Device</label>
-  <select id=""audioDeviceSelect""><option value=""-1"">Loading devices…</option></select>
-
-  <div class=""status-grid"">
-    <div class=""status-item""><div class=""status-label"">Shader</div><div class=""status-value"" id=""stShader"">—</div></div>
-    <div class=""status-item""><div class=""status-label"">Shaders</div><div class=""status-value"" id=""stCount"">0</div></div>
-
-    <div class=""status-item""><div class=""status-label"">Uptime</div><div class=""status-value"" id=""stUptime"">—</div></div>
+  <div class=""section"">
+    <h2>Shader</h2>
+    <label for=""shaderSelect"">Shader</label>
+    <select id=""shaderSelect""><option value=""off"">Off (blank)</option><option value="""">— select shader —</option></select>
+    <button class=""primary"" id=""applyShaderBtn"">Apply Shader</button>
   </div>
 
-  <div class=""notice"">Auto-refreshes status every 2 s. Changes apply immediately.</div>
+  <div class=""section"">
+    <h2>Audio</h2>
+    <div class=""grid2"">
+      <div>
+        <label for=""audioSourceSelect"">Source</label>
+        <select id=""audioSourceSelect"">
+          <option value=""off"">Off</option>
+          <option value=""microphone"">Microphone</option>
+          <option value=""loopback"">Loopback (system audio)</option>
+        </select>
+      </div>
+      <div>
+        <label for=""audioDeviceSelect"">Loopback Device</label>
+        <select id=""audioDeviceSelect""><option value=""-1"">Loading devices…</option></select>
+      </div>
+    </div>
+    <div class=""hint"">Choosing a device switches the audio source to that loopback device.</div>
+  </div>
+
+  <div class=""section"">
+    <h2>LED String</h2>
+    <div class=""toggle-row"">
+      <label class=""toggle-switch"">
+        <input type=""checkbox"" id=""stringEnabled"">
+        <span class=""toggle-slider""></span>
+      </label>
+      <span class=""desc"">Stream an LED string in parallel with the matrix (mirrors a matrix row)</span>
+    </div>
+    <div class=""grid2"">
+      <div>
+        <label for=""stringSize"">LED Count</label>
+        <input type=""number"" id=""stringSize"" min=""1"" max=""2000"" placeholder=""50"">
+      </div>
+      <div>
+        <label for=""stringRow"">Matrix Row</label>
+        <input type=""number"" id=""stringRow"" min=""0"" max=""10"" placeholder=""5 (center)"">
+      </div>
+      <div>
+        <label for=""stringIp"">Target IP</label>
+        <input type=""text"" id=""stringIp"" placeholder=""same as matrix"">
+      </div>
+      <div>
+        <label for=""stringUniverse"">Universe</label>
+        <input type=""number"" id=""stringUniverse"" min=""0"" max=""63999"" placeholder=""auto"">
+      </div>
+    </div>
+    <button id=""applyStringBtn"">Apply String Settings</button>
+    <div class=""hint"" id=""stringStatus"">Loading…</div>
+  </div>
+
+  <div class=""section"">
+    <h2>Status</h2>
+    <div class=""status-grid"">
+      <div class=""status-item""><div class=""status-label"">Shader</div><div class=""status-value"" id=""stShader"">—</div></div>
+      <div class=""status-item""><div class=""status-label"">Audio</div><div class=""status-value"" id=""stAudio"">—</div></div>
+      <div class=""status-item""><div class=""status-label"">String</div><div class=""status-value"" id=""stString"">—</div></div>
+      <div class=""status-item""><div class=""status-label"">Uptime</div><div class=""status-value"" id=""stUptime"">—</div></div>
+      <div class=""status-item""><div class=""status-label"">Matrix Frames</div><div class=""status-value"" id=""stFrames"">0</div></div>
+      <div class=""status-item""><div class=""status-label"">Send Errors</div><div class=""status-value"" id=""stErrors"">0</div></div>
+    </div>
+  </div>
+
+  <div class=""notice"">Status auto-refreshes every 2 s. Changes apply immediately.</div>
 </div>
 
 <script>
 const API = '';
+let bannerTimer = null;
 
-function ensureCurrentDeviceElement() {
-    let curDeviceEl = document.getElementById('stCurDevice');
-    if (!curDeviceEl) {
-        const devDiv = document.createElement('div');
-        devDiv.className = 'status-item';
-        devDiv.innerHTML = '<div class=""status-label"">Current Device</div><div class=""status-value"" id=""stCurDevice""></div>';
-        document.querySelector('.status-grid').appendChild(devDiv);
-        curDeviceEl = document.getElementById('stCurDevice');
-    }
-    return curDeviceEl;
+function $(id) { return document.getElementById(id); }
+
+function showBanner(msg, isError) {
+  const b = $('banner');
+  b.textContent = msg;
+  b.className = 'banner ' + (isError ? 'error' : 'ok');
+  b.style.display = 'block';
+  clearTimeout(bannerTimer);
+  bannerTimer = setTimeout(() => { b.style.display = 'none'; }, 5000);
 }
 
-function setCurrentDeviceText(name) {
-    const curDeviceEl = ensureCurrentDeviceElement();
-    const text = (name && name.length > 25) ? (name.substring(0, 23) + '..') : (name || '');
-    curDeviceEl.textContent = text;
-}
+function truncate(s, n) { return s && s.length > n ? s.substring(0, n - 2) + '…' : (s || ''); }
 
+// ── Shader ───────────────────────────────────────────────────────
 async function loadShaders() {
   try {
     const r = await fetch(API + 'api/shaders');
     const data = await r.json();
-    const sel = document.getElementById('shaderSelect');
-    sel.innerHTML = '<option value=""off"">Off (blank)</option><option value="""" >— select shader —</option>';
-    for (const s of data.shaders) {
-      const opt = document.createElement('option');
-      opt.value = s.name;
-      opt.textContent = s.name + (s.isAudioReactive ? ' 🔊' : '');
-      sel.appendChild(opt);
-    }
-  } catch(e) { console.error('Failed to load shaders', e); }
+    const sel = $('shaderSelect');
+    const prev = sel.value;
+    sel.innerHTML = '';
+    sel.add(new Option('Off (blank)', 'off'));
+    sel.add(new Option('— select shader —', ''));
+    for (const s of data.shaders) sel.add(new Option(s.name + (s.isAudioReactive ? ' 🔊' : ''), s.name));
+    if (prev !== '' && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+  } catch (e) { console.error('Failed to load shaders', e); }
 }
 
-async function apply() {
-  const shaderName = document.getElementById('shaderSelect').value;
-  if (!shaderName) return alert('Please select a shader.');
+async function applyShader() {
+  const name = $('shaderSelect').value;
+  if (!name) { showBanner('Pick a shader first — or choose ""Off (blank)"".', true); return; }
   try {
-    await fetch(API + 'api/select-shader', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:shaderName}) });
-    document.getElementById('applyBtn').textContent = '✓ Applied!';
-    setTimeout(() => document.getElementById('applyBtn').textContent = 'Apply & Restart Shader', 1500);
-  } catch(e) { alert('Failed to apply changes.'); console.error(e); }
+    const r = await fetch(API + 'api/select-shader', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+    const d = await r.json();
+    if (d.ok) {
+      showBanner(name === 'off' ? 'Shader turned off (blank).' : 'Applied ' + (d.shader || name) + '.', false);
+      refreshStatus();
+    } else {
+      showBanner(d.error || 'Failed to apply shader.', true);
+    }
+  } catch (e) { showBanner('Failed to apply shader: ' + e, true); }
 }
 
+// ── Audio ────────────────────────────────────────────────────────
 async function loadDevices() {
   try {
     const r = await fetch(API + 'api/audio-devices');
     const data = await r.json();
-    const sel = document.getElementById('audioDeviceSelect');
-    // Clear existing options first
+    const sel = $('audioDeviceSelect');
     sel.innerHTML = '';
     if (!data.devices || data.devices.length === 0) {
-      sel.innerHTML = '<option value=""-1"">No loopback devices found</option>';
+      sel.add(new Option('No loopback devices found', '-1'));
       return;
     }
-    for (const dev of data.devices) {
-      const opt = document.createElement('option');
-      opt.value = dev.index;
-      opt.textContent = `${dev.name}`;
-      sel.appendChild(opt);
-    }
-  } catch(e) { console.error('Failed to load audio devices', e); }
+    for (const dev of data.devices) sel.add(new Option(dev.name, dev.index));
+  } catch (e) { console.error('Failed to load audio devices', e); }
 }
 
+function syncAudioUi(d) {
+  const sel = $('audioSourceSelect');
+  if (d.audioSource && sel.value !== d.audioSource) sel.value = d.audioSource;
+  $('audioDeviceSelect').disabled = d.audioSource !== 'loopback';
+  let label;
+  if (!d.audioEnabled) label = 'off';
+  else if (d.audioSource === 'loopback') label = 'loopback' + (d.loopbackDeviceName ? ' · ' + truncate(d.loopbackDeviceName, 24) : '');
+  else label = 'microphone';
+  $('stAudio').textContent = label;
+}
+
+$('audioSourceSelect').addEventListener('change', async (e) => {
+  const source = e.target.value;
+  try {
+    const r = await fetch(API + 'api/set-audio-source', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source }) });
+    const d = await r.json();
+    if (d.ok) showBanner('Audio source set to ' + source + '.', false);
+    else showBanner(d.error || 'Failed to change audio source.', true);
+    refreshStatus();
+  } catch (err) { showBanner('Failed to change audio source: ' + err, true); }
+});
+
+$('audioDeviceSelect').addEventListener('change', async (e) => {
+  const idx = parseInt(e.target.value, 10);
+  if (isNaN(idx)) return;
+  try {
+    const r = await fetch(API + 'api/set-audio-device', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ deviceIndex: idx }) });
+    const d = await r.json();
+    if (d.ok) {
+      const deviceName = e.target.options[e.target.selectedIndex] ? e.target.options[e.target.selectedIndex].text : '';
+      showBanner('Loopback device: ' + deviceName + '.', false);
+      // Changing a device switches the source to loopback on the server.
+      $('audioSourceSelect').value = 'loopback';
+      refreshStatus();
+    } else {
+      showBanner(d.error || 'Failed to change loopback device.', true);
+    }
+  } catch (err) { showBanner('Failed to change loopback device: ' + err, true); }
+});
+
+// ── LED string ───────────────────────────────────────────────────
+async function loadStringConfig() {
+  try {
+    const r = await fetch(API + 'api/string-config');
+    const c = await r.json();
+    $('stringEnabled').checked = !!c.enabled;
+    $('stringSize').value = c.size;
+    $('stringRow').value = c.row;
+    $('stringIp').value = c.ip || '';
+    $('stringUniverse').value = c.universe && c.universe > 0 ? c.universe : '';
+    if (c.matrixHeight) {
+      $('stringRow').max = c.matrixHeight - 1;
+      $('stringRow').placeholder = Math.floor((c.matrixHeight - 1) / 2) + ' (center)';
+    }
+    updateStringHint(c);
+  } catch (e) { console.error('Failed to load string config', e); }
+}
+
+function updateStringHint(c) {
+  const el = $('stringStatus');
+  if (!c || !c.enabled) { el.textContent = 'String output is off.'; return; }
+  const target = c.ip ? c.ip : 'same as matrix';
+  const uni = c.universe && c.universe > 0 ? c.universe : 'auto';
+  el.textContent = c.size + ' LEDs · row ' + c.row + ' · universe ' + uni + ' → ' + target;
+}
+
+async function applyString() {
+  const body = {
+    enabled: $('stringEnabled').checked
+  };
+  const sizeRaw = $('stringSize').value.trim();
+  const rowRaw = $('stringRow').value.trim();
+  const uniRaw = $('stringUniverse').value.trim();
+  body.ip = $('stringIp').value.trim(); // blank = reset to the matrix IP
+
+  const num = (raw) => {
+    const n = Number(raw);
+    return Number.isInteger(n) ? n : NaN;
+  };
+  if (sizeRaw !== '') {
+    const n = num(sizeRaw);
+    if (isNaN(n)) { showBanner('LED count must be a whole number.', true); return; }
+    body.size = n;
+  }
+  if (rowRaw !== '') {
+    const n = num(rowRaw);
+    if (isNaN(n)) { showBanner('Matrix row must be a whole number.', true); return; }
+    body.row = n;
+  }
+  if (uniRaw !== '') {
+    const n = num(uniRaw);
+    if (isNaN(n)) { showBanner('Universe must be a whole number (0 = auto).', true); return; }
+    body.universe = n;
+  }
+
+  try {
+    const r = await fetch(API + 'api/set-string', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const d = await r.json();
+    if (d.ok) {
+      showBanner(body.enabled ? 'LED string settings applied.' : 'LED string disabled.', false);
+      setTimeout(loadStringConfig, 300);
+    } else {
+      showBanner(d.error || 'Failed to apply string settings.', true);
+    }
+  } catch (e) { showBanner('Failed to apply string settings: ' + e, true); }
+}
+
+// ── Status ───────────────────────────────────────────────────────
 async function refreshStatus() {
   try {
     const r = await fetch(API + 'api/status');
     const d = await r.json();
-    document.getElementById('stShader').textContent = d.selectedShader || '—';
-    document.getElementById('stCount').textContent = d.totalShaders;
-        setCurrentDeviceText(d.loopbackDeviceName || '');
-    
-    const s = Math.floor(d.uptimeSecs);
-    const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
-    document.getElementById('stUptime').textContent = `${h}h ${m.toString().padStart(2,'0')}m ${sec}s`;
-  } catch(e) { /* ignore transient errors */ }
+    $('stShader').textContent = d.selectedShader || '—';
+    syncAudioUi(d);
+
+    // Keep the shader dropdown in sync with the server without clobbering a
+    // shader the user just picked but hasn't applied yet.
+    if (d.selectedShader && $('shaderSelect').value !== d.selectedShader) {
+      const match = [...$('shaderSelect').options].find(o => o.value === d.selectedShader || o.value + '.glsl' === d.selectedShader);
+      if (match) $('shaderSelect').value = match.value;
+    }
+
+    $('stString').textContent = !d.stringEnabled ? 'off'
+      : (d.stringSize + ' LEDs · uni ' + (d.stringUniverse > 0 ? d.stringUniverse : 'auto') + ' → ' + (d.stringIp || 'matrix IP'));
+    updateStringHint({ enabled: d.stringEnabled, size: d.stringSize, row: d.stringRow, ip: d.stringIp, universe: d.stringUniverse });
+
+    $('stFrames').textContent = (d.framesSent ?? 0).toLocaleString();
+    $('stErrors').textContent = (d.sendErrors ?? 0).toLocaleString();
+
+    const s = Math.max(0, Math.floor(d.uptimeSecs || 0));
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    $('stUptime').textContent = h + 'h ' + m.toString().padStart(2, '0') + 'm ' + sec + 's';
+  } catch (e) { /* ignore transient errors */ }
 }
 
-// Device selection handler
-document.getElementById('audioDeviceSelect')?.addEventListener('change', async (e) => {
-  const idx = parseInt(e.target.value);
-  if (!isNaN(idx)) {
-    try {
-      await fetch(API + 'api/set-audio-device', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({deviceIndex:idx}) });
-            const selectedText = e.target.options[e.target.selectedIndex]?.text || '';
-            setCurrentDeviceText(selectedText);
-      // Refresh status to show new device
-      refreshStatus();
-    } catch(err) { console.error('Failed to change audio device', err); }
-  }
-});
-
-document.getElementById('applyBtn').addEventListener('click', apply);
+// ── Wire up ──────────────────────────────────────────────────────
+$('applyShaderBtn').addEventListener('click', applyShader);
+$('applyStringBtn').addEventListener('click', applyString);
 loadShaders();
 loadDevices();
+loadStringConfig();
 refreshStatus();
 setInterval(refreshStatus, 2000);
 </script>
@@ -650,6 +870,152 @@ setInterval(refreshStatus, 2000);
 
         SendJson(clientSocket, new { ok = true, deviceIndex = deviceIndex ?? CurrentDeviceIndex });
     }
+
+    private void ServeSetAudioSource(Socket clientSocket, string body)
+    {
+        Dictionary<string, JsonElement>? json;
+        try { json = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(body); }
+        catch { json = null; }
+
+        string? source = json is { Count: > 0 } && json.TryGetValue("source", out var se) && se.ValueKind == JsonValueKind.String
+            ? se.GetString()
+            : null;
+
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            SendJson(clientSocket, new { ok = false, error = "Missing 'source' field." });
+            return;
+        }
+
+        string src = source.Trim().ToLowerInvariant();
+        if (src != "off" && src != "microphone" && src != "loopback")
+        {
+            SendJson(clientSocket, new { ok = false, error = $"Unknown source '{src}'. Use 'off', 'microphone', or 'loopback'." });
+            return;
+        }
+
+        if (src == "off")
+        {
+            SetAudioEnabled?.Invoke(false);
+            SetAudioSource?.Invoke("off");
+        }
+        else
+        {
+            SetAudioSource?.Invoke(src);
+            SetAudioEnabled?.Invoke(true);
+        }
+
+        Console.WriteLine($"[WebServer] Audio source set to: {src}");
+        SendJson(clientSocket, new { ok = true, source = src, enabled = GetAudioEnabled?.Invoke() ?? false });
+    }
+
+    private void ServeSetString(Socket clientSocket, string body)
+    {
+        Dictionary<string, JsonElement>? json;
+        try { json = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(body); }
+        catch { json = null; }
+
+        if (json == null || json.Count == 0)
+        {
+            SendJson(clientSocket, new { ok = false, error = "Invalid or empty JSON body." });
+            return;
+        }
+
+        static int? GetIntValue(JsonElement e, out string? err)
+        {
+            err = null;
+            if (e.ValueKind == JsonValueKind.Number) return e.GetInt32();
+            if (e.ValueKind == JsonValueKind.String && int.TryParse(e.GetString(), out int v)) return v;
+            err = "must be an integer";
+            return null;
+        }
+
+        const int MaxStringSize = 2000;
+        bool? enabled = null;
+        int? size = null, row = null, universe = null;
+        string? ip = null;
+        bool ipProvided = false;
+        string? error = null;
+
+        if (json.TryGetValue("enabled", out var e))
+        {
+            if (e.ValueKind == JsonValueKind.True) enabled = true;
+            else if (e.ValueKind == JsonValueKind.False) enabled = false;
+            else if (e.ValueKind == JsonValueKind.Number) enabled = e.GetInt32() != 0;
+            else if (e.ValueKind == JsonValueKind.String && bool.TryParse(e.GetString(), out bool b)) enabled = b;
+            else error = "'enabled' must be a boolean.";
+        }
+
+        if (error == null && json.TryGetValue("size", out var sz))
+        {
+            size = GetIntValue(sz, out var err);
+            error ??= err != null ? $"'size' {err}." : null;
+            if (error == null && size.HasValue && (size.Value < 1 || size.Value > MaxStringSize))
+                error = $"size must be 1..{MaxStringSize} (got {size.Value}).";
+        }
+
+        if (error == null && json.TryGetValue("row", out var r))
+        {
+            row = GetIntValue(r, out var err);
+            error ??= err != null ? $"'row' {err}." : null;
+            if (error == null && row.HasValue && (row.Value < 0 || row.Value >= PixelMapper.Height))
+                error = $"row must be 0..{PixelMapper.Height - 1} (got {row.Value}).";
+        }
+
+        if (error == null && json.TryGetValue("ip", out var ipe))
+        {
+            if (ipe.ValueKind == JsonValueKind.String)
+            {
+                ip = ipe.GetString();
+                ipProvided = true;
+                if (!string.IsNullOrEmpty(ip) && !IPAddress.TryParse(ip, out _))
+                    error = $"'ip' is not a valid IP address: '{ip}'. Leave it blank to target the matrix IP.";
+            }
+            else if (ipe.ValueKind == JsonValueKind.Null)
+            {
+                ip = null; // null = leave unchanged
+            }
+            else error = "'ip' must be a string (or null to leave unchanged).";
+        }
+
+        if (error == null && json.TryGetValue("universe", out var u))
+        {
+            universe = GetIntValue(u, out var err);
+            error ??= err != null ? $"'universe' {err}." : null;
+            if (error == null && universe.HasValue && universe.Value != 0
+                && (universe.Value < StringOutput.MinUniverse || universe.Value > StringOutput.MaxUniverse))
+                error = $"universe must be 0 (auto) or {StringOutput.MinUniverse}..{StringOutput.MaxUniverse} (got {universe.Value}).";
+        }
+
+        if (error != null)
+        {
+            SendJson(clientSocket, new { ok = false, error });
+            return;
+        }
+
+        if (!enabled.HasValue && !size.HasValue && !row.HasValue && !universe.HasValue && !ipProvided)
+        {
+            SendJson(clientSocket, new { ok = false, error = "No fields provided. Send enabled, size, row, ip, and/or universe." });
+            return;
+        }
+
+        PendingStringChange = new StringConfigChange(enabled, size, row, ip, universe);
+        string ipDesc = !ipProvided ? "unchanged" : (string.IsNullOrEmpty(ip) ? "(reset to matrix IP)" : ip);
+        Console.WriteLine($"[WebServer] String config queued: enabled={enabled?.ToString() ?? "unchanged"} size={size?.ToString() ?? "unchanged"} row={row?.ToString() ?? "unchanged"} ip={ipDesc} universe={universe?.ToString() ?? "unchanged"}");
+        SendJson(clientSocket, new { ok = true, message = "String configuration queued — applied on the next frame." });
+    }
+
+    private void ServeStringConfig(Socket clientSocket)
+    {
+        var live = GetLiveStringState?.Invoke();
+        if (live == null)
+        {
+            live = new LiveStringState(
+                false, 50, (PixelMapper.Height - 1) / 2, null, 0, 0, 0, PixelMapper.Height);
+        }
+        SendJson(clientSocket, live);
+    }
+
     private void ServeShaderFile(Socket clientSocket, string path)
     {
         try
@@ -714,23 +1080,33 @@ setInterval(refreshStatus, 2000);
             {
                 snap!.SelectedShader,
                 snap.AudioEnabled,
+                snap.AudioSource,
                 snap.TotalShaders,
                 snap.AudioReactiveNames,
                 snap.UptimeSecs,
                 snap.FramesSent,
                 snap.SendErrors,
                 LoopbackDeviceName = loopbackName,
-                AvailableDevices = devices
+                AvailableDevices = devices,
+                snap.StringEnabled,
+                snap.StringSize,
+                snap.StringRow,
+                snap.StringIp,
+                snap.StringUniverse,
+                snap.StringFramesSent,
+                snap.StringSendErrors
             });
         }
         else
         {
             var devicesRaw = GetAvailableDevices?.Invoke() ?? new List<(int Index, string Name)>();
             var devices = devicesRaw.Select(d => new { Index = d.Index, Name = d.Name }).ToList();
+            bool audioOn = GetAudioEnabled != null && GetAudioEnabled()!;
             SendJson(clientSocket,
-                new ApiStatus("—", (GetAudioEnabled != null ? GetAudioEnabled() : false), _shaderList.Count,
+                new ApiStatus("—", audioOn, audioOn ? (GetCurrentAudioSource?.Invoke() ?? "microphone") : "off", _shaderList.Count,
                     _shaderList.Where(s => s.IsAudioReactive).Select(s => s.Name!).ToArray()!, 0, 0, 0,
-                    GetLoopbackDeviceName?.Invoke(), devicesRaw));
+                    GetLoopbackDeviceName?.Invoke(), devicesRaw,
+                    false, 50, (PixelMapper.Height - 1) / 2, null, 0, 0, 0));
         }
     }
 

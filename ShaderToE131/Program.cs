@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using Silk.NET.Maths;
 using Silk.NET.OpenGL;
 using Silk.NET.Windowing;
@@ -517,6 +517,16 @@ void main()
                     }
                 }
             };
+            _webServer.GetLiveStringState = () => new WebServer.LiveStringState(
+                _stringSender != null,
+                _stringSize,
+                _stringRow >= 0 ? _stringRow : (MatH - 1) / 2,
+                _stringIp,
+                _stringUniverse,
+                _stringFramesSent,
+                _stringSendErrors,
+                MatH
+            );
             _webServer.Start();
         }
 
@@ -716,8 +726,74 @@ void main()
         }
     }
 
+    /// <summary>
+    /// Apply a runtime LED string configuration change (from the web UI) on the render
+    /// thread. Fields that are null keep their current value. Ip="" resets to the
+    /// matrix IP; universe 0 means auto (first universe after the matrix's).
+    /// </summary>
+    private void ApplyStringChange(WebServer.StringConfigChange change)
+    {
+        bool enabled = change.Enabled ?? _stringSender != null;
+        int size = change.Size ?? _stringSize;
+        int row = change.Row ?? _stringRow;
+        string? ip = change.Ip;              // null = keep; "" = reset to matrix IP
+        int universe = change.Universe ?? _stringUniverse;
+
+        if (!enabled)
+        {
+            _stringSender?.Dispose();
+            _stringSender = null;
+            _stringBuffer = Array.Empty<byte>();
+            _stringFramesSent = 0;
+            _stringSendErrors = 0;
+            Console.WriteLine("[Web] LED string disabled.");
+            return;
+        }
+
+        string? effectiveIp = ip == null ? _stringIp : (ip.Length == 0 ? null : ip);
+        int effectiveUniverse = universe;
+        int effectiveRow = row >= 0 ? row : (MatH - 1) / 2;
+
+        int matrixUniverses = (PixelMapper.TotalChannels + 509) / 510;
+        int baseUniverse = effectiveUniverse > 0 ? effectiveUniverse : UniverseId + matrixUniverses;
+
+        string? error = StringOutput.Validate(size, baseUniverse);
+        if (error != null)
+        {
+            Console.WriteLine($"[Web] LED string change rejected: {error}");
+            return;
+        }
+        if (effectiveRow < 0 || effectiveRow >= MatH)
+        {
+            Console.WriteLine($"[Web] LED string change rejected: row must be 0..{MatH - 1} (got {row}).");
+            return;
+        }
+
+        _stringSender?.Dispose();
+        string strIp = effectiveIp ?? TargetIp;
+        _stringSender = new E131Sender(strIp, 5568);
+        _stringBuffer = new byte[size * 3];
+        _stringSize = size;
+        _stringRow = row;
+        _stringIp = effectiveIp;
+        _stringUniverse = effectiveUniverse;
+        _stringUniverseResolved = baseUniverse;
+        _stringRowResolved = effectiveRow;
+        _stringFramesSent = 0;
+        _stringSendErrors = 0;
+        Console.WriteLine($"[Web] LED string configured: {size} LEDs, row={effectiveRow}, universe={baseUniverse}, target={strIp}");
+    }
+
     private unsafe void OnRender(double deltaTime)
     {
+        // Apply a pending LED string configuration change from the web UI (render thread).
+        if (_webServer != null && _webServer.PendingStringChange != null)
+        {
+            var change = _webServer.PendingStringChange!;
+            _webServer.PendingStringChange = null;
+            ApplyStringChange(change);
+        }
+
         // Check for pending shader change BEFORE null guard — when coming from "Off",
         // _shaderProgram is null and we need to reload it before the guard would bail out.
         if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
@@ -798,13 +874,21 @@ void main()
             _webServer.StatusSnapshot = new WebServer.ApiStatus(
                 selectedName,
                 _audioEnabled,
+                _audioEnabled ? (_audioSource == AudioCapture.AudioSource.Loopback ? "loopback" : "microphone") : "off",
                 _webServer.Shaders.Count,
                 audioNames,
                 (Environment.TickCount64 - _webStartMs) / 1000.0,
                 _framesSent,
                 _sendErrors,
                 (_audioCapture?.GetCurrentLoopbackDeviceName() ?? (_audioSource == AudioCapture.AudioSource.Loopback ? _selectedLoopbackDeviceName : null)),
-                []
+                [],
+                _stringSender != null,
+                _stringSize,
+                _stringRow >= 0 ? _stringRow : (MatH - 1) / 2,
+                _stringIp,
+                _stringUniverseResolved,
+                _stringFramesSent,
+                _stringSendErrors
             );
         }
 
@@ -888,6 +972,14 @@ void main()
 
     private unsafe void OnRenderHeadless(double deltaTime)
     {
+        // Apply a pending LED string configuration change from the web UI (render thread).
+        if (_webServer != null && _webServer.PendingStringChange != null)
+        {
+            var change = _webServer.PendingStringChange!;
+            _webServer.PendingStringChange = null;
+            ApplyStringChange(change);
+        }
+
         // Check for pending shader change BEFORE null guard — when coming from "Off",
         // _shaderProgram is null and we need to reload it before the guard would bail out.
         if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
@@ -939,13 +1031,21 @@ void main()
             _webServer.StatusSnapshot = new WebServer.ApiStatus(
                 selectedName,
                 _audioEnabled,
+                _audioEnabled ? (_audioSource == AudioCapture.AudioSource.Loopback ? "loopback" : "microphone") : "off",
                 _webServer.Shaders.Count,
                 audioNames,
                 (Environment.TickCount64 - _webStartMs) / 1000.0,
                 _framesSent,
                 _sendErrors,
                 (_audioCapture?.GetCurrentLoopbackDeviceName() ?? (_audioSource == AudioCapture.AudioSource.Loopback ? _selectedLoopbackDeviceName : null)),
-                []
+                [],
+                _stringSender != null,
+                _stringSize,
+                _stringRow >= 0 ? _stringRow : (MatH - 1) / 2,
+                _stringIp,
+                _stringUniverseResolved,
+                _stringFramesSent,
+                _stringSendErrors
             );
         }
 
