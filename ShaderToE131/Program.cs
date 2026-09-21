@@ -551,7 +551,15 @@ void main()
         if (_audioEnabled)
         {
             string sourceLabel = _audioSource == AudioCapture.AudioSource.Loopback ? "loopback" : "microphone";
-            _audioCapture = AudioCapture.Create(_audioSource, _audioDeviceIndex);
+            try
+            {
+                _audioCapture = AudioCapture.Create(_audioSource, _audioDeviceIndex);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[WARN] Audio capture unavailable ({ex.GetType().Name}: {ex.Message}).");
+                _audioCapture = null;
+            }
 
             if (_audioCapture != null)
             {
