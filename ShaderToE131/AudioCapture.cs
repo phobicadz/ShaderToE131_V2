@@ -78,6 +78,10 @@ public sealed class AudioCapture : IDisposable
     /// </summary>
     public static AudioCapture? Create(AudioSource source = AudioSource.Microphone, int deviceIndex = 0)
     {
+        // NAudio's capture APIs (WinMM / WASAPI) are Windows-only; on other
+        // platforms they throw DllNotFoundException/PlatformNotSupportedException.
+        if (!OperatingSystem.IsWindows()) return null;
+
         switch (source)
         {
             case AudioSource.Microphone:
@@ -122,6 +126,8 @@ public sealed class AudioCapture : IDisposable
     /// </summary>
     public static AudioCapture? CreateLoopbackByName(string? deviceName)
     {
+        if (!OperatingSystem.IsWindows()) return null;
+
         if (string.IsNullOrWhiteSpace(deviceName))
             return Create(AudioSource.Loopback, 0);
 
@@ -144,6 +150,8 @@ public sealed class AudioCapture : IDisposable
     /// </summary>
     public static IEnumerable<(int index, string name)> ListMicrophones()
     {
+        if (!OperatingSystem.IsWindows()) yield break;
+
         for (int i = 0; i < NAudio.Wave.WaveInEvent.DeviceCount; i++)
         {
             var caps = NAudio.Wave.WaveInEvent.GetCapabilities(i);
@@ -157,6 +165,8 @@ public sealed class AudioCapture : IDisposable
     /// </summary>
     public static IEnumerable<(int Index, string Name)> ListLoopbackDevices()
     {
+        if (!OperatingSystem.IsWindows()) yield break;
+
         var enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
 
         // Index 0 is the system default render endpoint (matches the selection contract
