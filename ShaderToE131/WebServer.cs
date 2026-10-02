@@ -445,118 +445,206 @@ public sealed class WebServer : IDisposable
 <title>ShaderToE131 — Control Panel</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; min-height: 100vh; display: flex; justify-content: center; align-items: flex-start; padding-top: 40px; }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 28px; width: 580px; max-width: 95vw; box-shadow: 0 8px 32px rgba(0,0,0,.4); }
-  h1 { font-size: 1.6rem; margin-bottom: 4px; color: #58a6ff; }
-  .subtitle { font-size: 0.85rem; color: #8b949e; margin-bottom: 20px; }
-  .section { margin-bottom: 20px; padding-bottom: 18px; border-bottom: 1px solid #21262d; }
-  .section:last-of-type { border-bottom: none; margin-bottom: 0; }
-  h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; margin-bottom: 12px; }
-  label { display: block; font-weight: 600; font-size: 0.85rem; margin-bottom: 6px; color: #c9d1d9; }
-  select, input[type=number], input[type=text], button { width: 100%; padding: 9px 12px; border-radius: 8px; font-size: 0.9rem; border: 1px solid #30363d; background: #21262d; color: #c9d1d9; }
-  select:focus, input:focus, button:focus { outline: none; border-color: #58a6ff; box-shadow: 0 0 0 3px rgba(88,166,255,.15); }
-  select:hover, button:hover { background: #292e36; }
-  select:disabled { opacity: 0.45; cursor: not-allowed; }
-  button { cursor: pointer; margin-top: 10px; }
-  button.primary { background: #238636; border-color: #2ea043; color: #fff; font-weight: 600; }
-  button.primary:hover { background: #2ea043; }
-  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  :root {
+    --bg: #0a0e14;
+    --panel: #151d29;
+    --panel2: #0f151f;
+    --line: #24303f;
+    --text: #e6edf3;
+    --muted: #8b98a9;
+    --accent: #4da3ff;
+    --violet: #a06bff;
+    --green: #22c58a;
+    --amber: #d29922;
+    --err: #f85149;
+  }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    color: var(--text);
+    background:
+      radial-gradient(1100px 620px at 10% -10%, rgba(77,163,255,.16), transparent 62%),
+      radial-gradient(900px 520px at 95% -4%, rgba(160,107,255,.14), transparent 58%),
+      var(--bg);
+    min-height: 100vh;
+    padding: 26px 18px 48px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+
+  header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 18px; }
+  .mark { width: 44px; height: 44px; border-radius: 12px; flex: 0 0 auto;
+    background: conic-gradient(from 210deg, #4da3ff, #a06bff, #22c58a, #4da3ff);
+    box-shadow: 0 0 26px rgba(77,163,255,.35); }
+  h1 { font-size: 1.5rem; letter-spacing: -.02em; }
+  .subtitle { color: var(--muted); font-size: .85rem; }
+  .pill { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; font-size: .74rem;
+    border: 1px solid var(--line); background: var(--panel2); border-radius: 999px; padding: 6px 12px; color: var(--muted); }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--err); }
+  .pill.live { color: var(--green); border-color: rgba(34,197,138,.4); }
+  .pill.live .dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+  .banner { border-radius: 10px; padding: 11px 14px; font-size: .85rem; margin-bottom: 16px; }
+  .banner.ok { background: rgba(34,197,138,.12); border: 1px solid rgba(34,197,138,.45); color: #3fb950; }
+  .banner.error { background: rgba(248,81,73,.12); border: 1px solid rgba(248,81,73,.45); color: var(--err); }
+
+  .layout { display: grid; grid-template-columns: minmax(0,1.55fr) minmax(0,1fr); gap: 16px; align-items: start; }
+  .card { background: linear-gradient(180deg, var(--panel), var(--panel2));
+    border: 1px solid var(--line); border-radius: 14px; padding: 18px;
+    box-shadow: 0 18px 40px rgba(0,0,0,.35); }
+  .col > .card + .card { margin-top: 16px; }
+
+  h2 { display: flex; align-items: center; gap: 8px; font-size: .72rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .12em; color: var(--muted); margin-bottom: 14px; }
+  h2::before { content: ''; width: 10px; height: 10px; border-radius: 3px; background: var(--accent); }
+  .card.audio h2::before { background: var(--violet); }
+  .card.string h2::before { background: var(--green); }
+  .card.status h2::before { background: var(--amber); }
+
+  label { display: block; font-weight: 600; font-size: .8rem; margin-bottom: 6px; }
+  select, input[type=number], input[type=text] {
+    width: 100%; padding: 10px 12px; font-size: .9rem; color: var(--text);
+    background: #0c1219; border: 1px solid var(--line); border-radius: 10px; transition: border-color .15s, box-shadow .15s; }
+  select { appearance: none; -webkit-appearance: none; padding-right: 34px; cursor: pointer;
+    background-image: url('data:image/svg+xml;utf8,<svg xmlns=""http://www.w3.org/2000/svg"" width=""12"" height=""8"" viewBox=""0 0 12 8"" fill=""none"" stroke=""%238b98a9"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><path d=""M1 1l5 5 5-5""/></svg>');
+    background-repeat: no-repeat; background-position: right 12px center; }
+  ::placeholder { color: #58657a; }
+  select:hover, input:hover { border-color: #354458; }
+  select:focus, input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(77,163,255,.18); }
+  select:disabled, input:disabled { opacity: .45; cursor: not-allowed; }
+
+  button { width: 100%; padding: 11px 14px; margin-top: 12px; border-radius: 10px; font-size: .9rem;
+    cursor: pointer; border: 1px solid var(--line); background: #0c1219; color: var(--text);
+    transition: transform .12s, background .15s, border-color .15s; }
+  button:hover { transform: translateY(-1px); border-color: #354458; }
+  button:active { transform: none; }
+  button.primary { background: linear-gradient(180deg, #2ea043, #238636); border-color: #2ea043; color: #fff; font-weight: 600; }
+  button.primary:hover { background: linear-gradient(180deg, #35a94c, #2ea043); }
+  button:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(77,163,255,.25); }
+
+  .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .hint { font-size: .75rem; color: var(--muted); margin-top: 8px; }
+
   .toggle-row { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
-  .toggle-row .desc { font-size: 0.85rem; color: #8b949e; }
+  .toggle-row .desc { font-size: .82rem; color: var(--muted); }
   .toggle-switch { position: relative; width: 52px; height: 28px; flex-shrink: 0; display: inline-block; }
   .toggle-switch input { opacity: 0; width: 0; height: 0; }
-  .toggle-slider { position: absolute; inset: 0; background: #30363d; border-radius: 14px; cursor: pointer; transition: .2s; }
-  .toggle-slider::before { content: ''; position: absolute; width: 22px; height: 22px; left: 3px; top: 3px; background: #c9d1d9; border-radius: 50%; transition: .2s; }
-  .toggle-switch input:checked + .toggle-slider { background: #238636; }
+  .toggle-slider { position: absolute; inset: 0; background: #2a3646; border-radius: 14px; cursor: pointer; transition: .2s; }
+  .toggle-slider::before { content: ''; position: absolute; width: 22px; height: 22px; left: 3px; top: 3px; background: #cfd8e3; border-radius: 50%; transition: .2s; }
+  .toggle-switch input:checked + .toggle-slider { background: var(--green); }
   .toggle-switch input:checked + .toggle-slider::before { transform: translateX(24px); }
-  .banner { border-radius: 8px; padding: 10px 14px; font-size: 0.85rem; margin-bottom: 16px; }
-  .banner.ok { background: rgba(35,134,54,.15); border: 1px solid #238636; color: #3fb950; }
-  .banner.error { background: rgba(218,54,51,.15); border: 1px solid #da3633; color: #f85149; }
-  .hint { font-size: 0.75rem; color: #8b949e; margin-top: 8px; }
-  .status-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
-  .status-item { background: #0d1117; border-radius: 8px; padding: 10px 12px; text-align: center; }
-  .status-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: .5px; color: #8b949e; margin-bottom: 2px; }
-  .status-value { font-size: 0.9rem; font-weight: 600; color: #58a6ff; word-break: break-all; }
-  .notice { font-size: 0.75rem; color: #8b949e; margin-top: 14px; text-align: center; }
+  .toggle-switch input:focus-visible + .toggle-slider { box-shadow: 0 0 0 3px rgba(77,163,255,.25); }
+
+  .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 10px; }
+  .status-item { background: #0c1219; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .status-label { font-size: .64rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 3px; }
+  .status-value { font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; font-size: .9rem; font-weight: 600;
+    color: var(--accent); word-break: break-all; }
+  .notice { font-size: .74rem; color: var(--muted); margin-top: 18px; text-align: center; }
+
+  @media (max-width: 960px) { .layout { grid-template-columns: 1fr; } }
+  @media (max-width: 520px) {
+    body { padding: 16px 12px 32px; }
+    .card { padding: 14px; }
+    h1 { font-size: 1.25rem; }
+    .pill { margin-left: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+    button:hover { transform: none; }
+  }
 </style>
 </head>
 <body>
-<div class=""card"">
-  <h1>ShaderToE131</h1>
-  <div class=""subtitle"">LED Matrix Shader Control Panel</div>
+<div class=""wrap"">
+  <header>
+    <div class=""mark""></div>
+    <div>
+      <h1>ShaderToE131</h1>
+      <div class=""subtitle"">LED matrix shader control panel</div>
+    </div>
+    <span class=""pill"" id=""connPill""><span class=""dot""></span><span id=""connText"">connecting…</span></span>
+  </header>
 
   <div id=""banner"" class=""banner ok"" style=""display:none""></div>
 
-  <div class=""section"">
-    <h2>Shader</h2>
-    <label for=""shaderSelect"">Shader</label>
-    <select id=""shaderSelect""><option value=""off"">Off (blank)</option><option value="""">— select shader —</option></select>
-    <button class=""primary"" id=""applyShaderBtn"">Apply Shader</button>
+  <div class=""layout"">
+    <div class=""col"">
+      <section class=""card"">
+        <h2>Shader</h2>
+        <label for=""shaderSelect"">Shader</label>
+        <select id=""shaderSelect""><option value=""off"">Off (blank)</option><option value="""">— select shader —</option></select>
+        <div class=""hint"" id=""shaderCount""></div>
+        <button class=""primary"" id=""applyShaderBtn"">Apply Shader</button>
+      </section>
+
+      <section class=""card audio"">
+        <h2>Audio</h2>
+        <div class=""fields"">
+          <div>
+            <label for=""audioSourceSelect"">Source</label>
+            <select id=""audioSourceSelect"">
+              <option value=""off"">Off</option>
+              <option value=""microphone"">Microphone</option>
+              <option value=""loopback"">Loopback (system audio)</option>
+            </select>
+          </div>
+          <div>
+            <label for=""audioDeviceSelect"">Loopback Device</label>
+            <select id=""audioDeviceSelect""><option value=""-1"">Loading devices…</option></select>
+          </div>
+        </div>
+        <div class=""hint"">Choosing a device switches the audio source to that loopback device.</div>
+      </section>
+    </div>
+
+    <div class=""col"">
+      <section class=""card status"">
+        <h2>Live Status</h2>
+        <div class=""status-grid"">
+          <div class=""status-item""><div class=""status-label"">Shader</div><div class=""status-value"" id=""stShader"">—</div></div>
+          <div class=""status-item""><div class=""status-label"">Audio</div><div class=""status-value"" id=""stAudio"">—</div></div>
+          <div class=""status-item""><div class=""status-label"">String</div><div class=""status-value"" id=""stString"">—</div></div>
+          <div class=""status-item""><div class=""status-label"">Uptime</div><div class=""status-value"" id=""stUptime"">—</div></div>
+          <div class=""status-item""><div class=""status-label"">Matrix Frames</div><div class=""status-value"" id=""stFrames"">0</div></div>
+          <div class=""status-item""><div class=""status-label"">Send Errors</div><div class=""status-value"" id=""stErrors"">0</div></div>
+        </div>
+        <div class=""hint"">Auto-refreshes every 2 s. Changes apply immediately.</div>
+      </section>
+
+      <section class=""card string"">
+        <h2>LED String</h2>
+        <div class=""toggle-row"">
+          <label class=""toggle-switch"">
+            <input type=""checkbox"" id=""stringEnabled"" aria-labelledby=""stringEnabledDesc"">
+            <span class=""toggle-slider""></span>
+          </label>
+          <span class=""desc"" id=""stringEnabledDesc"">Stream an LED string alongside the matrix (mirrors a matrix row)</span>
+        </div>
+        <div class=""fields"">
+          <div>
+            <label for=""stringSize"">LED Count</label>
+            <input type=""number"" id=""stringSize"" min=""1"" max=""2000"" placeholder=""50"">
+          </div>
+          <div>
+            <label for=""stringRow"">Matrix Row</label>
+            <input type=""number"" id=""stringRow"" min=""0"" max=""10"" placeholder=""center"">
+          </div>
+          <div>
+            <label for=""stringIp"">Target IP / hostname</label>
+            <input type=""text"" id=""stringIp"" placeholder=""same as matrix"" title=""IPv4/IPv6 address or hostname (e.g. ledstring.local); blank = matrix IP"">
+          </div>
+          <div>
+            <label for=""stringUniverse"">Universe</label>
+            <input type=""number"" id=""stringUniverse"" min=""0"" max=""63999"" placeholder=""auto"">
+          </div>
+        </div>
+        <button id=""applyStringBtn"">Apply String Settings</button>
+        <div class=""hint"" id=""stringStatus"">Loading…</div>
+      </section>
+    </div>
   </div>
 
-  <div class=""section"">
-    <h2>Audio</h2>
-    <div class=""grid2"">
-      <div>
-        <label for=""audioSourceSelect"">Source</label>
-        <select id=""audioSourceSelect"">
-          <option value=""off"">Off</option>
-          <option value=""microphone"">Microphone</option>
-          <option value=""loopback"">Loopback (system audio)</option>
-        </select>
-      </div>
-      <div>
-        <label for=""audioDeviceSelect"">Loopback Device</label>
-        <select id=""audioDeviceSelect""><option value=""-1"">Loading devices…</option></select>
-      </div>
-    </div>
-    <div class=""hint"">Choosing a device switches the audio source to that loopback device.</div>
-  </div>
-
-  <div class=""section"">
-    <h2>LED String</h2>
-    <div class=""toggle-row"">
-      <label class=""toggle-switch"">
-        <input type=""checkbox"" id=""stringEnabled"" aria-labelledby=""stringEnabledDesc"">
-        <span class=""toggle-slider""></span>
-      </label>
-      <span class=""desc"" id=""stringEnabledDesc"">Stream an LED string in parallel with the matrix (mirrors a matrix row)</span>
-    </div>
-    <div class=""grid2"">
-      <div>
-        <label for=""stringSize"">LED Count</label>
-        <input type=""number"" id=""stringSize"" min=""1"" max=""2000"" placeholder=""50"">
-      </div>
-      <div>
-        <label for=""stringRow"">Matrix Row</label>
-        <input type=""number"" id=""stringRow"" min=""0"" max=""10"" placeholder=""5 (center)"">
-      </div>
-      <div>
-        <label for=""stringIp"">Target IP / hostname</label>
-        <input type=""text"" id=""stringIp"" placeholder=""same as matrix"" title=""IPv4/IPv6 address or hostname (e.g. ledstring.local); blank = matrix IP"">
-      </div>
-      <div>
-        <label for=""stringUniverse"">Universe</label>
-        <input type=""number"" id=""stringUniverse"" min=""0"" max=""63999"" placeholder=""auto"">
-      </div>
-    </div>
-    <button id=""applyStringBtn"">Apply String Settings</button>
-    <div class=""hint"" id=""stringStatus"">Loading…</div>
-  </div>
-
-  <div class=""section"">
-    <h2>Status</h2>
-    <div class=""status-grid"">
-      <div class=""status-item""><div class=""status-label"">Shader</div><div class=""status-value"" id=""stShader"">—</div></div>
-      <div class=""status-item""><div class=""status-label"">Audio</div><div class=""status-value"" id=""stAudio"">—</div></div>
-      <div class=""status-item""><div class=""status-label"">String</div><div class=""status-value"" id=""stString"">—</div></div>
-      <div class=""status-item""><div class=""status-label"">Uptime</div><div class=""status-value"" id=""stUptime"">—</div></div>
-      <div class=""status-item""><div class=""status-label"">Matrix Frames</div><div class=""status-value"" id=""stFrames"">0</div></div>
-      <div class=""status-item""><div class=""status-label"">Send Errors</div><div class=""status-value"" id=""stErrors"">0</div></div>
-    </div>
-  </div>
-
-  <div class=""notice"">Status auto-refreshes every 2 s. Changes apply immediately.</div>
+  <div class=""notice"">ShaderToE131 · sACN / E1.31 output</div>
 </div>
 
 <script>
@@ -575,6 +663,11 @@ function showBanner(msg, isError) {
 }
 
 function truncate(s, n) { return s && s.length > n ? s.substring(0, n - 2) + '…' : (s || ''); }
+
+function setConn(ok) {
+  $('connPill').classList.toggle('live', ok);
+  $('connText').textContent = ok ? 'connected' : 'disconnected';
+}
 
 // ── Shader ───────────────────────────────────────────────────────
 let shadersLoaded = false;
@@ -595,6 +688,9 @@ async function loadShaders(retries) {
       for (const s of data.shaders) sel.add(new Option(s.name + (s.isAudioReactive ? ' 🔊' : ''), s.name));
       if (prev !== '' && [...sel.options].some(o => o.value === prev)) sel.value = prev;
       shadersLoaded = true;
+      $('shaderCount').textContent = data.shaders.length === 0
+        ? 'No .glsl shaders in the shader directory.'
+        : data.shaders.length + ' shaders available · 🔊 reacts to audio';
       if (data.shaders.length === 0) showBanner('No .glsl shaders found in the shader directory.', true);
       return;
     } catch (e) {
@@ -757,6 +853,7 @@ async function refreshStatus() {
   try {
     const r = await fetch(API + 'api/status');
     const d = await r.json();
+    setConn(true);
     $('stShader').textContent = d.selectedShader || '—';
     syncAudioUi(d);
 
@@ -788,7 +885,7 @@ async function refreshStatus() {
     const s = Math.max(0, Math.floor(d.uptimeSecs || 0));
     const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
     $('stUptime').textContent = h + 'h ' + m.toString().padStart(2, '0') + 'm ' + sec + 's';
-  } catch (e) { /* ignore transient errors */ }
+  } catch (e) { setConn(false); }
 }
 
 // ── Wire up ──────────────────────────────────────────────────────
