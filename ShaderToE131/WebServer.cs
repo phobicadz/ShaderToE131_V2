@@ -42,8 +42,15 @@ public sealed class WebServer : IDisposable
     public StringConfigChange? PendingStringChange { get => _pendingStringChange; set => _pendingStringChange = value; }
     public Func<LiveStringState>? GetLiveStringState { get; set; }  // current string config + live stats
 
-    private readonly List<ShaderInfo> _shaderList = new();
-    internal IReadOnlyList<ShaderInfo> Shaders => _shaderList;
+    // Shader list is rebuilt into a NEW array and published with a single
+    // reference assignment. Readers (HTTP handlers, render loop) always see a
+    // complete, immutable snapshot — never a list that is half-way through being
+    // re-scanned by another thread.
+    private readonly object _shaderScanLock = new();
+    private volatile ShaderInfo[] _shaders = Array.Empty<ShaderInfo>();
+    private DateTime _shadersScannedAt = DateTime.MinValue;
+    private const int RescanSeconds = 5;
+    internal IReadOnlyList<ShaderInfo> Shaders => _shaders;
     private volatile ApiStatus? _statusSnapshot;
 
     public record ShaderInfo(string Name, string FileName, bool IsAudioReactive);
@@ -112,16 +119,36 @@ public sealed class WebServer : IDisposable
 
     private void LoadShaderList()
     {
-        _shaderList.Clear();
-        if (!Directory.Exists(_shaderDirPath)) return;
-
-        foreach (var file in Directory.GetFiles(_shaderDirPath, "*.glsl", SearchOption.TopDirectoryOnly)
-                                        .OrderBy(Path.GetFileName))
+        var list = new List<ShaderInfo>();
+        if (Directory.Exists(_shaderDirPath))
         {
-            string name = Path.GetFileNameWithoutExtension(file);
-            bool isAudioReactive = IsAudioReactiveShader(file);
-            _shaderList.Add(new ShaderInfo(name, file, isAudioReactive));
+            foreach (var file in Directory.GetFiles(_shaderDirPath, "*.glsl", SearchOption.TopDirectoryOnly)
+                                            .OrderBy(Path.GetFileName))
+            {
+                string name = Path.GetFileNameWithoutExtension(file);
+                list.Add(new ShaderInfo(name, file, IsAudioReactiveShader(file)));
+            }
         }
+        _shaders = list.ToArray();
+        _shadersScannedAt = DateTime.UtcNow;
+    }
+
+    /// <summary>
+    /// Return the current shader snapshot, re-scanning the directory only when the
+    /// cached snapshot is older than <see cref="RescanSeconds"/>. Safe to call from
+    /// every request and from the render loop.
+    /// </summary>
+    private ShaderInfo[] CurrentShaders()
+    {
+        if ((DateTime.UtcNow - _shadersScannedAt).TotalSeconds >= RescanSeconds)
+        {
+            lock (_shaderScanLock)
+            {
+                if ((DateTime.UtcNow - _shadersScannedAt).TotalSeconds >= RescanSeconds)
+                    LoadShaderList();
+            }
+        }
+        return _shaders;
     }
 
     private static bool IsAudioReactiveShader(string filePath)
@@ -165,6 +192,11 @@ public sealed class WebServer : IDisposable
             }
             catch (ObjectDisposedException) { break; }
             catch (InvalidOperationException) { break; }
+            catch (SocketException ex)
+            {
+                if (!_running) break;
+                Console.WriteLine($"[WebServer] Accept error: {ex.Message}");
+            }
         }
     }
 
@@ -252,7 +284,11 @@ public sealed class WebServer : IDisposable
         }
         finally
         {
-            try { clientSocket.Shutdown(SocketShutdown.Both); } catch { }
+            // Graceful close: half-close after the full response is queued, and keep
+            // the socket alive until the OS has actually delivered it (SO_LINGER).
+            // An abrupt Close() here drops any still-buffered bytes on the wire.
+            try { clientSocket.LingerState = new LingerOption(true, 5); } catch { }
+            try { clientSocket.Shutdown(SocketShutdown.Send); } catch { }
             try { clientSocket.Close(); } catch { }
         }
     }
@@ -367,11 +403,23 @@ public sealed class WebServer : IDisposable
 
         byte[] headerBytes = System.Text.Encoding.UTF8.GetBytes(response);
 
+        // Headers + body in ONE buffer, sent in full. Sending them separately and
+        // then closing the socket can leave the tail of the body in the send buffer,
+        // which Close() discards — the client then sees a truncated response
+        // (e.g. an empty / partially filled shader dropdown).
+        byte[] responseBytes = new byte[headerBytes.Length + bodyBytes.Length];
+        Buffer.BlockCopy(headerBytes, 0, responseBytes, 0, headerBytes.Length);
+        Buffer.BlockCopy(bodyBytes, 0, responseBytes, headerBytes.Length, bodyBytes.Length);
+
         try
         {
-            clientSocket.Send(headerBytes, SocketFlags.None);
-            if (bodyBytes.Length > 0)
-                clientSocket.Send(bodyBytes, SocketFlags.None);
+            int sent = 0;
+            while (sent < responseBytes.Length)
+            {
+                int n = clientSocket.Send(responseBytes, sent, responseBytes.Length - sent, SocketFlags.None);
+                if (n <= 0) break;
+                sent += n;
+            }
         }
         catch (Exception ex) { Console.WriteLine($"[WebServer] Send error: {ex.Message}"); }
     }
@@ -529,18 +577,33 @@ function showBanner(msg, isError) {
 function truncate(s, n) { return s && s.length > n ? s.substring(0, n - 2) + '…' : (s || ''); }
 
 // ── Shader ───────────────────────────────────────────────────────
-async function loadShaders() {
-  try {
-    const r = await fetch(API + 'api/shaders');
-    const data = await r.json();
-    const sel = $('shaderSelect');
-    const prev = sel.value;
-    sel.innerHTML = '';
-    sel.add(new Option('Off (blank)', 'off'));
-    sel.add(new Option('— select shader —', ''));
-    for (const s of data.shaders) sel.add(new Option(s.name + (s.isAudioReactive ? ' 🔊' : ''), s.name));
-    if (prev !== '' && [...sel.options].some(o => o.value === prev)) sel.value = prev;
-  } catch (e) { console.error('Failed to load shaders', e); }
+let shadersLoaded = false;
+
+async function loadShaders(retries) {
+  retries = (retries === undefined) ? 2 : retries;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const r = await fetch(API + 'api/shaders', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      if (!Array.isArray(data.shaders)) throw new Error('bad shader list');
+      const sel = $('shaderSelect');
+      const prev = sel.value;
+      sel.innerHTML = '';
+      sel.add(new Option('Off (blank)', 'off'));
+      sel.add(new Option('— select shader —', ''));
+      for (const s of data.shaders) sel.add(new Option(s.name + (s.isAudioReactive ? ' 🔊' : ''), s.name));
+      if (prev !== '' && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+      shadersLoaded = true;
+      if (data.shaders.length === 0) showBanner('No .glsl shaders found in the shader directory.', true);
+      return;
+    } catch (e) {
+      if (attempt < retries) { await new Promise(r => setTimeout(r, 400 * (attempt + 1))); continue; }
+      // Never leave the user staring at a silently empty dropdown.
+      showBanner('Could not load the shader list (' + (e && e.message ? e.message : e) + ').', true);
+      return;
+    }
+  }
 }
 
 async function applyShader() {
@@ -703,6 +766,7 @@ async function refreshStatus() {
     // previous poll (or on the first poll); otherwise the user is staging a
     // manual selection and we leave it alone.
     const sel = $('shaderSelect');
+    if (!shadersLoaded) loadShaders(0);   // self-heal a list that failed to load
     const prevServer = window._shaderServerSel;
     if (prevServer === undefined || sel.value === prevServer) {
       if (d.selectedShader === 'off') {
@@ -743,8 +807,7 @@ setInterval(refreshStatus, 2000);
 
     private void ServeShadersList(Socket clientSocket)
     {
-        LoadShaderList(); // re-scan in case new files appeared
-        var data = _shaderList.Select(s => new { s.Name, s.FileName, s.IsAudioReactive }).ToArray();
+        var data = CurrentShaders().Select(s => new { s.Name, s.FileName, s.IsAudioReactive }).ToArray();
         SendJson(clientSocket, new { shaders = data });
     }
 
@@ -774,7 +837,7 @@ setInterval(refreshStatus, 2000);
         // (filename without extension) or the full filename — never a substring,
         // so "fire" won't accidentally select "fireworks.glsl".
         string? fullPath = null;
-        foreach (var s in _shaderList)
+        foreach (var s in CurrentShaders())
         {
             string fileNameWithExt = Path.GetFileName(s.FileName);
             if (s.Name.Equals(name!, StringComparison.OrdinalIgnoreCase)
@@ -1057,7 +1120,7 @@ setInterval(refreshStatus, 2000);
             string fileName = Uri.UnescapeDataString(path.TrimStart('/').Replace("/shaders/", ""));
             string? fullPath = null;
 
-            foreach (var s in _shaderList)
+            foreach (var s in _shaders)
                 if (s.FileName.EndsWith(fileName, StringComparison.OrdinalIgnoreCase)) { fullPath = s.FileName; break; }
 
             if (fullPath == null || !File.Exists(fullPath))
@@ -1098,7 +1161,7 @@ setInterval(refreshStatus, 2000);
     /// </summary>
     public void RefreshShaderList()
     {
-        LoadShaderList();
+        CurrentShaders();
     }
 
     private void ServeStatus(Socket clientSocket)
@@ -1106,13 +1169,13 @@ setInterval(refreshStatus, 2000);
         if (_statusSnapshot != null)
         {
             var snap = _statusSnapshot;
-            var devicesRaw = GetAvailableDevices?.Invoke() ?? snap!.AvailableDevices;
+            var devicesRaw = GetAvailableDevices?.Invoke() ?? snap.AvailableDevices;
             var devices = devicesRaw.Select(d => new { Index = d.Index, Name = d.Name }).ToList();
-            var loopbackName = GetLoopbackDeviceName?.Invoke() ?? snap!.LoopbackDeviceName;
+            var loopbackName = GetLoopbackDeviceName?.Invoke() ?? snap.LoopbackDeviceName;
 
             SendJson(clientSocket, new
             {
-                snap!.SelectedShader,
+                snap.SelectedShader,
                 snap.AudioEnabled,
                 snap.AudioSource,
                 snap.TotalShaders,
@@ -1136,9 +1199,10 @@ setInterval(refreshStatus, 2000);
             var devicesRaw = GetAvailableDevices?.Invoke() ?? new List<(int Index, string Name)>();
             var devices = devicesRaw.Select(d => new { Index = d.Index, Name = d.Name }).ToList();
             bool audioOn = GetAudioEnabled != null && GetAudioEnabled()!;
+            var shaders = CurrentShaders();
             SendJson(clientSocket,
-                new ApiStatus("off", audioOn, audioOn ? (GetCurrentAudioSource?.Invoke() ?? "microphone") : "off", _shaderList.Count,
-                    _shaderList.Where(s => s.IsAudioReactive).Select(s => s.Name!).ToArray()!, 0, 0, 0,
+                new ApiStatus("off", audioOn, audioOn ? (GetCurrentAudioSource?.Invoke() ?? "microphone") : "off", shaders.Length,
+                    shaders.Where(s => s.IsAudioReactive).Select(s => s.Name!).ToArray()!, 0, 0, 0,
                     GetLoopbackDeviceName?.Invoke(), devicesRaw,
                     false, 50, (PixelMapper.Height - 1) / 2, null, 0, 0, 0));
         }

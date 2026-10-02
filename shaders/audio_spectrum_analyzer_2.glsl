@@ -23,7 +23,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
 {
     vec2 uv = fragCoord.xy / iResolution.xy;      // 0..1 normalized coordinates
     float x = uv.x;                                // horizontal position (frequency axis)
-    float y = 1.0 - uv.y;                          // vertical position (amplitude axis) — inverted for LED matrix
+    float y = uv.y;                                  // vertical position (amplitude axis); 0 = bottom of the panel
 
     // ── Pure black background ────────────────────────────────────────
     vec3 color = vec3(0.0);
@@ -81,9 +81,9 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
             energy = pow(energy, 0.75);
             energy = clamp(energy, 0.0, 1.0);
 
-            // Bar dimensions — base at bottom of screen (Y=0 in inverted coords), bars grow upward
-            // For 11-pixel height display: use full height from Y≈0 to Y≈1 (inverted)
-            float barBaseY = 0.0;                      // bottom of screen (inverted Y)
+            // Bar dimensions — base at the bottom of the panel (Y=0), bars grow upward
+            // For an 11-pixel tall display: use the full height from Y=0 to Y=1
+            float barBaseY = 0.0;                      // bottom of the panel
             float barTopY  = energy * 1.0;             // bars grow up to full height
 
             // ── Draw the solid bar column ────────────────────────

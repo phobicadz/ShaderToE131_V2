@@ -1471,14 +1471,13 @@ void main(){ fragColor = texture(tex, UV); }";
             gl.ReadPixels(0, 0, (uint)width, (uint)height, PixelFormat.Rgba, PixelType.UnsignedByte, readPtr);
         }
 
-        // Copy directly to framebuffer (no downsample needed)
+        // Straight copy — deliberately NOT flipped. ReadPixels returns rows
+        // bottom-to-top, so framebuffer row 0 is the bottom of the rendered image.
+        // That row goes to LED row 0 (the bottom row of the panel) and to the bottom
+        // of the preview window, so the panel, the preview and the shader's own
+        // up/down all agree.
         int rowBytes = width * 4;
-        for (int y = 0; y < height; y++)
-        {
-            int srcY = height - 1 - y;  // Flip Y: OpenGL bottom-to-top
-            for (int i = 0; i < rowBytes; i++)
-                framebuffer[y * rowBytes + i] = readPixels[srcY * rowBytes + i];
-        }
+        Array.Copy(readPixels, 0, framebuffer, 0, rowBytes * height);
 
         // Restore viewport to window size for preview drawing
         gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);

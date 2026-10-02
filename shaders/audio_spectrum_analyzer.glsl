@@ -34,7 +34,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
 {
     vec2 uv = fragCoord.xy / iResolution.xy;      // 0..1 normalized coordinates
     float x = uv.x;                                // horizontal position (frequency axis)
-    float y = 1.0 - uv.y;                            // vertical position (amplitude axis)
+    float y = uv.y;                                  // vertical position (amplitude axis); 0 = bottom of the panel
 
     // ── Pure black background ────────────────────────────────────────
     vec3 color = vec3(0.0);
