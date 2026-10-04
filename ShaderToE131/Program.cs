@@ -907,10 +907,12 @@ void main()
             }
         }
 
-        if (_shaderProgram == null || _sender == null) return;
+        if (_sender == null) return;
 
         // ─── Pending shader swap from web server (main-thread GL work) ───
-        bool _isOff = false;
+        // No program means the output is blank — keep sending black frames. Returning
+        // early here would stop sending entirely and the controller holds its last lit frame.
+        bool _isOff = _shaderProgram == null;
         if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderFileName) && _webServer.PendingShaderFileName == "Off")
         {
             // "Off" — blank screen, dispose shader to stop GPU rendering
@@ -922,20 +924,15 @@ void main()
             _webServer.PendingShaderSource = null;  // consume
             _webServer.PendingShaderFileName = null;
             _isOff = true;
-
-            // Publish an explicit "off" in the snapshot so the web UI never sees a
-            // stale shader name while no shader is loaded (the snapshot update below
-            // is skipped once the shader is null).
-            var currentSnapshot = _webServer.StatusSnapshot;
-            if (currentSnapshot != null)
-                _webServer.StatusSnapshot = currentSnapshot with { SelectedShader = "off" };
         }
 
         // Update web server status (with live stats)
-        if (_webServer != null && _shaderSource != null)
+        if (_webServer != null)
         {
             string selectedName = "built-in default";
-            if (_demoShaders != null && _demoIndex >= 0)
+            if (_shaderProgram == null)
+                selectedName = "off";  // Off (blank): no program loaded
+            else if (_demoShaders != null && _demoIndex >= 0)
                 selectedName = Path.GetFileName(_demoShaders[_demoIndex]);
             else if (!string.IsNullOrEmpty(_currentShaderFileName))
                 selectedName = _currentShaderFileName + ".glsl";
@@ -1084,10 +1081,12 @@ void main()
             Console.WriteLine($"[Web] Shader changed: {newName ?? "unknown"}");
         }
 
-        if (_shaderProgram == null || _sender == null) return;
+        if (_sender == null) return;
 
         // Check for pending shader change from web server (thread-safe polling)
-        bool _isOff = false;
+        // No program means the output is blank — keep sending black frames. Returning
+        // early here would stop sending entirely and the controller holds its last lit frame.
+        bool _isOff = _shaderProgram == null;
         if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderFileName) && _webServer.PendingShaderFileName == "Off")
         {
             // "Off" — blank screen, dispose shader to stop GPU rendering
@@ -1099,20 +1098,15 @@ void main()
             _webServer.PendingShaderSource = null;  // consume
             _webServer.PendingShaderFileName = null;
             _isOff = true;
-
-            // Publish an explicit "off" in the snapshot so the web UI never sees a
-            // stale shader name while no shader is loaded (the snapshot update below
-            // is skipped once the shader is null).
-            var currentSnapshot = _webServer.StatusSnapshot;
-            if (currentSnapshot != null)
-                _webServer.StatusSnapshot = currentSnapshot with { SelectedShader = "off" };
         }
 
         // Update web server status (with live stats)
-        if (_webServer != null && _shaderSource != null)
+        if (_webServer != null)
         {
             string selectedName = "built-in default";
-            if (_demoShaders != null && _demoIndex >= 0)
+            if (_shaderProgram == null)
+                selectedName = "off";  // Off (blank): no program loaded
+            else if (_demoShaders != null && _demoIndex >= 0)
                 selectedName = Path.GetFileName(_demoShaders[_demoIndex]);
             else if (!string.IsNullOrEmpty(_currentShaderFileName))
                 selectedName = _currentShaderFileName + ".glsl";
