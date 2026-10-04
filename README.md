@@ -134,6 +134,7 @@ dotnet run --help
 | `--string-row <y>` | Matrix row to sample the string from (default: center row) |
 | `--string-ip <ip\|host>` | Target IP or hostname (e.g. `ledstring.local`) for the string (default: same as matrix) |
 | `--string-universe <n>` | Universe for the string (default: first after the matrix's universes) |
+| `--fps <n>` | Cap the E.1.31 send rate for matrix + string (default: uncapped). Use `30`–`60` for typical pixel controllers — sending 4 universes per frame at thousands of fps overruns their refresh rate and drops frames |
 | `--list-devices` | List available audio input devices and exit |
 | `--help, -h` | Show usage help |
 

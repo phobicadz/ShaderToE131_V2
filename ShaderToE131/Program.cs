@@ -31,6 +31,8 @@ class Program : IDisposable
     private string? _selectedLoopbackDeviceName;
     private int _webPort = 8080;
     private string _webBindAddress = "0.0.0.0";
+    private int _targetFps = 0;             // 0 = uncapped E.1.31 send rate
+    private double _nextSendMs = 0;
     private WebServer? _webServer;
 
     private IWindow? _window;
@@ -246,6 +248,8 @@ void main()
                 prog._webPort = wp;
             else if (args[i] == "--bind-address" && i + 1 < args.Length)
                 prog._webBindAddress = args[++i];
+            else if (args[i] == "--fps" && i + 1 < args.Length && int.TryParse(args[++i], out var fps) && fps > 0)
+                prog._targetFps = fps;
             else if (args[i] == "--string") { prog._stringEnabled = true; }
             else if (args[i] == "--string-size" && i + 1 < args.Length && int.TryParse(args[++i], out var ss))
                 prog._stringSize = ss;
@@ -279,6 +283,7 @@ void main()
             Console.WriteLine("  --string-row <y>       Matrix row to sample the string from (default: center row)");
             Console.WriteLine("  --string-ip <ip|host>  Target IP or hostname for the string (default: same as matrix)");
             Console.WriteLine("  --string-universe <n>  Universe for the string (default: first after the matrix's universes)");
+            Console.WriteLine("  --fps <n>            Cap the E.1.31 send rate (matrix + string). Default: uncapped");
             Console.WriteLine("  --list-devices         List available audio input devices and exit");
             Console.WriteLine();
             return;
@@ -337,6 +342,8 @@ void main()
         Console.WriteLine($"  Matrix: {MatW}×{MatH} ({PixelMapper.TotalPixels} pixels, {PixelMapper.TotalChannels} channels)");
         Console.WriteLine($"  Target: {TargetIp}:5568 (unicast, universe={UniverseId})");
         Console.WriteLine($"  Aspect ratio: {PixelMapper.AspectRatio:F3}");
+        if (_targetFps > 0)
+            Console.WriteLine($"  Output cap: {_targetFps} fps (E.1.31 send paced; rendering stays uncapped)");
 
         // Resolve LED string settings (if enabled)
         if (_stringEnabled)
@@ -673,6 +680,25 @@ void main()
     }
 
     /// <summary>
+    /// True when an E.1.31 frame is due. Without --fps this always sends.
+    /// Only the send is paced — the GL loop keeps running at full speed.
+    /// The deadline advances by a fixed interval instead of being recomputed from "now",
+    /// otherwise it aliases against the render loop's own period (60 fps requested against
+    /// a ~64 fps loop would skip every other frame and deliver 32).
+    /// </summary>
+    private bool SendDue()
+    {
+        if (_targetFps <= 0) return true;
+
+        double now = Environment.TickCount64;
+        double interval = 1000.0 / _targetFps;
+        if (now < _nextSendMs) return false;
+        // The loop is slower than the target rate — resync instead of owing a backlog.
+        _nextSendMs = (now - _nextSendMs > interval) ? now : _nextSendMs + interval;
+        return true;
+    }
+
+    /// <summary>
     /// Headless render loop — uses a tiny visible window so Silk.NET doesn't throttle to ~1fps.
     /// Skips preview drawing for max performance.
     /// </summary>
@@ -971,35 +997,39 @@ void main()
         // Map to E.1.31 buffer (straight raster layout)
         PixelMapper.MapFrame(_frameBuffer.AsSpan(), _e131Buffer.AsSpan());
 
-        // Send to LED matrix — 583 pixels × 3 channels = 1749 slots → needs 4 universes
-        try
+        // Send matrix + string together, paced by --fps when set, so both stay frame-aligned
+        if (SendDue())
         {
-            _sender.SendFrameMultiUniverse(_e131Buffer, UniverseId);
-            _framesSent++;
-        }
-        catch (Exception ex)
-        {
-            _sendErrors++;
-            Console.WriteLine($"[E1.31] Send failed: {ex.Message}");
-        }
-
-        // Send to LED string — mirrors a matrix row (default: center row)
-        if (_stringSender != null)
-        {
-            PixelMapper.MapRowToString(_frameBuffer.AsSpan(), _stringRowResolved, _stringSize, _stringBuffer.AsSpan());
+            // Send to LED matrix — 583 pixels × 3 channels = 1749 slots → needs 4 universes
             try
             {
-                _stringSender.SendFrameMultiUniverse(_stringBuffer, (ushort)_stringUniverseResolved);
-                _stringFramesSent++;
+                _sender.SendFrameMultiUniverse(_e131Buffer, UniverseId);
+                _framesSent++;
             }
             catch (Exception ex)
             {
-                _stringSendErrors++;
-                Console.WriteLine($"[String] Send failed: {ex.Message}");
+                _sendErrors++;
+                Console.WriteLine($"[E1.31] Send failed: {ex.Message}");
             }
-        }
 
-        _frameCount++;
+            // Send to LED string — mirrors a matrix row (default: center row)
+            if (_stringSender != null)
+            {
+                PixelMapper.MapRowToString(_frameBuffer.AsSpan(), _stringRowResolved, _stringSize, _stringBuffer.AsSpan());
+                try
+                {
+                    _stringSender.SendFrameMultiUniverse(_stringBuffer, (ushort)_stringUniverseResolved);
+                    _stringFramesSent++;
+                }
+                catch (Exception ex)
+                {
+                    _stringSendErrors++;
+                    Console.WriteLine($"[String] Send failed: {ex.Message}");
+                }
+            }
+
+            _frameCount++;
+        }
         long nowMs = Environment.TickCount64;
         if (nowMs - _lastStatusLogMs >= 1000)
         {
@@ -1144,35 +1174,39 @@ void main()
         // Map to E.1.31 buffer (straight raster layout)
         PixelMapper.MapFrame(_frameBuffer.AsSpan(), _e131Buffer.AsSpan());
 
-        // Send to LED matrix — 583 pixels × 3 channels = 1749 slots → needs 4 universes
-        try
+        // Send matrix + string together, paced by --fps when set, so both stay frame-aligned
+        if (SendDue())
         {
-            _sender.SendFrameMultiUniverse(_e131Buffer, UniverseId);
-            _framesSent++;
-        }
-        catch (Exception ex)
-        {
-            _sendErrors++;
-            Console.WriteLine($"[E1.31] Send failed: {ex.Message}");
-        }
-
-        // Send to LED string — mirrors a matrix row (default: center row)
-        if (_stringSender != null)
-        {
-            PixelMapper.MapRowToString(_frameBuffer.AsSpan(), _stringRowResolved, _stringSize, _stringBuffer.AsSpan());
+            // Send to LED matrix — 583 pixels × 3 channels = 1749 slots → needs 4 universes
             try
             {
-                _stringSender.SendFrameMultiUniverse(_stringBuffer, (ushort)_stringUniverseResolved);
-                _stringFramesSent++;
+                _sender.SendFrameMultiUniverse(_e131Buffer, UniverseId);
+                _framesSent++;
             }
             catch (Exception ex)
             {
-                _stringSendErrors++;
-                Console.WriteLine($"[String] Send failed: {ex.Message}");
+                _sendErrors++;
+                Console.WriteLine($"[E1.31] Send failed: {ex.Message}");
             }
-        }
 
-        _frameCount++;
+            // Send to LED string — mirrors a matrix row (default: center row)
+            if (_stringSender != null)
+            {
+                PixelMapper.MapRowToString(_frameBuffer.AsSpan(), _stringRowResolved, _stringSize, _stringBuffer.AsSpan());
+                try
+                {
+                    _stringSender.SendFrameMultiUniverse(_stringBuffer, (ushort)_stringUniverseResolved);
+                    _stringFramesSent++;
+                }
+                catch (Exception ex)
+                {
+                    _stringSendErrors++;
+                    Console.WriteLine($"[String] Send failed: {ex.Message}");
+                }
+            }
+
+            _frameCount++;
+        }
         long nowMs = Environment.TickCount64;
         if (nowMs - _lastStatusLogMs >= 2000)
         {
