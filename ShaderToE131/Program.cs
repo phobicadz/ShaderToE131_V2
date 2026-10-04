@@ -14,6 +14,7 @@ class Program : IDisposable
     private const int MatW = PixelMapper.Width;     // 53
     private const int MatH = PixelMapper.Height;    // 11
     private const ushort UniverseId = 1;            // sACN universe (valid range: 1..63999)
+    private const int OffClearFrames = 10;          // black frames sent when output is turned off
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void SwapIntervalFn(int interval);
@@ -32,6 +33,7 @@ class Program : IDisposable
     private int _webPort = 8080;
     private string _webBindAddress = "0.0.0.0";
     private int _targetFps = 0;             // 0 = uncapped E.1.31 send rate
+    private int _offFramesRemaining;        // black frames left to send after turning off
     private double _nextSendMs = 0;
     private WebServer? _webServer;
 
@@ -699,6 +701,17 @@ void main()
     }
 
     /// <summary>
+    /// Off output: a short burst of black frames clears the controller, then the send
+    /// goes quiet. Re-armed by every Off request; a new shader resumes normal sending.
+    /// </summary>
+    private bool OffBurstDue()
+    {
+        if (_offFramesRemaining <= 0) return false;
+        _offFramesRemaining--;
+        return true;
+    }
+
+    /// <summary>
     /// Headless render loop — uses a tiny visible window so Silk.NET doesn't throttle to ~1fps.
     /// Skips preview drawing for max performance.
     /// </summary>
@@ -924,6 +937,7 @@ void main()
             _webServer.PendingShaderSource = null;  // consume
             _webServer.PendingShaderFileName = null;
             _isOff = true;
+            _offFramesRemaining = OffClearFrames;
         }
 
         // Update web server status (with live stats)
@@ -995,7 +1009,8 @@ void main()
         PixelMapper.MapFrame(_frameBuffer.AsSpan(), _e131Buffer.AsSpan());
 
         // Send matrix + string together, paced by --fps when set, so both stay frame-aligned
-        if (SendDue())
+        // SendDue() first: OffBurstDue() must only spend burst frames on slots that send.
+        if (SendDue() && (!_isOff || OffBurstDue()))
         {
             // Send to LED matrix — 583 pixels × 3 channels = 1749 slots → needs 4 universes
             try
@@ -1028,7 +1043,7 @@ void main()
             _frameCount++;
         }
         long nowMs = Environment.TickCount64;
-        if (nowMs - _lastStatusLogMs >= 1000)
+        if (nowMs - _lastStatusLogMs >= 1000 && (!_isOff || _offFramesRemaining > 0))
         {
             int r = _e131Buffer.Length > 0 ? _e131Buffer[0] : 0;
             int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;
@@ -1098,6 +1113,7 @@ void main()
             _webServer.PendingShaderSource = null;  // consume
             _webServer.PendingShaderFileName = null;
             _isOff = true;
+            _offFramesRemaining = OffClearFrames;
         }
 
         // Update web server status (with live stats)
@@ -1169,7 +1185,8 @@ void main()
         PixelMapper.MapFrame(_frameBuffer.AsSpan(), _e131Buffer.AsSpan());
 
         // Send matrix + string together, paced by --fps when set, so both stay frame-aligned
-        if (SendDue())
+        // SendDue() first: OffBurstDue() must only spend burst frames on slots that send.
+        if (SendDue() && (!_isOff || OffBurstDue()))
         {
             // Send to LED matrix — 583 pixels × 3 channels = 1749 slots → needs 4 universes
             try
@@ -1202,7 +1219,7 @@ void main()
             _frameCount++;
         }
         long nowMs = Environment.TickCount64;
-        if (nowMs - _lastStatusLogMs >= 2000)
+        if (nowMs - _lastStatusLogMs >= 2000 && (!_isOff || _offFramesRemaining > 0))
         {
             int r = _e131Buffer.Length > 0 ? _e131Buffer[0] : 0;
             int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;
