@@ -34,6 +34,7 @@ public sealed class WebServer : IDisposable
     public Func<string?>? GetLoopbackDeviceName { get; set; }       // current loopback device friendly name
     public Action<int>? SetAudioDeviceIndex { get; set; }         // change audio device index via web
     public Func<List<(int Index, string Name)>>? GetAvailableDevices { get; set; }  // list available devices for selection UI
+    public Func<List<(int Index, string Name)>>? GetAvailableDevicesFresh { get; set; }  // same, but re-enumerated (used by /api/audio-devices)
 
     // ─── LED string output state ───
     // A pending config change posted by the web UI; consumed (and cleared) by the
@@ -49,7 +50,8 @@ public sealed class WebServer : IDisposable
     private readonly object _shaderScanLock = new();
     private volatile ShaderInfo[] _shaders = Array.Empty<ShaderInfo>();
     private DateTime _shadersScannedAt = DateTime.MinValue;
-    private const int RescanSeconds = 5;
+    private DateTime _shaderDirStamp = DateTime.MinValue;
+    private const int RescanSeconds = 60;   // full re-scan interval; file add/remove is caught by the directory stamp
     internal IReadOnlyList<ShaderInfo> Shaders => _shaders;
     private volatile ApiStatus? _statusSnapshot;
 
@@ -117,6 +119,12 @@ public sealed class WebServer : IDisposable
         return IPAddress.Loopback;
     }
 
+    private DateTime DirectoryStamp()
+    {
+        try { return Directory.Exists(_shaderDirPath) ? Directory.GetLastWriteTimeUtc(_shaderDirPath) : DateTime.MinValue; }
+        catch { return DateTime.MinValue; }
+    }
+
     private void LoadShaderList()
     {
         var list = new List<ShaderInfo>();
@@ -131,6 +139,7 @@ public sealed class WebServer : IDisposable
         }
         _shaders = list.ToArray();
         _shadersScannedAt = DateTime.UtcNow;
+        _shaderDirStamp = DirectoryStamp();
     }
 
     /// <summary>
@@ -140,11 +149,13 @@ public sealed class WebServer : IDisposable
     /// </summary>
     private ShaderInfo[] CurrentShaders()
     {
-        if ((DateTime.UtcNow - _shadersScannedAt).TotalSeconds >= RescanSeconds)
+        // Reading every .glsl file costs hundreds of ms, and /api/status is polled constantly.
+        // Re-scan only when the directory itself changes (add/remove/rename) or once a minute.
+        if ((DateTime.UtcNow - _shadersScannedAt).TotalSeconds >= RescanSeconds || DirectoryStamp() != _shaderDirStamp)
         {
             lock (_shaderScanLock)
             {
-                if ((DateTime.UtcNow - _shadersScannedAt).TotalSeconds >= RescanSeconds)
+                if ((DateTime.UtcNow - _shadersScannedAt).TotalSeconds >= RescanSeconds || DirectoryStamp() != _shaderDirStamp)
                     LoadShaderList();
             }
         }
@@ -1018,7 +1029,8 @@ setInterval(refreshStatus, 2000);
 
     private void ServeGetAudioDevices(Socket clientSocket)
     {
-        var devicesRaw = GetAvailableDevices?.Invoke() ?? new List<(int Index, string Name)>();
+        // Asking for devices is an explicit user action, so enumerate them for real.
+        var devicesRaw = (GetAvailableDevicesFresh ?? GetAvailableDevices)?.Invoke() ?? new List<(int Index, string Name)>();
 
         var devices = devicesRaw.Select(d => new { Index = d.Index, Name = d.Name }).ToList();
         SendJson(clientSocket, new { devices = devices });

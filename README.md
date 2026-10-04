@@ -119,7 +119,7 @@ dotnet run --help
 
 | Option | Description |
 |--------|-------------|
-| `--no-preview` | Run headless (no OpenGL window) |
+| `--no-preview` | Run headless: no preview window, own render loop (see "Idle cost" below) |
 | `--shader <file>` | Path to a `.glsl` shader file |
 | `--demo` | Cycle through all shaders in `shaders/` directory |
 | `--demo-time <secs>` | Seconds per shader in demo mode (default: 10) |
@@ -134,7 +134,7 @@ dotnet run --help
 | `--string-row <y>` | Matrix row to sample the string from (default: center row) |
 | `--string-ip <ip\|host>` | Target IP or hostname (e.g. `ledstring.local`) for the string (default: same as matrix) |
 | `--string-universe <n>` | Universe for the string (default: first after the matrix's universes) |
-| `--fps <n>` | Cap the E.1.31 send rate for matrix + string (default: uncapped). Use `30`–`60` for typical pixel controllers — sending 4 universes per frame at thousands of fps overruns their refresh rate and drops frames |
+| `--fps <n>` | Cap the output rate for matrix + string (default: uncapped). Use `30`–`60` for typical pixel controllers — sending 4 universes per frame at thousands of fps overruns their refresh rate and drops frames. In headless mode the whole render loop is paced to this rate, so it also caps CPU use |
 | `--list-devices` | List available audio input devices and exit |
 | `--help, -h` | Show usage help |
 
@@ -359,6 +359,17 @@ shaders/
 ### No preview window appears
 
 Use `--no-preview` to run headless when OpenGL window creation fails or is not needed. The LED matrix output continues to work in headless mode.
+
+### Idle cost
+
+Headless mode owns its loop: it creates a minimal GL context, then renders, sends and sleeps on
+its own schedule instead of using Silk.NET's window loop (which keeps spinning to hold its own
+update cadence and ignores `--fps`). Combined with `--fps`, a 53×11 matrix runs at ~8% of a core
+instead of ~135%.
+
+Selecting **Off (blank)** sends a short burst of black frames (10, enough to clear the controller
+and survive a lost packet), then the loop idles instead of streaming black frames forever — an idle
+service costs a few percent of a core, not the same as a running shader.
 
 ### Audio not detected
 

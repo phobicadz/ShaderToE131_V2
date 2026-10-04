@@ -15,6 +15,8 @@ class Program : IDisposable
     private const int MatH = PixelMapper.Height;    // 11
     private const ushort UniverseId = 1;            // sACN universe (valid range: 1..63999)
     private const int OffClearFrames = 10;          // black frames sent when output is turned off
+    private const long DeviceListCacheMs = 60_000;  // /api/status may reuse the list this long
+    private const int OffIdleSleepMs = 50;          // how long the loop sleeps while the output is off
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate void SwapIntervalFn(int interval);
@@ -33,6 +35,8 @@ class Program : IDisposable
     private int _webPort = 8080;
     private string _webBindAddress = "0.0.0.0";
     private int _targetFps = 0;             // 0 = uncapped E.1.31 send rate
+    private List<(int Index, string Name)>? _deviceListCache;
+    private long _deviceListCacheMs;
     private int _offFramesRemaining;        // black frames left to send after turning off
     private double _nextSendMs = 0;
     private WebServer? _webServer;
@@ -285,7 +289,7 @@ void main()
             Console.WriteLine("  --string-row <y>       Matrix row to sample the string from (default: center row)");
             Console.WriteLine("  --string-ip <ip|host>  Target IP or hostname for the string (default: same as matrix)");
             Console.WriteLine("  --string-universe <n>  Universe for the string (default: first after the matrix's universes)");
-            Console.WriteLine("  --fps <n>            Cap the E.1.31 send rate (matrix + string). Default: uncapped");
+            Console.WriteLine("  --fps <n>            Cap the output rate (matrix + string); headless mode paces its render loop to it. Default: uncapped");
             Console.WriteLine("  --list-devices         List available audio input devices and exit");
             Console.WriteLine();
             return;
@@ -345,7 +349,7 @@ void main()
         Console.WriteLine($"  Target: {TargetIp}:5568 (unicast, universe={UniverseId})");
         Console.WriteLine($"  Aspect ratio: {PixelMapper.AspectRatio:F3}");
         if (_targetFps > 0)
-            Console.WriteLine($"  Output cap: {_targetFps} fps (E.1.31 send paced; rendering stays uncapped)");
+            Console.WriteLine($"  Output cap: {_targetFps} fps{(_noPreview ? " (render loop + E.1.31 send paced)" : " (E.1.31 send paced; preview rendering uncapped)")}");
 
         // Resolve LED string settings (if enabled)
         if (_stringEnabled)
@@ -494,7 +498,8 @@ void main()
     (_audioSource == AudioCapture.AudioSource.Loopback)
         ? (_audioCapture?.GetCurrentLoopbackDeviceName() ?? _selectedLoopbackDeviceName)
         : null;
-            _webServer.GetAvailableDevices = () => AudioCapture.ListLoopbackDevices().ToList();
+            _webServer.GetAvailableDevices = () => CachedDeviceList();
+            _webServer.GetAvailableDevicesFresh = () => CachedDeviceList(refresh: true);
             _webServer.SetAudioDeviceIndex = idx =>
             {
                 _audioSource = AudioCapture.AudioSource.Loopback;
@@ -701,6 +706,22 @@ void main()
     }
 
     /// <summary>
+    /// WASAPI endpoint enumeration (MMDeviceEnumerator + FriendlyName per device) costs about
+    /// a second per call when there is no interactive audio session, and the web UI polls
+    /// /api/status every few seconds. Enumerate once per cache window instead.
+    /// </summary>
+    private List<(int Index, string Name)> CachedDeviceList(bool refresh = false)
+    {
+        long now = Environment.TickCount64;
+        if (refresh || _deviceListCache == null || now - _deviceListCacheMs > DeviceListCacheMs)
+        {
+            _deviceListCache = AudioCapture.ListLoopbackDevices().ToList();
+            _deviceListCacheMs = now;
+        }
+        return _deviceListCache;
+    }
+
+    /// <summary>
     /// Off output: a short burst of black frames clears the controller, then the send
     /// goes quiet. Re-armed by every Off request; a new shader resumes normal sending.
     /// </summary>
@@ -712,8 +733,9 @@ void main()
     }
 
     /// <summary>
-    /// Headless render loop — uses a tiny visible window so Silk.NET doesn't throttle to ~1fps.
-    /// Skips preview drawing for max performance.
+    /// Headless render loop — a tiny window supplies the GL context, but the loop itself is
+    /// ours. Silk.NET's own loop keeps spinning to hold its internal update cadence, which
+    /// costs real CPU even when nothing is being drawn, and it ignores --fps.
     /// </summary>
     private unsafe void RunHeadless()
     {
@@ -721,19 +743,31 @@ void main()
 
         // Small but VISIBLE window — Silk.NET throttles hidden/minimized windows to ~1fps
         var opts = WindowOptions.Default;
-        // Tiny window prevents Silk.NET from throttling to ~1fps.
         // We don't actually display it — just need a minimal GL context.
         opts.Size = new Vector2D<int>(64, 64);
         opts.Title = "ShaderToE131 Headless";
-        opts.FramesPerSecond = 0; // unlimited
+        opts.FramesPerSecond = 0; // unlimited; pacing below is ours
 
         _window = Window.Create(opts);
         _window.Load += OnLoadHeadless;
-        _window.Render += OnRenderHeadless;
         _window.Closing += () => { };
 
         Console.WriteLine("Starting headless render loop...");
-        _window.Run();
+        _window.Initialize();
+
+        long prevTickMs = Environment.TickCount64;
+        while (true)
+        {
+            _window.DoEvents();
+            long nowTickMs = Environment.TickCount64;
+            OnRenderHeadless((nowTickMs - prevTickMs) / 1000.0);
+            prevTickMs = nowTickMs;
+            _window.SwapBuffers();
+
+            // Render at the output cap, not faster than the frames we are allowed to send.
+            long wait = (long)Math.Ceiling(_nextSendMs - Environment.TickCount64);
+            if (wait > 0) Thread.Sleep((int)Math.Min(wait, 1000));
+        }
     }
 
     private unsafe void OnLoadHeadless()
@@ -995,6 +1029,14 @@ void main()
             }
         }
 
+        // Burst spent and output off: idle the loop. Spinning it at full speed doing
+        // nothing is why "off" cost as much CPU as a running shader.
+        if (_isOff && _offFramesRemaining <= 0)
+        {
+            Thread.Sleep(OffIdleSleepMs);
+            return;
+        }
+
         // Render shader output into the matrix-sized framebuffer.
         if (_isOff)
         {
@@ -1169,6 +1211,14 @@ void main()
                 int next = (_demoIndex + 1) % _demoShaders.Length;
                 LoadDemoShader(next);
             }
+        }
+
+        // Burst spent and output off: idle the loop. Spinning it at full speed doing
+        // nothing is why "off" cost as much CPU as a running shader.
+        if (_isOff && _offFramesRemaining <= 0)
+        {
+            Thread.Sleep(OffIdleSleepMs);
+            return;
         }
 
         // Render shader output into the matrix-sized framebuffer.
