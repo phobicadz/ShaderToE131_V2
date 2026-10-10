@@ -903,6 +903,9 @@ void main()
         if (note.Text.Length == 0)
         {
             _notifyText = null;
+            // Off output: the controller still holds the banner. Re-arm the clear burst
+            // so black frames are actually sent and the display clears.
+            if (_shaderProgram == null) _offFramesRemaining = OffClearFrames;
             Console.WriteLine("[Web] Notification cleared.");
             return;
         }
@@ -923,6 +926,9 @@ void main()
         if (nowMs >= _notifyUntilMs)
         {
             _notifyText = null;
+            // Same as the explicit clear path: re-arm the Off clear burst so the
+            // banner is replaced by black frames on the controller.
+            if (_shaderProgram == null) _offFramesRemaining = OffClearFrames;
             return;
         }
         TextRenderer.DrawBanner(_frameBuffer.AsSpan(), MatW, MatH, _notifyText, nowMs - _notifyStartMs);
