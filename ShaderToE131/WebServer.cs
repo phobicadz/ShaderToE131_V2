@@ -41,6 +41,24 @@ public sealed class WebServer : IDisposable
     // render loop once it has been applied on the GL thread.
     private volatile StringConfigChange? _pendingStringChange;
     public StringConfigChange? PendingStringChange { get => _pendingStringChange; set => _pendingStringChange = value; }
+
+    /// <summary>
+    /// A text notification posted via /api/notify, waiting for the render loop to pick up.
+    /// An empty Text means "clear the active notification".
+    /// </summary>
+    public record NotificationRequest(string Text, int DurationSec);
+
+    private volatile NotificationRequest? _pendingNotification;
+
+    /// <summary>
+    /// Atomically take the pending notification and clear the slot in one step,
+    /// so a notification posted concurrently cannot be dropped by a read-then-clear race.
+    /// Returns null when nothing is pending.
+    /// </summary>
+    public NotificationRequest? ConsumePendingNotification() => Interlocked.Exchange(ref _pendingNotification, null);
+
+    // Test hook: post a notification as the /api/notify handler would.
+    internal void SetPendingNotificationForTest(NotificationRequest request) => _pendingNotification = request;
     public Func<LiveStringState>? GetLiveStringState { get; set; }  // current string config + live stats
 
     // Shader list is rebuilt into a NEW array and published with a single
@@ -93,7 +111,9 @@ public sealed class WebServer : IDisposable
         string? StringIp,
         int StringUniverse,
         int StringFramesSent,
-        int StringSendErrors
+        int StringSendErrors,
+        string? ActiveNotification,
+        double NotificationRemainingSecs
     );
 
     private static readonly JsonSerializerOptions JsonCamelCase = new()
@@ -367,6 +387,10 @@ public sealed class WebServer : IDisposable
                     if (method == "GET") ServeStringConfig(clientSocket);
                     else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
                     break;
+                case "/api/notify":
+                    if (method == "POST") ServeNotify(clientSocket, body);
+                    else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
+                    break;
                 case "/api/status":
                     if (method == "GET") ServeStatus(clientSocket);
                     else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
@@ -605,6 +629,20 @@ public sealed class WebServer : IDisposable
           </div>
         </div>
         <div class=""hint"">Choosing a device switches the audio source to that loopback device.</div>
+      </section>
+
+      <section class=""card notify"">
+        <h2>Notifications</h2>
+        <label for=""notifyText"">Message</label>
+        <input type=""text"" id=""notifyText"" maxlength=""200"" placeholder=""Text to show on the LED matrix"">
+        <div class=""fields"">
+          <div>
+            <label for=""notifyDuration"">Duration (s)</label>
+            <input type=""number"" id=""notifyDuration"" min=""1"" max=""300"" value=""10"">
+          </div>
+        </div>
+        <button id=""sendNotifyBtn"">Send Notification</button>
+        <div class=""hint"" id=""notifyStatus"">No active notification.</div>
       </section>
     </div>
 
@@ -859,6 +897,20 @@ async function applyString() {
   } catch (e) { showBanner('Failed to apply string settings: ' + e, true); }
 }
 
+// ── Notifications ────────────────────────────────────────────────
+async function sendNotification() {
+  const text = $('notifyText').value.trim();
+  const durRaw = $('notifyDuration').value.trim() || '10';
+  const dur = Number(durRaw);
+  if (!Number.isInteger(dur) || dur < 1 || dur > 300) { showBanner('Duration must be a whole number of seconds (1–300).', true); return; }
+  try {
+    const r = await fetch(API + 'api/notify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, duration: dur }) });
+    const d = await r.json();
+    if (d.ok) showBanner(text ? 'Notification sent.' : 'Notification cleared.', false);
+    else showBanner(d.error || 'Failed to send notification.', true);
+  } catch (e) { showBanner('Failed to send notification: ' + e, true); }
+}
+
 // ── Status ───────────────────────────────────────────────────────
 async function refreshStatus() {
   try {
@@ -893,6 +945,13 @@ async function refreshStatus() {
     $('stFrames').textContent = (d.framesSent ?? 0).toLocaleString();
     $('stErrors').textContent = (d.sendErrors ?? 0).toLocaleString();
 
+    const notifyEl = $('notifyStatus');
+    if (notifyEl) {
+      notifyEl.textContent = d.activeNotification
+        ? 'Showing: ' + truncate(d.activeNotification, 60) + ' · ' + Math.ceil(d.notificationRemainingSecs || 0) + 's left'
+        : 'No active notification.';
+    }
+
     const s = Math.max(0, Math.floor(d.uptimeSecs || 0));
     const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
     $('stUptime').textContent = h + 'h ' + m.toString().padStart(2, '0') + 'm ' + sec + 's';
@@ -902,6 +961,8 @@ async function refreshStatus() {
 // ── Wire up ──────────────────────────────────────────────────────
 $('applyShaderBtn').addEventListener('click', applyShader);
 $('applyStringBtn').addEventListener('click', applyString);
+$('sendNotifyBtn').addEventListener('click', sendNotification);
+$('notifyText').addEventListener('keydown', e => { if (e.key === 'Enter') sendNotification(); });
 loadShaders();
 loadDevices();
 loadStringConfig();
@@ -1098,6 +1159,63 @@ setInterval(refreshStatus, 2000);
 
         Console.WriteLine($"[WebServer] Audio source set to: {src}");
         SendJson(clientSocket, new { ok = true, source = src, enabled = GetAudioEnabled?.Invoke() ?? false });
+    }
+
+    /// <summary>
+    /// Parse and validate a /api/notify JSON body.
+    /// Returns the request on success (null <paramref name="error"/>), or an error message.
+    /// An empty "text" is valid and means "clear the active notification".
+    /// </summary>
+    public static NotificationRequest? ParseNotifyRequest(string body, out string? error)
+    {
+        error = null;
+
+        Dictionary<string, JsonElement>? json;
+        try { json = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(body); }
+        catch { json = null; }
+
+        if (json == null || !json.TryGetValue("text", out var textEl) || textEl.ValueKind != JsonValueKind.String)
+        {
+            error = "Body must be JSON with a \"text\" string, e.g. {\"text\":\"Hello\",\"duration\":10}.";
+            return null;
+        }
+
+        string text = textEl.GetString() ?? "";
+        if (text.Length > TextRenderer.MaxTextLength)
+        {
+            error = $"text is limited to {TextRenderer.MaxTextLength} characters (got {text.Length}).";
+            return null;
+        }
+
+        int duration = 10;
+        if (json.TryGetValue("duration", out var durEl))
+        {
+            int? d = null;
+            if (durEl.ValueKind == JsonValueKind.Number && durEl.TryGetInt32(out int nv)) d = nv;
+            else if (durEl.ValueKind == JsonValueKind.String && int.TryParse(durEl.GetString(), out int sv)) d = sv;
+
+            if (d == null) { error = "'duration' must be a whole number of seconds."; return null; }
+            if (d is < 1 or > 300) { error = $"'duration' must be 1..300 seconds (got {d})."; return null; }
+            duration = d.Value;
+        }
+
+        return new NotificationRequest(text, duration);
+    }
+
+    private void ServeNotify(Socket clientSocket, string body)
+    {
+        var request = ParseNotifyRequest(body, out string? error);
+        if (request == null)
+        {
+            SendJson(clientSocket, new { ok = false, error });
+            return;
+        }
+
+        _pendingNotification = request;
+        if (request.Text.Length == 0)
+            SendJson(clientSocket, new { ok = true, cleared = true });
+        else
+            SendJson(clientSocket, new { ok = true, text = request.Text, duration = request.DurationSec });
     }
 
     private void ServeSetString(Socket clientSocket, string body)
@@ -1300,7 +1418,9 @@ setInterval(refreshStatus, 2000);
                 snap.StringIp,
                 snap.StringUniverse,
                 snap.StringFramesSent,
-                snap.StringSendErrors
+                snap.StringSendErrors,
+                snap.ActiveNotification,
+                snap.NotificationRemainingSecs
             });
         }
         else
@@ -1313,7 +1433,7 @@ setInterval(refreshStatus, 2000);
                 new ApiStatus("off", audioOn, audioOn ? (GetCurrentAudioSource?.Invoke() ?? "microphone") : "off", shaders.Length,
                     shaders.Where(s => s.IsAudioReactive).Select(s => s.Name!).ToArray()!, 0, 0, 0,
                     GetLoopbackDeviceName?.Invoke(), devicesRaw,
-                    false, 50, (PixelMapper.Height - 1) / 2, null, 0, 0, 0));
+                    false, 50, (PixelMapper.Height - 1) / 2, null, 0, 0, 0, null, 0));
         }
     }
 

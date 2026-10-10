@@ -73,6 +73,11 @@ class Program : IDisposable
     // thread, so a change arriving between a read and clear is never lost.
     private readonly System.Collections.Concurrent.ConcurrentQueue<WebServer.StringConfigChange> _pendingStringChanges = new();
 
+    // ─── Text notifications (banner overlay on the matrix) ───
+    private string? _notifyText;
+    private long _notifyStartMs;
+    private long _notifyUntilMs;
+
     private static readonly string[] AudioUniformNames =
         { "u_bass", "u_lowmid", "u_mid", "u_highmid", "u_treble", "u_volume" };
 
@@ -887,6 +892,52 @@ void main()
         Console.WriteLine($"[Web] LED string configured: {size} LEDs, row={effectiveRow}, universe={baseUniverse}, target={strIp}");
     }
 
+    /// <summary>
+    /// Consume any pending text notification from the web server (render thread).
+    /// An empty text clears the active notification.
+    /// </summary>
+    private void ApplyPendingNotification()
+    {
+        if (_webServer?.ConsumePendingNotification() is not { } note) return;
+
+        if (note.Text.Length == 0)
+        {
+            _notifyText = null;
+            // Off output: the controller still holds the banner. Re-arm the clear burst
+            // so black frames are actually sent and the display clears.
+            if (_shaderProgram == null) _offFramesRemaining = OffClearFrames;
+            Console.WriteLine("[Web] Notification cleared.");
+            return;
+        }
+
+        _notifyText = note.Text;
+        _notifyStartMs = Environment.TickCount64;
+        _notifyUntilMs = _notifyStartMs + (long)note.DurationSec * 1000;
+        Console.WriteLine($"[Web] Notification shown for {note.DurationSec}s: {note.Text}");
+    }
+
+    /// <summary>
+    /// Overlay the active notification banner on the rendered frame; clears it once expired.
+    /// </summary>
+    private void DrawActiveNotification()
+    {
+        if (_notifyText == null) return;
+        long nowMs = Environment.TickCount64;
+        if (nowMs >= _notifyUntilMs)
+        {
+            _notifyText = null;
+            // Same as the explicit clear path: re-arm the Off clear burst so the
+            // banner is replaced by black frames on the controller.
+            if (_shaderProgram == null) _offFramesRemaining = OffClearFrames;
+            return;
+        }
+        TextRenderer.DrawBanner(_frameBuffer.AsSpan(), MatW, MatH, _notifyText, nowMs - _notifyStartMs);
+    }
+
+    /// <summary>Remaining seconds of the active notification (0 when none).</summary>
+    private double NotificationRemainingSecs()
+        => _notifyText == null ? 0 : Math.Max(0, (_notifyUntilMs - Environment.TickCount64) / 1000.0);
+
     private unsafe void OnRender(double deltaTime)
     {
         // Apply pending LED string configuration changes from the web UI (render thread).
@@ -905,6 +956,9 @@ void main()
         {
             ApplyStringChange(queued);
         }
+
+        // Consume any pending text notification from the web UI/API.
+        ApplyPendingNotification();
 
         // Check for pending shader change BEFORE null guard — when coming from "Off",
         // _shaderProgram is null and we need to reload it before the guard would bail out.
@@ -1005,7 +1059,9 @@ void main()
                 _stringIp,
                 _stringUniverse,
                 _stringFramesSent,
-                _stringSendErrors
+                _stringSendErrors,
+                _notifyText,
+                NotificationRemainingSecs()
             );
         }
 
@@ -1031,7 +1087,7 @@ void main()
 
         // Burst spent and output off: idle the loop. Spinning it at full speed doing
         // nothing is why "off" cost as much CPU as a running shader.
-        if (_isOff && _offFramesRemaining <= 0)
+        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null)
         {
             Thread.Sleep(OffIdleSleepMs);
             return;
@@ -1047,12 +1103,15 @@ void main()
             _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
         }
 
+        // Overlay the active text notification banner (if any) on the frame.
+        DrawActiveNotification();
+
         // Map to E.1.31 buffer (straight raster layout)
         PixelMapper.MapFrame(_frameBuffer.AsSpan(), _e131Buffer.AsSpan());
 
         // Send matrix + string together, paced by --fps when set, so both stay frame-aligned
         // SendDue() first: OffBurstDue() must only spend burst frames on slots that send.
-        if (SendDue() && (!_isOff || OffBurstDue()))
+        if (SendDue() && (!_isOff || OffBurstDue() || _notifyText != null))
         {
             // Send to LED matrix — 583 pixels × 3 channels = 1749 slots → needs 4 universes
             try
@@ -1118,6 +1177,9 @@ void main()
         {
             ApplyStringChange(queued);
         }
+
+        // Consume any pending text notification from the web UI/API.
+        ApplyPendingNotification();
 
         // Check for pending shader change BEFORE null guard — when coming from "Off",
         // _shaderProgram is null and we need to reload it before the guard would bail out.
@@ -1189,7 +1251,9 @@ void main()
                 _stringIp,
                 _stringUniverse,
                 _stringFramesSent,
-                _stringSendErrors
+                _stringSendErrors,
+                _notifyText,
+                NotificationRemainingSecs()
             );
         }
 
@@ -1215,7 +1279,7 @@ void main()
 
         // Burst spent and output off: idle the loop. Spinning it at full speed doing
         // nothing is why "off" cost as much CPU as a running shader.
-        if (_isOff && _offFramesRemaining <= 0)
+        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null)
         {
             Thread.Sleep(OffIdleSleepMs);
             return;
@@ -1231,12 +1295,15 @@ void main()
             _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
         }
 
+        // Overlay the active text notification banner (if any) on the frame.
+        DrawActiveNotification();
+
         // Map to E.1.31 buffer (straight raster layout)
         PixelMapper.MapFrame(_frameBuffer.AsSpan(), _e131Buffer.AsSpan());
 
         // Send matrix + string together, paced by --fps when set, so both stay frame-aligned
         // SendDue() first: OffBurstDue() must only spend burst frames on slots that send.
-        if (SendDue() && (!_isOff || OffBurstDue()))
+        if (SendDue() && (!_isOff || OffBurstDue() || _notifyText != null))
         {
             // Send to LED matrix — 583 pixels × 3 channels = 1749 slots → needs 4 universes
             try
