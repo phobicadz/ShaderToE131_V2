@@ -96,6 +96,33 @@ public class TextRendererTests
     }
 
     [Fact]
+    public void DrawBanner_Tilde_RendersTildeGlyphNotArrow()
+    {
+        var frame = WhiteFrame();
+        // "~" is 5px wide → centered at x = (53 - 5) / 2 = 24; glyph rows map to y=2..8.
+        TextRenderer.DrawBanner(frame.AsSpan(), W, H, "~", elapsedMs: 0);
+
+        // Tilde columns are 0x08, 0x04, 0x08, 0x10, 0x08: a zigzag wave at glyph rows 3,2,3,4,3.
+        Assert.True(IsLit(frame, 24, 5));
+        Assert.True(IsLit(frame, 25, 4));
+        Assert.True(IsLit(frame, 26, 5));
+        Assert.True(IsLit(frame, 27, 6));
+        Assert.True(IsLit(frame, 28, 5));
+
+        // No other pixel in the glyph box is lit (in particular none of the arrow-shape rows).
+        for (int x = 24; x <= 28; x++)
+            for (int y = 2; y <= 8; y++)
+            {
+                bool expected = (x, y) switch
+                {
+                    (24, 5) or (25, 4) or (26, 5) or (27, 6) or (28, 5) => true,
+                    _ => false,
+                };
+                Assert.Equal(expected, IsLit(frame, x, y));
+            }
+    }
+
+    [Fact]
     public void DrawBanner_EmptyText_DoesNothing()
     {
         var frame = WhiteFrame();
