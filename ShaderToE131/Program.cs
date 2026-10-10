@@ -898,8 +898,7 @@ void main()
     /// </summary>
     private void ApplyPendingNotification()
     {
-        if (_webServer?.PendingNotification is not { } note) return;
-        _webServer.PendingNotification = null;
+        if (_webServer?.ConsumePendingNotification() is not { } note) return;
 
         if (note.Text.Length == 0)
         {

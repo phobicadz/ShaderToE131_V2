@@ -106,4 +106,22 @@ public class NotificationApiTests
         Assert.Null(req);
         Assert.NotNull(error);
     }
+
+    [Fact]
+    public void ConsumePendingNotification_ReturnsPendingOnce_ThenNull()
+    {
+        using var ws = new WebServer(0, Directory.GetCurrentDirectory(), "localhost");
+
+        // Nothing pending yet.
+        Assert.Null(ws.ConsumePendingNotification());
+
+        // Simulate the /api/notify handler posting a request.
+        var req = WebServer.ParseNotifyRequest("""{"text":"Hello"}""", out _);
+        Assert.NotNull(req);
+        ws.SetPendingNotificationForTest(req);
+
+        // First consume returns it; the slot is cleared atomically.
+        Assert.Same(req, ws.ConsumePendingNotification());
+        Assert.Null(ws.ConsumePendingNotification());
+    }
 }

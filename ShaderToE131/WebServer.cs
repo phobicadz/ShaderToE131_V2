@@ -49,7 +49,16 @@ public sealed class WebServer : IDisposable
     public record NotificationRequest(string Text, int DurationSec);
 
     private volatile NotificationRequest? _pendingNotification;
-    public NotificationRequest? PendingNotification { get => _pendingNotification; set => _pendingNotification = value; }
+
+    /// <summary>
+    /// Atomically take the pending notification and clear the slot in one step,
+    /// so a notification posted concurrently cannot be dropped by a read-then-clear race.
+    /// Returns null when nothing is pending.
+    /// </summary>
+    public NotificationRequest? ConsumePendingNotification() => Interlocked.Exchange(ref _pendingNotification, null);
+
+    // Test hook: post a notification as the /api/notify handler would.
+    internal void SetPendingNotificationForTest(NotificationRequest request) => _pendingNotification = request;
     public Func<LiveStringState>? GetLiveStringState { get; set; }  // current string config + live stats
 
     // Shader list is rebuilt into a NEW array and published with a single
@@ -1202,7 +1211,7 @@ setInterval(refreshStatus, 2000);
             return;
         }
 
-        PendingNotification = request;
+        _pendingNotification = request;
         if (request.Text.Length == 0)
             SendJson(clientSocket, new { ok = true, cleared = true });
         else
