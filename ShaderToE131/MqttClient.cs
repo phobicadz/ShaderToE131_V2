@@ -46,6 +46,7 @@ public sealed class MqttClient : IDisposable
     private readonly string _uniqueId;
 
     private System.Threading.Timer? _heartbeat;
+    private readonly CancellationTokenSource _pendingStatePublish = new();
     private volatile string _lastEffect = "";
     private volatile bool _disposed;
 
@@ -166,7 +167,7 @@ public sealed class MqttClient : IDisposable
             ["schema"] = "json",
             ["command_topic"] = SetTopic,
             ["state_topic"] = StateTopic,
-            ["attribute_topic"] = AttributesTopic,
+            ["json_attributes_topic"] = AttributesTopic,
             ["availability_topic"] = AvailabilityTopic,
             ["payload_available"] = "online",
             ["payload_not_available"] = "offline",
@@ -293,15 +294,36 @@ public sealed class MqttClient : IDisposable
                     return;
                 }
 
-                string? target = effect
-                    ?? (state == "OFF" ? "off"
-                        : state == "ON" && _lastEffect.Length > 0 ? _lastEffect
-                        : null);
+                // Resolve the command against what the render loop is actually showing:
+                // an effect name selects it; ON restores the last known shader; OFF captures the
+                // current one so a later ON can restore it; TOGGLE flips between the two.
+                string current = CurrentShaderOption();
+
+                string? target = effect;
+                if (target == null)
+                {
+                    switch (state)
+                    {
+                        case "OFF":
+                            target = "off";
+                            break;
+                        case "ON":
+                            target = current != "off" ? current
+                                : _lastEffect.Length > 0 ? _lastEffect
+                                : "built-in default";
+                            break;
+                        case "TOGGLE":
+                            target = current != "off" ? "off"
+                                : _lastEffect.Length > 0 ? _lastEffect
+                                : "built-in default";
+                            break;
+                    }
+                }
 
                 if (target == null)
                 {
-                    // "ON" with no effect and nothing previously selected: the render loop keeps
-                    // whatever is already loaded, so there is nothing to change.
+                    // A JSON payload with neither state nor effect never reaches here
+                    // (TryParseLightCommand rejects it); kept as a safety net.
                     Console.WriteLine($"[Mqtt] '{state}' with no effect ignored — send an effect name to pick a shader.");
                 }
                 else
@@ -312,15 +334,14 @@ public sealed class MqttClient : IDisposable
                         Console.WriteLine($"[Mqtt] {selectError}");
                         return;
                     }
+                    // Remember every lit selection (HTTP or MQTT) so OFF/TOGGLE can restore it.
                     if (target != "off") _lastEffect = target;
                     Console.WriteLine($"[Mqtt] light command → {selected}");
                 }
 
-                // Let the render loop pick the change up (it applies pending shaders on the next
-                // frame and refreshes the status snapshot in the same frame), then publish the
-                // authoritative state instead of an optimistic guess.
-                await Task.Delay(1500);
-                await PublishStateAsync();
+                // Publish the authoritative state once the render loop has had a frame to apply
+                // the change — scheduled, not awaited, so the MQTT callback returns immediately.
+                ScheduleStatePublish();
             }
             else if (topic == ShaderSelectCommandTopic)
             {
@@ -333,8 +354,7 @@ public sealed class MqttClient : IDisposable
                 }
                 if (name != "off") _lastEffect = name;
                 Console.WriteLine($"[Mqtt] select command → {selected}");
-                await Task.Delay(1500);
-                await PublishStateAsync();
+                ScheduleStatePublish();
             }
             else if (topic == NotifySetTopic)
             {
@@ -348,8 +368,7 @@ public sealed class MqttClient : IDisposable
                 else
                     Console.WriteLine($"[Mqtt] notification queued: {payload}");
 
-                await Task.Delay(1500);
-                await PublishStateAsync();
+                ScheduleStatePublish();
             }
             else if (topic == NotifyDurationSetTopic)
             {
@@ -486,6 +505,35 @@ public sealed class MqttClient : IDisposable
 
     // ─── State ───
 
+    /// <summary>Delay before publishing state after a command: long enough for the render loop
+    /// to apply the change and refresh the status snapshot, short enough that the banner (1 s
+    /// minimum) is still on screen when <c>notify/state</c> is read.</summary>
+    private const int StatePublishDelayMs = 600;
+
+    /// <summary>
+    /// The shader option the matrix is showing right now, read from the render loop's status
+    /// snapshot ("off", "built-in default", or a bare shader name). "off" when no snapshot exists yet.
+    /// </summary>
+    private string CurrentShaderOption()
+    {
+        var snap = _web.StatusSnapshot;
+        return snap == null ? "off" : ShaderOption(snap.SelectedShader);
+    }
+
+    /// <summary>
+    /// Schedule an authoritative state publish shortly after a command. Deliberately not awaited:
+    /// MQTTnet awaits the receive callback before acknowledging the message and dispatching the
+    /// next one, so blocking here would stall later commands. If another command arrives first,
+    /// its scheduled publish replaces this one.
+    /// </summary>
+    private void ScheduleStatePublish()
+    {
+        var token = _pendingStatePublish.Token;
+        _ = Task.Delay(StatePublishDelayMs, token).ContinueWith(
+            async _ => { if (!token.IsCancellationRequested) await PublishStateAsync(); },
+            TaskScheduler.Default);
+    }
+
     /// <summary>Heartbeat entry point. Must never throw: an unhandled exception on a timer
     /// callback would take the whole process down.</summary>
     private void PublishState()
@@ -557,6 +605,7 @@ public sealed class MqttClient : IDisposable
     public void Dispose()
     {
         _disposed = true;
+        _pendingStatePublish.Cancel();   // drop any scheduled post-command state publish
         _heartbeat?.Dispose();
         try
         {

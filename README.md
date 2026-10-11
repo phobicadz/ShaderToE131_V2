@@ -201,7 +201,7 @@ curl http://localhost:8080/api/status
 ## Home Assistant (MQTT)
 
 `--mqtt <broker>` adds an MQTT front-end (`MqttClient`, [MQTTnet](https://github.com/mqttnet/MQTTnet)).
-It publishes Home Assistant **discovery**, so HA gets two entities under one device
+It publishes Home Assistant **discovery**, so HA gets four entities under one device
 (`ShaderToE131`):
 
 | HA entity | Purpose |
@@ -249,7 +249,7 @@ Text banners — the `text` entity is the dashboard way to do it (note the field
 
 ```yaml
 - action: text.set_value
-  target: { entity_id: text.mancave_shadertoe131_matrix_message }
+  target: { entity_id: text.shadertoe131_matrix_message }
   data: { value: "Tea is ready" }
 ```
 

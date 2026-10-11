@@ -80,6 +80,35 @@ public class WebServerControlSurfaceTests
     }
 
     [Fact]
+    public void ConsumePendingShader_TakesSourceAndFileNameAtomically()
+    {
+        using var web = NewServer();
+        web.SelectShaderByName("built-in default", out _);
+
+        // One call sees the complete command and clears the slot — the render loop can never
+        // read a source while the matching file name is still being written.
+        var pending = web.ConsumePendingShader();
+        Assert.NotNull(pending);
+        Assert.Equal(WebServer.BuiltInShaderToken, pending!.Source);
+        Assert.Equal("built-in default", pending.FileName);
+        Assert.Null(web.ConsumePendingShader());
+        Assert.Null(web.PendingShaderSource);
+        Assert.Null(web.PendingShaderFileName);
+    }
+
+    [Fact]
+    public void ConsumePendingShader_OffCarriesNullSourceWithOffName()
+    {
+        using var web = NewServer();
+        web.SelectShaderByName("off", out _);
+
+        var pending = web.ConsumePendingShader();
+        Assert.NotNull(pending);
+        Assert.Null(pending!.Source);      // null source is the render loop's "off" signal
+        Assert.Equal("Off", pending.FileName);
+    }
+
+    [Fact]
     public void TryPostNotification_AcceptsValidJsonAndQueuesIt()
     {
         using var web = NewServer();

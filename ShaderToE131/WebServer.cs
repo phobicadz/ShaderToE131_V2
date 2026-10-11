@@ -19,17 +19,31 @@ public sealed class WebServer : IDisposable
     private volatile bool _running = false;
 
     // Shared state — set by Program after construction.
-    // Render loop polls these each frame (volatile for thread safety).
-    private volatile string? _pendingShaderSource;
-    private volatile string? _pendingShaderFileName;
+    // Render loop polls this each frame. Source and file name live in ONE record so a
+    // queue/consume can never observe a half-written command (see ConsumePendingShader).
+    public record PendingShader(string? Source, string FileName);
 
-    public string? PendingShaderSource { get => _pendingShaderSource; set => _pendingShaderSource = value; }
+    private volatile PendingShader? _pendingShader;
+
+    /// <summary>Read-only views of the queued command (used by tests and status reporting).</summary>
+    public string? PendingShaderSource => _pendingShader?.Source;
     /// <summary>
     /// Sentinel queued by <see cref="SelectShaderByName"/> for the pseudo-shader
     /// "built-in default"; Program.BuildFragmentShader expands it to the built-in source.
     /// </summary>
     public const string BuiltInShaderToken = "<<built-in-default>>";
-    public string? PendingShaderFileName { get => _pendingShaderFileName; set => _pendingShaderFileName = value; }
+    public string? PendingShaderFileName => _pendingShader?.FileName;
+
+    /// <summary>
+    /// Atomically take the pending shader command and clear the slot in one step, so a command
+    /// queued concurrently cannot be dropped (or half-consumed) by a read-then-clear race.
+    /// A null Source is the render loop's "off" signal.
+    /// </summary>
+    public PendingShader? ConsumePendingShader() => Interlocked.Exchange(ref _pendingShader, null);
+
+    /// <summary>Queue a shader command atomically (source + display name travel together).
+    /// A null <paramref name="source"/> is the "off" signal for the render loop.</summary>
+    private void QueuePendingShader(string? source, string fileName) => _pendingShader = new PendingShader(source, fileName);
     public Func<bool>? GetAudioEnabled { get; set; }              // current audio state
     public Action<bool>? SetAudioEnabled { get; set; }              // toggle audio on/off
     public Action<string>? SetAudioSource { get; set; }            // change audio source (microphone/loopback/off)
@@ -1025,8 +1039,7 @@ setInterval(refreshStatus, 2000);
         // source (Program owns it), so it queues a token that BuildFragmentShader expands.
         if (lowerName == "built-in default" || lowerName == "built-in")
         {
-            PendingShaderSource = BuiltInShaderToken;
-            PendingShaderFileName = "built-in default";
+            QueuePendingShader(BuiltInShaderToken, "built-in default");
             Console.WriteLine("[WebServer] Shader set to the built-in default.");
             return "built-in default";
         }
@@ -1034,8 +1047,7 @@ setInterval(refreshStatus, 2000);
         // Special: "off" renders a blank/black screen
         if (lowerName == "off")
         {
-            PendingShaderSource = null;  // signals render loop to skip shader rendering
-            PendingShaderFileName = "Off";
+            QueuePendingShader(null, "Off");  // null source signals render loop to skip shader rendering
             Console.WriteLine("[WebServer] Shader set to Off — blank screen.");
             return "Off (blank)";
         }
@@ -1091,8 +1103,7 @@ setInterval(refreshStatus, 2000);
 
         string source = File.ReadAllText(fullPath);
         string fileName = Path.GetFileNameWithoutExtension(fullPath);
-        PendingShaderSource = source;
-        PendingShaderFileName = fileName;
+        QueuePendingShader(source, fileName);
         Console.WriteLine($"[WebServer] Shader changed via web: {fileName}");
         return Path.GetFileName(fullPath);
     }

@@ -583,7 +583,7 @@ void main()
             _webServer.RefreshShaderList();   // populate the effect list before publishing discovery
             _mqttClient = new MqttClient(_mqttBrokerHost, _mqttPort, _mqttTopicPrefix, _webServer);
             _mqttClient.Start();
-            Console.WriteLine($"MQTT bridge active: broker={_mqttBrokerHost}:{_mqttPort}, topics={_mqttTopicPrefix}/#, Home Assistant discovery on homeassistant/light/{_mqttTopicPrefix}_matrix/state");
+            Console.WriteLine($"MQTT bridge active: broker={_mqttBrokerHost}:{_mqttPort}, topics={_mqttTopicPrefix}/#, Home Assistant discovery on homeassistant/light/{_mqttTopicPrefix}_matrix/config");
         }
 
         // Record web server start time for uptime tracking
@@ -994,18 +994,17 @@ void main()
         // Consume any pending text notification from the web UI/API.
         ApplyPendingNotification();
 
-        // Check for pending shader change BEFORE null guard — when coming from "Off",
+        // Consume any pending shader change BEFORE null guard — when coming from "Off",
         // _shaderProgram is null and we need to reload it before the guard would bail out.
-        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
+        // Taken atomically so a concurrently queued command is never half-read.
+        var pendingShader = _webServer?.ConsumePendingShader();
+        if (pendingShader != null && !string.IsNullOrEmpty(pendingShader.Source))
         {
-            string newSource = _webServer.PendingShaderSource!;
-            string? newName = _webServer.PendingShaderFileName;
-            _webServer.PendingShaderSource = null;
-            _webServer.PendingShaderFileName = null;
+            string newSource = pendingShader.Source!;
+            string newName = pendingShader.FileName;
 
             _shaderSource = newSource;
-            if (!string.IsNullOrEmpty(newName))
-                _currentShaderFileName = newName;
+            _currentShaderFileName = newName;
 
             string fragShader = BuildFragmentShader(_shaderSource!);
             _shaderProgram?.Dispose();
@@ -1048,7 +1047,7 @@ void main()
         // No program means the output is blank — keep sending black frames. Returning
         // early here would stop sending entirely and the controller holds its last lit frame.
         bool _isOff = _shaderProgram == null;
-        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderFileName) && _webServer.PendingShaderFileName == "Off")
+        if (pendingShader != null && pendingShader.FileName == "Off")
         {
             // "Off" — blank screen, dispose shader to stop GPU rendering
             Console.WriteLine("[Web] Shader stopped — Off (blank).");
@@ -1056,8 +1055,6 @@ void main()
             _shaderProgram = null;
             _shaderSource = null;
             _currentShaderFileName = "Off";
-            _webServer.PendingShaderSource = null;  // consume
-            _webServer.PendingShaderFileName = null;
             _isOff = true;
             _offFramesRemaining = OffClearFrames;
         }
@@ -1215,18 +1212,17 @@ void main()
         // Consume any pending text notification from the web UI/API.
         ApplyPendingNotification();
 
-        // Check for pending shader change BEFORE null guard — when coming from "Off",
+        // Consume any pending shader change BEFORE null guard — when coming from "Off",
         // _shaderProgram is null and we need to reload it before the guard would bail out.
-        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderSource))
+        // Taken atomically so a concurrently queued command is never half-read.
+        var pendingShader = _webServer?.ConsumePendingShader();
+        if (pendingShader != null && !string.IsNullOrEmpty(pendingShader.Source))
         {
-            string newSource = _webServer.PendingShaderSource!;
-            string? newName = _webServer.PendingShaderFileName;
-            _webServer.PendingShaderSource = null;
-            _webServer.PendingShaderFileName = null;
+            string newSource = pendingShader.Source!;
+            string newName = pendingShader.FileName;
 
             _shaderSource = newSource;
-            if (!string.IsNullOrEmpty(newName))
-                _currentShaderFileName = newName;
+            _currentShaderFileName = newName;
 
             string fragShader = BuildFragmentShader(_shaderSource!);
             _shaderProgram?.Dispose();
@@ -1240,7 +1236,7 @@ void main()
         // No program means the output is blank — keep sending black frames. Returning
         // early here would stop sending entirely and the controller holds its last lit frame.
         bool _isOff = _shaderProgram == null;
-        if (_webServer != null && !string.IsNullOrEmpty(_webServer.PendingShaderFileName) && _webServer.PendingShaderFileName == "Off")
+        if (pendingShader != null && pendingShader.FileName == "Off")
         {
             // "Off" — blank screen, dispose shader to stop GPU rendering
             Console.WriteLine("[Web] Shader stopped — Off (blank).");
@@ -1248,8 +1244,6 @@ void main()
             _shaderProgram = null;
             _shaderSource = null;
             _currentShaderFileName = "Off";
-            _webServer.PendingShaderSource = null;  // consume
-            _webServer.PendingShaderFileName = null;
             _isOff = true;
             _offFramesRemaining = OffClearFrames;
         }
