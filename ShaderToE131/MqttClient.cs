@@ -121,7 +121,7 @@ public sealed class MqttClient : IDisposable
                     Console.WriteLine($"[Mqtt] connected to {_host}:{_port} (client id {_prefix}).");
 
                     await SubscribeAsync();
-                    await PublishAsync(AvailabilityTopic, "online", retain: true);
+                    await PublishAsync(AvailabilityTopic, "online", retain: true, MqttQualityOfServiceLevel.AtLeastOnce);
                     await PublishDiscoveryAsync();
                     await PublishShaderSelectDiscoveryAsync();
                     await PublishBannerEntitiesDiscoveryAsync();
@@ -185,7 +185,7 @@ public sealed class MqttClient : IDisposable
         };
 
         Console.WriteLine($"[Mqtt] publishing Home Assistant discovery for light '{_uniqueId}' ({effects.Length} effects).");
-        return PublishAsync(DiscoveryTopic, JsonSerializer.Serialize(discovery), retain: true);
+        return PublishAsync(DiscoveryTopic, JsonSerializer.Serialize(discovery), retain: true, MqttQualityOfServiceLevel.AtLeastOnce);
     }
 
     /// <summary>
@@ -219,7 +219,7 @@ public sealed class MqttClient : IDisposable
         };
 
         Console.WriteLine($"[Mqtt] publishing Home Assistant discovery for select '{_prefix}_shader' ({options.Count} options).");
-        return PublishAsync(ShaderSelectDiscoveryTopic, JsonSerializer.Serialize(discovery), retain: true);
+        return PublishAsync(ShaderSelectDiscoveryTopic, JsonSerializer.Serialize(discovery), retain: true, MqttQualityOfServiceLevel.AtLeastOnce);
     }
 
     private Dictionary<string, object> DeviceBlock() => new()
@@ -252,7 +252,7 @@ public sealed class MqttClient : IDisposable
             ["qos"] = 1,
             ["device"] = DeviceBlock(),
         };
-        await PublishAsync(NotifyDiscoveryTopic, JsonSerializer.Serialize(message), retain: true);
+        await PublishAsync(NotifyDiscoveryTopic, JsonSerializer.Serialize(message), retain: true, MqttQualityOfServiceLevel.AtLeastOnce);
         Console.WriteLine($"[Mqtt] publishing Home Assistant discovery for text '{_prefix}_message'.");
 
         var duration = new Dictionary<string, object>
@@ -273,7 +273,7 @@ public sealed class MqttClient : IDisposable
             ["qos"] = 1,
             ["device"] = DeviceBlock(),
         };
-        await PublishAsync(NotifyDurationDiscoveryTopic, JsonSerializer.Serialize(duration), retain: true);
+        await PublishAsync(NotifyDurationDiscoveryTopic, JsonSerializer.Serialize(duration), retain: true, MqttQualityOfServiceLevel.AtLeastOnce);
         Console.WriteLine($"[Mqtt] publishing Home Assistant discovery for number '{_prefix}_banner_seconds'.");
     }
 
@@ -510,6 +510,10 @@ public sealed class MqttClient : IDisposable
     /// minimum) is still on screen when <c>notify/state</c> is read.</summary>
     private const int StatePublishDelayMs = 600;
 
+    /// <summary>Minimum gap between two state refreshes, however many commands arrive in between.</summary>
+    private const int StatePublishMinIntervalMs = 2_000;
+    private long _lastStatePublishMs;
+
     /// <summary>
     /// The shader option the matrix is showing right now, read from the render loop's status
     /// snapshot ("off", "built-in default", or a bare shader name). "off" when no snapshot exists yet.
@@ -528,6 +532,11 @@ public sealed class MqttClient : IDisposable
     /// </summary>
     private void ScheduleStatePublish()
     {
+        // Coalesce: a 1 Hz source (the clock automation) would otherwise queue a full
+        // state + attributes refresh every second, which is what put the app behind the broker.
+        // Anything that is genuinely missed is covered by the 30 s heartbeat.
+        if (Environment.TickCount64 - _lastStatePublishMs < StatePublishMinIntervalMs) return;
+
         var token = _pendingStatePublish.Token;
         _ = Task.Delay(StatePublishDelayMs, token).ContinueWith(
             async _ => { if (!token.IsCancellationRequested) await PublishStateAsync(); },
@@ -554,6 +563,7 @@ public sealed class MqttClient : IDisposable
     private async Task PublishStateAsync()
     {
         if (!_client.IsConnected) return;
+        _lastStatePublishMs = Environment.TickCount64;
 
         var snap = _web.StatusSnapshot;
         string? selected = snap?.SelectedShader;
@@ -585,15 +595,20 @@ public sealed class MqttClient : IDisposable
         }), retain: true);
     }
 
-    private async Task PublishAsync(string topic, string payload, bool retain)
+    private async Task PublishAsync(string topic, string payload, bool retain,
+        MqttQualityOfServiceLevel qos = MqttQualityOfServiceLevel.AtMostOnce)
     {
+        // State and attribute topics default to QoS 0: every one of them is superseded by the next
+        // publish, and awaiting a PUBACK for each of five messages per refresh is what saturates the
+        // connection when something publishes once a second (a clock automation). Availability and
+        // discovery are explicitly asked for at QoS 1 by their callers — losing those actually matters.
         try
         {
             await _client.PublishAsync(new MqttApplicationMessageBuilder()
                 .WithTopic(topic)
                 .WithPayload(payload)
                 .WithRetainFlag(retain)
-                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
+                .WithQualityOfServiceLevel(qos)
                 .Build());
         }
         catch (Exception ex)
@@ -613,7 +628,7 @@ public sealed class MqttClient : IDisposable
             {
                 // Publish offline explicitly so the entity goes unavailable immediately instead of
                 // waiting for the broker to notice the dropped connection.
-                PublishAsync(AvailabilityTopic, "offline", retain: true).GetAwaiter().GetResult();
+                PublishAsync(AvailabilityTopic, "offline", retain: true, MqttQualityOfServiceLevel.AtLeastOnce).GetAwaiter().GetResult();
                 _client.DisconnectAsync().GetAwaiter().GetResult();
             }
         }
