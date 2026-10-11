@@ -19,12 +19,31 @@ public sealed class WebServer : IDisposable
     private volatile bool _running = false;
 
     // Shared state — set by Program after construction.
-    // Render loop polls these each frame (volatile for thread safety).
-    private volatile string? _pendingShaderSource;
-    private volatile string? _pendingShaderFileName;
+    // Render loop polls this each frame. Source and file name live in ONE record so a
+    // queue/consume can never observe a half-written command (see ConsumePendingShader).
+    public record PendingShader(string? Source, string FileName);
 
-    public string? PendingShaderSource { get => _pendingShaderSource; set => _pendingShaderSource = value; }
-    public string? PendingShaderFileName { get => _pendingShaderFileName; set => _pendingShaderFileName = value; }
+    private volatile PendingShader? _pendingShader;
+
+    /// <summary>Read-only views of the queued command (used by tests and status reporting).</summary>
+    public string? PendingShaderSource => _pendingShader?.Source;
+    /// <summary>
+    /// Sentinel queued by <see cref="SelectShaderByName"/> for the pseudo-shader
+    /// "built-in default"; Program.BuildFragmentShader expands it to the built-in source.
+    /// </summary>
+    public const string BuiltInShaderToken = "<<built-in-default>>";
+    public string? PendingShaderFileName => _pendingShader?.FileName;
+
+    /// <summary>
+    /// Atomically take the pending shader command and clear the slot in one step, so a command
+    /// queued concurrently cannot be dropped (or half-consumed) by a read-then-clear race.
+    /// A null Source is the render loop's "off" signal.
+    /// </summary>
+    public PendingShader? ConsumePendingShader() => Interlocked.Exchange(ref _pendingShader, null);
+
+    /// <summary>Queue a shader command atomically (source + display name travel together).
+    /// A null <paramref name="source"/> is the "off" signal for the render loop.</summary>
+    private void QueuePendingShader(string? source, string fileName) => _pendingShader = new PendingShader(source, fileName);
     public Func<bool>? GetAudioEnabled { get; set; }              // current audio state
     public Action<bool>? SetAudioEnabled { get; set; }              // toggle audio on/off
     public Action<string>? SetAudioSource { get; set; }            // change audio source (microphone/loopback/off)
@@ -991,15 +1010,46 @@ setInterval(refreshStatus, 2000);
             return;
         }
 
-        // Special: "off" renders a blank/black screen
+        string? selected = SelectShaderByName(name, out string? error);
+        if (selected == null)
+            SendJson(clientSocket, new { ok = false, error });
+        else
+            SendJson(clientSocket, new { ok = true, shader = selected });
+    }
+
+    /// <summary>
+    /// Resolve a shader by display name (or file name) and queue it for the render loop.
+    /// <paramref name="name"/> = "off" blanks the screen. Shared by the HTTP API
+    /// (<c>POST /api/select-shader</c>) and the MQTT front-end, so both validate identically.
+    /// </summary>
+    /// <returns>The selected shader's file name, or "Off" when the output was turned off;
+    /// null on failure, with <paramref name="error"/> describing why.</returns>
+    public string? SelectShaderByName(string name, out string? error)
+    {
+        error = null;
+        if (string.IsNullOrEmpty(name))
+        {
+            error = "Missing shader name.";
+            return null;
+        }
+
         string lowerName = name.ToLowerInvariant();
+
+        // Special: "built-in default" re-selects the app's own shader. WebServer cannot see the
+        // source (Program owns it), so it queues a token that BuildFragmentShader expands.
+        if (lowerName == "built-in default" || lowerName == "built-in")
+        {
+            QueuePendingShader(BuiltInShaderToken, "built-in default");
+            Console.WriteLine("[WebServer] Shader set to the built-in default.");
+            return "built-in default";
+        }
+
+        // Special: "off" renders a blank/black screen
         if (lowerName == "off")
         {
-            PendingShaderSource = null;  // signals render loop to skip shader rendering
-            PendingShaderFileName = "Off";
+            QueuePendingShader(null, "Off");  // null source signals render loop to skip shader rendering
             Console.WriteLine("[WebServer] Shader set to Off — blank screen.");
-            SendJson(clientSocket, new { ok = true, shader = "Off (blank)" });
-            return;
+            return "Off (blank)";
         }
 
         // Search for the shader file by name. Match exactly on the display name
@@ -1047,16 +1097,15 @@ setInterval(refreshStatus, 2000);
 
         if (fullPath == null || !File.Exists(fullPath))
         {
-            SendJson(clientSocket, new { ok = false, error = $"Shader '{name}' not found." });
-            return;
+            error = $"Shader '{name}' not found.";
+            return null;
         }
 
         string source = File.ReadAllText(fullPath);
         string fileName = Path.GetFileNameWithoutExtension(fullPath);
-        PendingShaderSource = source;
-        PendingShaderFileName = fileName;
+        QueuePendingShader(source, fileName);
         Console.WriteLine($"[WebServer] Shader changed via web: {fileName}");
-        SendJson(clientSocket, new { ok = true, shader = Path.GetFileName(fullPath) });
+        return Path.GetFileName(fullPath);
     }
 
     private void ServeSetAudio(Socket clientSocket, string body)
@@ -1204,18 +1253,29 @@ setInterval(refreshStatus, 2000);
 
     private void ServeNotify(Socket clientSocket, string body)
     {
-        var request = ParseNotifyRequest(body, out string? error);
-        if (request == null)
+        if (!TryPostNotification(body, out string? error))
         {
             SendJson(clientSocket, new { ok = false, error });
             return;
         }
 
-        _pendingNotification = request;
+        var request = ParseNotifyRequest(body, out _)!;
         if (request.Text.Length == 0)
             SendJson(clientSocket, new { ok = true, cleared = true });
         else
             SendJson(clientSocket, new { ok = true, text = request.Text, duration = request.DurationSec });
+    }
+
+    /// <summary>
+    /// Queue a banner notification from a non-HTTP front-end (the MQTT bridge).
+    /// Reuses the exact <c>POST /api/notify</c> validation, so both paths behave identically.
+    /// </summary>
+    public bool TryPostNotification(string jsonBody, out string? error)
+    {
+        var request = ParseNotifyRequest(jsonBody, out error);
+        if (request == null) return false;
+        _pendingNotification = request;
+        return true;
     }
 
     private void ServeSetString(Socket clientSocket, string body)
