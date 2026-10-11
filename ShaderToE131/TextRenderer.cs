@@ -130,7 +130,9 @@ public static class TextRenderer
     /// static; longer text scrolls right-to-left as a marquee. Rows outside the band
     /// keep the underlying frame, so the banner overlays the shader output.
     /// </summary>
-    /// <param name="frame">Width×Height RGBA framebuffer (straight raster order).</param>
+    /// <param name="frame">Width×Height RGBA framebuffer in the same bottom-up order the rest of
+    /// the pipeline uses: row 0 is the BOTTOM row of the panel (see Program.Render, which copies
+    /// ReadPixels output without flipping so the panel, the preview and the shader all agree).</param>
     /// <param name="elapsedMs">Time since the notification started, used for marquee position.</param>
     public static void DrawBanner(Span<byte> frame, int width, int height, string text, long elapsedMs)
     {
@@ -143,7 +145,10 @@ public static class TextRenderer
         // Band: glyph height plus 1px padding above and below. Rows outside it are untouched.
         int bandTop = Math.Max(0, (height - GlyphHeight) / 2 - 1);
         int bandBottom = Math.Min(height, bandTop + GlyphHeight + 2);
-        int textTop = Math.Min(height - 1, bandTop + 1);
+        // Glyph rows occupy band indices [bandTop + 1, bandTop + GlyphHeight]. Index order is
+        // bottom-up, so the glyph's OWN top row (font bit 0) must map to the HIGHEST index in
+        // that range; drawing it at the lowest index renders the text upside down.
+        int glyphTopIndex = Math.Min(height - 1, bandTop + GlyphHeight);
 
         for (int y = bandTop; y < bandBottom; y++)
             frame.Slice(y * width * 4, width * 4).Clear();
@@ -180,7 +185,7 @@ public static class TextRenderer
                 for (int row = 0; row < GlyphHeight; row++)
                 {
                     if ((bits & (1 << row)) == 0) continue;
-                    int py = textTop + row;
+                    int py = glyphTopIndex - row;
                     if (py >= height) continue;
 
                     int idx = (py * width + px) * 4;

@@ -138,6 +138,62 @@ dotnet run --help
 | `--list-devices` | List available audio input devices and exit |
 | `--help, -h` | Show usage help |
 
+## Recommended Startup Parameters
+
+These are the parameters this instance runs with as a Windows service (Servy service
+`ShaderToE131`, started automatically at boot):
+
+```bash
+--no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30
+```
+
+| Flag | Why |
+|------|-----|
+| `--no-preview` | Headless: no OpenGL window in a service session. The render loop is self-paced and the matrix output is unaffected |
+| *(no `--demo`)* | Runs one shader instead of cycling all 50. Switch shaders at runtime with `POST /api/select-shader` or the web UI |
+| `--string` | Streams the 50-LED string in parallel with the matrix |
+| `--string-ip ledstring.local` | String controller host (resolves to `192.168.3.18`) |
+| `--string-universe 1` | Universe for the string. Same number as the matrix is safe — the two targets are different hosts, so neither sees the other's packets |
+| `--audio --loopback 0` | Capture system playback (the default render endpoint) instead of a microphone. Works under the LocalSystem service account; the active device is reported as `loopbackDeviceName` in `/api/status` |
+| `--fps 30` | Caps matrix + string output to 30 fps, which matches the controllers' refresh rate and keeps headless CPU use low |
+
+Defaults left alone: `--web-port 8080` (control panel on `0.0.0.0`), `--string-size 50`,
+`--string-row` = center row.
+
+> Note: the built-in default shader does not reference the audio uniforms, so the log shows
+> `[Audio] WARNING: Some audio uniforms not found in shader program` and the band values stay at
+> `0.000`. That is cosmetic — capture is still running. Pick one of the 13 audio-reactive shaders
+> (see `/api/status` → `audioReactiveNames`) for the bands to have any visual effect.
+
+### Installing as a Windows service (Servy)
+
+```powershell
+Install-ServyService -Name ShaderToE131 -DisplayName 'ShaderToE131 E1.31 Server' -Quiet `
+    -Path 'C:\Users\Chamb\source\repos\ShaderToE131_V2\publish\ShaderToE131.exe' `
+    -StartupDir 'C:\Users\Chamb\source\repos\ShaderToE131_V2\publish' `
+    -Params '--no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30' `
+    -StartupType Automatic `
+    -Stdout 'C:\ProgramData\Servy\logs\ShaderToE131-stdout.log' `
+    -Stderr 'C:\ProgramData\Servy\logs\ShaderToE131-stderr.log'
+```
+
+`-StartupDir` must point at the published folder so the app finds `shaders/` and `glfw3.dll`.
+Re-running `Install-ServyService` with the same `-Name` updates the arguments in place. After a
+`git pull`, publish first (the running service locks `ShaderToE131.dll`, so stop it first), then restart:
+
+```powershell
+Stop-ServyService ShaderToE131 -Quiet
+dotnet publish -c Release -o ..\publish      # from the ShaderToE131 project directory
+Start-ServyService ShaderToE131 -Quiet
+```
+
+Verify without elevation:
+
+```bash
+sc query ShaderToE131
+curl http://localhost:8080/api/status
+```
+
 ## Web Control Panel
 
 When started with `--web-port <port>` (or default 8080), a web UI is available at:
