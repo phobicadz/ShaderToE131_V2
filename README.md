@@ -135,6 +135,9 @@ dotnet run --help
 | `--string-ip <ip\|host>` | Target IP or hostname (e.g. `ledstring.local`) for the string (default: same as matrix) |
 | `--string-universe <n>` | Universe for the string (default: first after the matrix's universes) |
 | `--fps <n>` | Cap the output rate for matrix + string (default: uncapped). Use `30`–`60` for typical pixel controllers — sending 4 universes per frame at thousands of fps overruns their refresh rate and drops frames. In headless mode the whole render loop is paced to this rate, so it also caps CPU use |
+| `--mqtt <host>` | Connect to an MQTT broker and publish Home Assistant discovery (a `light` plus a `select` of shaders). Requires the control API, i.e. not `--web-port 0` |
+| `--mqtt-port <port>` | MQTT broker port (default: 1883) |
+| `--mqtt-topic <prefix>` | MQTT topic prefix for all entities and topics (default: `shadertoe131`) |
 | `--list-devices` | List available audio input devices and exit |
 | `--help, -h` | Show usage help |
 
@@ -144,7 +147,7 @@ These are the parameters this instance runs with as a Windows service (Servy ser
 `ShaderToE131`, started automatically at boot):
 
 ```bash
---no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30
+--no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30 --mqtt 192.168.2.11
 ```
 
 | Flag | Why |
@@ -156,6 +159,7 @@ These are the parameters this instance runs with as a Windows service (Servy ser
 | `--string-universe 1` | Universe for the string. Same number as the matrix is safe — the two targets are different hosts, so neither sees the other's packets |
 | `--audio --loopback 0` | Capture system playback (the default render endpoint) instead of a microphone. Works under the LocalSystem service account; the active device is reported as `loopbackDeviceName` in `/api/status` |
 | `--fps 30` | Caps matrix + string output to 30 fps, which matches the controllers' refresh rate and keeps headless CPU use low |
+| `--mqtt 192.168.2.11` | Mosquitto on `pi5.mancave` (`~/docker/pi5/mosquitto`). Publishes Home Assistant discovery so the matrix is a `light` plus a `select` of shaders |
 
 Defaults left alone: `--web-port 8080` (control panel on `0.0.0.0`), `--string-size 50`,
 `--string-row` = center row.
@@ -171,7 +175,7 @@ Defaults left alone: `--web-port 8080` (control panel on `0.0.0.0`), `--string-s
 Install-ServyService -Name ShaderToE131 -DisplayName 'ShaderToE131 E1.31 Server' -Quiet `
     -Path 'C:\Users\Chamb\source\repos\ShaderToE131_V2\publish\ShaderToE131.exe' `
     -StartupDir 'C:\Users\Chamb\source\repos\ShaderToE131_V2\publish' `
-    -Params '--no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30' `
+    -Params '--no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30 --mqtt 192.168.2.11' `
     -StartupType Automatic `
     -Stdout 'C:\ProgramData\Servy\logs\ShaderToE131-stdout.log' `
     -Stderr 'C:\ProgramData\Servy\logs\ShaderToE131-stderr.log'
@@ -193,6 +197,88 @@ Verify without elevation:
 sc query ShaderToE131
 curl http://localhost:8080/api/status
 ```
+
+## Home Assistant (MQTT)
+
+`--mqtt <broker>` adds an MQTT front-end (`MqttClient`, [MQTTnet](https://github.com/mqttnet/MQTTnet)).
+It publishes Home Assistant **discovery**, so HA gets two entities under one device
+(`ShaderToE131`):
+
+| HA entity | Purpose |
+|-----------|---------|
+| `light.shadertoe131_led_matrix` | On/off for the matrix (`off` blanks the panel and keeps sending black frames) |
+| `select.shadertoe131_shader` | One option per shader, plus `off` and `built-in default` — this is how shaders are picked |
+| `text.shadertoe131_matrix_message` | Type text and it appears on the matrix; its state mirrors the banner currently on screen |
+| `number.shadertoe131_banner_seconds` | How long a plain-text banner stays lit (1–300 s, default 10) |
+
+Topics (prefix `shadertoe131`):
+
+| Topic | Direction | Contents |
+|-------|-----------|----------|
+| `homeassistant/light/shadertoe131_matrix/config` | out (retained) | light discovery |
+| `homeassistant/select/shadertoe131_shader/config` | out (retained) | select discovery |
+| `homeassistant/text/shadertoe131_message/config` | out (retained) | text-entity discovery |
+| `homeassistant/number/shadertoe131_banner_seconds/config` | out (retained) | number-entity discovery |
+| `shadertoe131/matrix/set` | in | `{"state":"ON\|OFF"}`, `{"effect":"<shader>"}` or bare `ON`/`OFF` |
+| `shadertoe131/shader/set` | in | a shader name, `off`, or `built-in default` |
+| `shadertoe131/matrix/state` | out (retained) | `{"state":"ON","effect":"<shader>"}` |
+| `shadertoe131/shader/state` | out (retained) | current shader option |
+| `shadertoe131/matrix/attributes` | out (retained) | frames sent, send errors, audio state, string config, uptime |
+| `shadertoe131/matrix/availability` | out (retained) | `online` / `offline` (also the client's last-will) |
+| `shadertoe131/notify/set` | in | banner text, plain text or `{"text":"…","duration":10}` |
+| `shadertoe131/notify/state` | out (retained) | the banner currently on screen (empty when there is none) |
+| `shadertoe131/notify/duration/set` | in | banner lifetime in seconds, used for plain-text banners |
+| `shadertoe131/notify/duration/state` | out (retained) | current banner lifetime |
+
+State is pushed after every command and on a 30 s heartbeat; commands go through the same
+`WebServer.SelectShaderByName` / `TryPostNotification` validation as the HTTP API, and are applied
+by the render thread only (never by the MQTT callback).
+
+### Driving it from Home Assistant
+
+Shaders — pick from the dropdown, or from an automation:
+
+```yaml
+- action: select.select_option
+  target: { entity_id: select.shadertoe131_shader }
+  data: { option: audio_spectrum_pro }
+```
+
+Text banners — the `text` entity is the dashboard way to do it (note the field is `value`, not
+`text`; the banner length comes from `number.shadertoe131_banner_seconds`):
+
+```yaml
+- action: text.set_value
+  target: { entity_id: text.mancave_shadertoe131_matrix_message }
+  data: { value: "Tea is ready" }
+```
+
+or publish straight to the topic when you want to choose the duration per message:
+
+```yaml
+- action: mqtt.publish
+  data:
+    topic: shadertoe131/notify/set
+    payload: >-
+      {"text": "Tea is ready", "duration": 15}
+```
+
+Clear a banner early with an empty value. Limits: 200 characters, printable ASCII; anything wider
+than the panel scrolls as a marquee at 12 px/s.
+
+Broker side on this network: Mosquitto in `~/docker/pi5/mosquitto` on `pi5.mancave`
+(`192.168.2.11:1883`, host networking, anonymous on the LAN, retained-message persistence in
+`./data`). Home Assistant is configured with an MQTT config entry pointing at that address — the
+broker is reachable from both the Pi's Docker networks and the LAN.
+
+Notes:
+
+- Discovery must be published to `…/<component>/<unique_id>/config`: Home Assistant subscribes to
+  `homeassistant/<component>/+/config` (and the two-level subentry form), not to `/state`.
+- This Home Assistant build reports `supported_features` for effects on the MQTT light but does not
+  surface its `effect_list`, so shader choice is driven by the `select` entity instead.
+- Set the broker password by switching `allow_anonymous` to `false` in `mosquitto.conf` and adding
+  `password_file`; the client currently connects anonymously.
 
 ## Web Control Panel
 
