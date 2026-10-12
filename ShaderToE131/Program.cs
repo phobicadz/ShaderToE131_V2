@@ -1144,6 +1144,12 @@ void main()
             _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
         }
 
+        // Map the LED string row from the framebuffer BEFORE the banner is drawn: the string mirrors
+        // the shader, so a notification never appears on it. Done every rendered frame; the send below
+        // only transmits the slots its pacing allows.
+        if (_stringSender != null)
+            PixelMapper.MapRowToString(_frameBuffer.AsSpan(), _stringRowResolved, _stringSize, _stringBuffer.AsSpan());
+
         // Overlay the active text notification banner (if any) on the frame.
         DrawActiveNotification();
 
@@ -1166,10 +1172,9 @@ void main()
                 Console.WriteLine($"[E1.31] Send failed: {ex.Message}");
             }
 
-            // Send to LED string — mirrors a matrix row (default: center row)
+            // Send to LED string — the row captured above, from before any text was drawn.
             if (_stringSender != null)
             {
-                PixelMapper.MapRowToString(_frameBuffer.AsSpan(), _stringRowResolved, _stringSize, _stringBuffer.AsSpan());
                 try
                 {
                     _stringSender.SendFrameMultiUniverse(_stringBuffer, (ushort)_stringUniverseResolved);
@@ -1333,6 +1338,12 @@ void main()
             _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
         }
 
+        // Map the LED string row from the framebuffer BEFORE the banner is drawn: the string mirrors
+        // the shader, so a notification never appears on it. Done every rendered frame; the send below
+        // only transmits the slots its pacing allows.
+        if (_stringSender != null)
+            PixelMapper.MapRowToString(_frameBuffer.AsSpan(), _stringRowResolved, _stringSize, _stringBuffer.AsSpan());
+
         // Overlay the active text notification banner (if any) on the frame.
         DrawActiveNotification();
 
@@ -1355,10 +1366,9 @@ void main()
                 Console.WriteLine($"[E1.31] Send failed: {ex.Message}");
             }
 
-            // Send to LED string — mirrors a matrix row (default: center row)
+            // Send to LED string — the row captured above, from before any text was drawn.
             if (_stringSender != null)
             {
-                PixelMapper.MapRowToString(_frameBuffer.AsSpan(), _stringRowResolved, _stringSize, _stringBuffer.AsSpan());
                 try
                 {
                     _stringSender.SendFrameMultiUniverse(_stringBuffer, (ushort)_stringUniverseResolved);

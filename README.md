@@ -333,6 +333,9 @@ Text limits: 5×7 ASCII bitmap font (200 characters max, unsupported characters 
 9 characters fit the 53 px panel and are centered and static; anything longer scrolls as a marquee at
 12 px/s, which needs about 5 s to cross the panel.
 
+The LED string is sampled from the framebuffer **before** the banner is drawn, so text always appears
+on the matrix only — the string keeps mirroring the shader.
+
 #### Status Response
 
 ```json
