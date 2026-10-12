@@ -135,6 +135,8 @@ dotnet run --help
 | `--string-ip <ip\|host>` | Target IP or hostname (e.g. `ledstring.local`) for the string (default: same as matrix) |
 | `--string-universe <n>` | Universe for the string (default: first after the matrix's universes) |
 | `--fps <n>` | Cap the output rate for matrix + string (default: uncapped). Use `30`–`60` for typical pixel controllers — sending 4 universes per frame at thousands of fps overruns their refresh rate and drops frames. In headless mode the whole render loop is paced to this rate, so it also caps CPU use |
+| `--text-overlay` | Default banner style: draw text over the shader (with a black halo around the strokes) instead of blanking a black band across it. A per-message `overlay` field overrides it |
+| `--text-shadow <0-3>` | Width of that halo: 1 = 1 px outline, 2 = 2 px, 0 = none. Default 1. Only applies to overlay banners |
 | `--mqtt <host>` | Connect to an MQTT broker and publish Home Assistant discovery (a `light` plus a `select` of shaders). Requires the control API, i.e. not `--web-port 0` |
 | `--mqtt-port <port>` | MQTT broker port (default: 1883) |
 | `--mqtt-topic <prefix>` | MQTT topic prefix for all entities and topics (default: `shadertoe131`) |
@@ -225,7 +227,7 @@ Topics (prefix `shadertoe131`):
 | `shadertoe131/shader/state` | out (retained) | current shader option |
 | `shadertoe131/matrix/attributes` | out (retained) | frames sent, send errors, audio state, string config, uptime |
 | `shadertoe131/matrix/availability` | out (retained) | `online` / `offline` (also the client's last-will) |
-| `shadertoe131/notify/set` | in | banner text, plain text or `{"text":"…","duration":10}` |
+| `shadertoe131/notify/set` | in | banner text, plain text or `{"text":"…","duration":10,"overlay":true}` |
 | `shadertoe131/notify/state` | out (retained) | the banner currently on screen (empty when there is none) |
 | `shadertoe131/notify/duration/set` | in | banner lifetime in seconds, used for plain-text banners |
 | `shadertoe131/notify/duration/state` | out (retained) | current banner lifetime |
@@ -253,14 +255,15 @@ Text banners — the `text` entity is the dashboard way to do it (note the field
   data: { value: "Tea is ready" }
 ```
 
-or publish straight to the topic when you want to choose the duration per message:
+or publish straight to the topic when you want to choose the duration per message, or keep the
+shader visible behind the text:
 
 ```yaml
 - action: mqtt.publish
   data:
     topic: shadertoe131/notify/set
     payload: >-
-      {"text": "Tea is ready", "duration": 15}
+      {"text": "Tea is ready", "duration": 15, "overlay": true}
 ```
 
 Clear a banner early with an empty value. Limits: 200 characters, printable ASCII; anything wider
@@ -301,6 +304,7 @@ http://localhost:<port>
 |----------|--------|-------------|----------|
 | `/api/shaders` | GET | List all available shaders | JSON array of `{name, fileName, isAudioReactive}` |
 | `/api/select-shader` | POST | Select a shader by filename (`"off"` for blank) | `{"ok": true/false}` |
+| `/api/notify` | POST | Show a text banner: `{"text":"…","duration":10,"overlay":false}` (`"text":""` clears it) | `{"ok": true, "text", "duration", "overlay"}` |
 | `/api/set-audio` | POST | Enable/disable audio capture | `{"ok": true/false}` |
 | `/api/set-audio-source` | POST | Set source: `off`, `microphone`, or `loopback` | `{"ok": true, "source", "enabled"}` |
 | `/api/audio-devices` | GET | List available loopback devices | `{devices: [{index, name}]}` |
@@ -308,6 +312,26 @@ http://localhost:<port>
 | `/api/set-string` | POST | Configure LED string: `{enabled, size, row, ip, universe}` (omit fields to keep current values; `ip` accepts an IP or a hostname, e.g. `ledstring.local`; `ip: ""` resets to the matrix IP; `universe: 0` = auto) | `{"ok": true/false}` |
 | `/api/string-config` | GET | Current LED string config + live stats | JSON object (see below) |
 | `/api/status` | GET | Get current status and stats | JSON object (see below) |
+
+#### Text banners
+
+`/api/notify` (and the MQTT `…/notify/set` topic) takes `text`, an optional `duration` (1–300 s,
+default 10) and an optional `overlay`:
+
+- **`overlay: false`** *(default)* — a black band is cleared across the panel and the text is drawn
+  in white on it. The shader keeps rendering outside the band.
+- **`overlay: true`** — nothing is cleared: the text is drawn straight onto the current frame with a
+  1 px black halo around every stroke, so the shader stays visible behind it and the text is still
+  readable over bright output. Use this when the banner would otherwise cut a black stripe through a
+  shader you care about.
+
+`--text-overlay` makes overlay the default for every banner that does not say otherwise; a per-message
+`overlay` always wins over it. The web control panel has an **Overlay** checkbox in the Notifications
+card.
+
+Text limits: 5×7 ASCII bitmap font (200 characters max, unsupported characters render as gaps). Up to
+9 characters fit the 53 px panel and are centered and static; anything longer scrolls as a marquee at
+12 px/s, which needs about 5 s to cross the panel.
 
 #### Status Response
 

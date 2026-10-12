@@ -65,9 +65,17 @@ public sealed class WebServer : IDisposable
     /// A text notification posted via /api/notify, waiting for the render loop to pick up.
     /// An empty Text means "clear the active notification".
     /// </summary>
-    public record NotificationRequest(string Text, int DurationSec);
+    /// <summary>A pending text banner. <see cref="Overlay"/> is null when the request did not say,
+    /// in which case <see cref="DefaultTextOverlay"/> decides it.</summary>
+    public record NotificationRequest(string Text, int DurationSec, bool? Overlay = null);
 
     private volatile NotificationRequest? _pendingNotification;
+
+    /// <summary>
+    /// What a banner does when the request does not say: false (default) blanks a black band across
+    /// the shader, true draws the text over the shader with a drop shadow. Set with --text-overlay.
+    /// </summary>
+    public bool DefaultTextOverlay { get; set; }
 
     /// <summary>
     /// Atomically take the pending notification and clear the slot in one step,
@@ -659,8 +667,13 @@ public sealed class WebServer : IDisposable
             <label for=""notifyDuration"">Duration (s)</label>
             <input type=""number"" id=""notifyDuration"" min=""1"" max=""300"" value=""10"">
           </div>
+          <div>
+            <label for=""notifyOverlay"">Overlay</label>
+            <input type=""checkbox"" id=""notifyOverlay"">
+          </div>
         </div>
         <button id=""sendNotifyBtn"">Send Notification</button>
+        <div class=""hint"">Overlay draws the text on top of the shader (with a black outline) instead of blanking a band across it.</div>
         <div class=""hint"" id=""notifyStatus"">No active notification.</div>
       </section>
     </div>
@@ -923,7 +936,7 @@ async function sendNotification() {
   const dur = Number(durRaw);
   if (!Number.isInteger(dur) || dur < 1 || dur > 300) { showBanner('Duration must be a whole number of seconds (1–300).', true); return; }
   try {
-    const r = await fetch(API + 'api/notify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, duration: dur }) });
+    const r = await fetch(API + 'api/notify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, duration: dur, overlay: $('notifyOverlay').checked }) });
     const d = await r.json();
     if (d.ok) showBanner(text ? 'Notification sent.' : 'Notification cleared.', false);
     else showBanner(d.error || 'Failed to send notification.', true);
@@ -1248,7 +1261,18 @@ setInterval(refreshStatus, 2000);
             duration = d.Value;
         }
 
-        return new NotificationRequest(text, duration);
+        // Optional: draw the text over the shader instead of blanking a band across it.
+        // Absent means "no opinion"; the server default decides.
+        bool? overlay = null;
+        if (json.TryGetValue("overlay", out var ovEl))
+        {
+            if (ovEl.ValueKind == JsonValueKind.True) overlay = true;
+            else if (ovEl.ValueKind == JsonValueKind.False) overlay = false;
+            else if (ovEl.ValueKind == JsonValueKind.String && bool.TryParse(ovEl.GetString(), out bool sv)) overlay = sv;
+            else { error = "'overlay' must be true or false."; return null; }
+        }
+
+        return new NotificationRequest(text, duration, overlay);
     }
 
     private void ServeNotify(Socket clientSocket, string body)
@@ -1263,7 +1287,7 @@ setInterval(refreshStatus, 2000);
         if (request.Text.Length == 0)
             SendJson(clientSocket, new { ok = true, cleared = true });
         else
-            SendJson(clientSocket, new { ok = true, text = request.Text, duration = request.DurationSec });
+            SendJson(clientSocket, new { ok = true, text = request.Text, duration = request.DurationSec, overlay = request.Overlay == true });
     }
 
     /// <summary>
@@ -1274,7 +1298,7 @@ setInterval(refreshStatus, 2000);
     {
         var request = ParseNotifyRequest(jsonBody, out error);
         if (request == null) return false;
-        _pendingNotification = request;
+        _pendingNotification = request with { Overlay = request.Overlay ?? DefaultTextOverlay };
         return true;
     }
 

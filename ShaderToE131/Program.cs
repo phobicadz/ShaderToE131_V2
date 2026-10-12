@@ -22,6 +22,8 @@ class Program : IDisposable
     private delegate void SwapIntervalFn(int interval);
 
     private bool _noPreview = false;
+    private bool _textOverlay = false;   // default banner behaviour: draw over the shader, no black band
+    private int _textShadow = TextRenderer.DefaultShadowSpread; // halo width around overlay text
     private string? _shaderSource = null;
     private string? _currentShaderFileName;
     private bool _demoMode = false;
@@ -81,6 +83,7 @@ class Program : IDisposable
 
     // ─── Text notifications (banner overlay on the matrix) ───
     private string? _notifyText;
+    private bool _notifyOverlay;
     private long _notifyStartMs;
     private long _notifyUntilMs;
 
@@ -286,6 +289,9 @@ void main()
                 prog._stringIp = args[++i];
             else if (args[i] == "--string-universe" && i + 1 < args.Length && int.TryParse(args[++i], out var su))
                 prog._stringUniverse = su;
+            else if (args[i] == "--text-overlay") { prog._textOverlay = true; }
+            else if (args[i] == "--text-shadow" && i + 1 < args.Length && int.TryParse(args[++i], out var ts))
+                prog._textShadow = Math.Clamp(ts, 0, TextRenderer.MaxShadowSpread);
         }
 
         // Show available audio devices when --help, -h, or --list-devices is passed
@@ -311,6 +317,8 @@ void main()
             Console.WriteLine("  --string-ip <ip|host>  Target IP or hostname for the string (default: same as matrix)");
             Console.WriteLine("  --string-universe <n>  Universe for the string (default: first after the matrix's universes)");
             Console.WriteLine("  --fps <n>            Cap the output rate (matrix + string); headless mode paces its render loop to it. Default: uncapped");
+            Console.WriteLine("  --text-overlay       Default banner style: draw text over the shader (with a black outline around the strokes) instead of blanking a band across it. Per-message \"overlay\" overrides it");
+            Console.WriteLine("  --text-shadow <0-3>  Width of that outline (1 = 1px halo, 2 = 2px halo, 0 = none). Default: 1. Only applies to overlay banners");
             Console.WriteLine("  --mqtt <host>        Connect to an MQTT broker and publish a Home Assistant light entity (effects = shaders)");
             Console.WriteLine("  --mqtt-port <port>   MQTT broker port (default: 1883)");
             Console.WriteLine("  --mqtt-topic <prefix> Topic prefix (default: shadertoe131)");
@@ -459,6 +467,7 @@ void main()
         if (_webPort > 0)
         {
             _webServer = new WebServer(_webPort, resolvedShaderDir, _webBindAddress);
+            _webServer.DefaultTextOverlay = _textOverlay;
             _webServer.GetAudioEnabled = () => _audioEnabled;
             _webServer.SetAudioEnabled = enabled =>
             {
@@ -945,6 +954,7 @@ void main()
         }
 
         _notifyText = note.Text;
+        _notifyOverlay = note.Overlay == true;   // ParseNotifyRequest/TryPostNotification resolve the default
         _notifyStartMs = Environment.TickCount64;
         _notifyUntilMs = _notifyStartMs + (long)note.DurationSec * 1000;
         Console.WriteLine($"[Web] Notification shown for {note.DurationSec}s: {note.Text}");
@@ -965,7 +975,7 @@ void main()
             if (_shaderProgram == null) _offFramesRemaining = OffClearFrames;
             return;
         }
-        TextRenderer.DrawBanner(_frameBuffer.AsSpan(), MatW, MatH, _notifyText, nowMs - _notifyStartMs);
+        TextRenderer.DrawBanner(_frameBuffer.AsSpan(), MatW, MatH, _notifyText, nowMs - _notifyStartMs, _notifyOverlay, _textShadow);
     }
 
     /// <summary>Remaining seconds of the active notification (0 when none).</summary>
