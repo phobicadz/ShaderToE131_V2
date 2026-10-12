@@ -376,6 +376,22 @@ void main()
         return null;
     }
 
+    /// <summary>
+    /// Resolve the shader directory for the web server and demo mode.
+    /// Explicit --shader-dir wins; otherwise prefer an existing shaders/ next to
+    /// the working directory (e.g. running from the repo root), falling back to
+    /// the app base directory (published deployment layout).
+    /// </summary>
+    private static string ResolveShaderDirectory(string? explicitPath)
+    {
+        if (!string.IsNullOrEmpty(explicitPath))
+            return Path.IsPathRooted(explicitPath) ? explicitPath : Path.Combine(Directory.GetCurrentDirectory(), explicitPath);
+
+        string cwdDir = Path.Combine(Directory.GetCurrentDirectory(), "shaders");
+        if (Directory.Exists(cwdDir)) return cwdDir;
+        return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "shaders");
+    }
+
     private unsafe void Run()
     {
         Console.WriteLine("ShaderToE131 — ShaderToy → E.1.31 LED Matrix");
@@ -413,16 +429,8 @@ void main()
         // Resolve shader source(s) — file override, demo mode, or built-in default
         if (_demoMode)
         {
-            // Resolve shader directory — explicit path, fallback to base/shaders/
-            string shaderDir;
-            if (!string.IsNullOrEmpty(_shaderDirPath))
-            {
-                shaderDir = Path.IsPathRooted(_shaderDirPath) ? _shaderDirPath : Path.Combine(Directory.GetCurrentDirectory(), _shaderDirPath);
-            }
-            else
-            {
-                shaderDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "shaders");
-            }
+            // Resolve shader directory — explicit path, working dir, or base/shaders/
+            string shaderDir = ResolveShaderDirectory(_shaderDirPath);
             if (Directory.Exists(shaderDir))
                 _demoShaders = Directory.GetFiles(shaderDir, "*.glsl", SearchOption.TopDirectoryOnly)
                                          .OrderBy(Path.GetFileName).ToArray();
@@ -459,11 +467,7 @@ void main()
         }
 
         // Resolve shader directory for web server
-        string resolvedShaderDir;
-        if (!string.IsNullOrEmpty(_shaderDirPath))
-            resolvedShaderDir = Path.IsPathRooted(_shaderDirPath) ? _shaderDirPath : Path.Combine(Directory.GetCurrentDirectory(), _shaderDirPath);
-        else
-            resolvedShaderDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "shaders");
+        string resolvedShaderDir = ResolveShaderDirectory(_shaderDirPath);
 
         // Start web control panel (use --web-port 0 to disable)
         if (_webPort > 0)
