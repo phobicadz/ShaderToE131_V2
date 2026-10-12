@@ -190,12 +190,14 @@ vec3 HSVtoRGB(vec3 c)
             + (rawSource.Contains("out vec4 FragColor") ? "" : "out vec4 FragColor;\n")
             + (_audioEnabled ? GetMissingAudioUniforms(rawSource) : "");
 
+        // No trailing ';' after main(): Apple's (macOS) GLSL compiler rejects it,
+        // while Windows drivers tolerate it. GLSL grammar makes it optional anyway.
         string wrapped = header + shaderToyHelpers + body + @"
 void main()
 {{
     vec2 fragCoord = gl_FragCoord.xy;
     mainImage(FragColor, fragCoord);
-}};";
+}}";
         return wrapped.Replace("{AR}", arValue);
     }
 
@@ -242,7 +244,7 @@ void main()
 
     vec3 col = 0.5 + 0.5*cos(iTime+uv.xyx+vec3(0,2,4));
     FragColor = vec4(vec3(pixel) * col, 1.0);
-}};";
+}}";
     static void Main(string[] args)
     {
         using var prog = new Program();
