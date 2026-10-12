@@ -121,6 +121,14 @@ public static class TextRenderer
     };
 
     /// <summary>Pixel width of <paramref name="text"/> when rendered (0 for empty text).</summary>
+    /// <summary>Default half-width of the black halo drawn around glyphs in overlay mode, used when
+    /// the caller does not pass one. Override at runtime with --text-shadow &lt;0..3&gt;.</summary>
+    public const int DefaultShadowSpread = 1;
+
+    /// <summary>Halo widths are clamped to this: on an 11-row panel a 3 px outline already swallows
+    /// most of a 7-row glyph.</summary>
+    public const int MaxShadowSpread = 3;
+
     public static int MeasureWidth(string text)
         => text.Length > 0 ? text.Length * GlyphAdvance - 1 : 0;
 
@@ -134,7 +142,13 @@ public static class TextRenderer
     /// the pipeline uses: row 0 is the BOTTOM row of the panel (see Program.Render, which copies
     /// ReadPixels output without flipping so the panel, the preview and the shader all agree).</param>
     /// <param name="elapsedMs">Time since the notification started, used for marquee position.</param>
-    public static void DrawBanner(Span<byte> frame, int width, int height, string text, long elapsedMs)
+    /// <param name="overlay">Draw the text on top of the existing frame instead of blanking a band
+    /// across it: the shader stays visible behind the text, and the glyphs are surrounded by a black
+    /// halo (<paramref name="shadowSpread"/> pixels wide) so white text is readable over bright shader
+    /// output.</param>
+    /// <param name="shadowSpread">Half-width of that halo: 1 gives a 1 px outline around every stroke,
+    /// 2 gives a 2 px one, 0 draws no halo at all. Only used when <paramref name="overlay"/> is true.</param>
+    public static void DrawBanner(Span<byte> frame, int width, int height, string text, long elapsedMs, bool overlay = false, int shadowSpread = 1)
     {
         if (text.Length == 0 || width <= 0 || height <= 0) return;
         if (frame.Length < width * height * 4)
@@ -150,8 +164,11 @@ public static class TextRenderer
         // that range; drawing it at the lowest index renders the text upside down.
         int glyphTopIndex = Math.Min(height - 1, bandTop + GlyphHeight);
 
-        for (int y = bandTop; y < bandBottom; y++)
-            frame.Slice(y * width * 4, width * 4).Clear();
+        if (!overlay)
+        {
+            for (int y = bandTop; y < bandBottom; y++)
+                frame.Slice(y * width * 4, width * 4).Clear();
+        }
 
         int x;
         if (textWidth <= width)
@@ -166,33 +183,64 @@ public static class TextRenderer
             x = (int)(width - pos);
         }
 
-        for (int i = 0; i < text.Length; i++)
+        // Two passes in overlay mode: shadows first, then the glyphs, so a shadow can never dim a
+        // glyph pixel drawn later in the same pass.
+        for (int pass = overlay ? 0 : 1; pass <= 1; pass++)
         {
-            int gx = x + i * GlyphAdvance;
-            if (gx >= width || gx + GlyphWidth <= 0) continue;
+            bool shadowPass = pass == 0;
+            int spread = Math.Clamp(shadowSpread, 0, MaxShadowSpread);
+            if (shadowPass && spread == 0) continue;
 
-            char c = text[i];
-            if (c < FirstChar || c > LastChar) continue; // unsupported characters render as a gap
-            int fontOffset = (c - FirstChar) * 5;
-
-            for (int col = 0; col < GlyphWidth; col++)
+            for (int i = 0; i < text.Length; i++)
             {
-                int px = gx + col;
-                if (px < 0 || px >= width) continue;
-                byte bits = Font[fontOffset + col];
-                if (bits == 0) continue;
+                int gx = x + i * GlyphAdvance;
+                if (gx >= width || gx + GlyphWidth <= 0) continue;
 
-                for (int row = 0; row < GlyphHeight; row++)
+                char c = text[i];
+                if (c < FirstChar || c > LastChar) continue; // unsupported characters render as a gap
+                int fontOffset = (c - FirstChar) * 5;
+
+                for (int col = 0; col < GlyphWidth; col++)
                 {
-                    if ((bits & (1 << row)) == 0) continue;
-                    int py = glyphTopIndex - row;
-                    if (py >= height) continue;
+                    int px = gx + col;
+                    if (px < 0 || px >= width) continue;
+                    byte bits = Font[fontOffset + col];
+                    if (bits == 0) continue;
 
-                    int idx = (py * width + px) * 4;
-                    frame[idx] = 255;
-                    frame[idx + 1] = 255;
-                    frame[idx + 2] = 255;
-                    frame[idx + 3] = 255;
+                    for (int row = 0; row < GlyphHeight; row++)
+                    {
+                        if ((bits & (1 << row)) == 0) continue;
+                        int py = glyphTopIndex - row;
+                        if (py >= height) continue;
+
+                        if (shadowPass)
+                        {
+                            // A solid black halo all the way around the stroke, not just a smudge to
+                            // one side: overlay text has to stay readable over any shader.
+                            for (int ox = -spread; ox <= spread; ox++)
+                            {
+                                for (int oy = -spread; oy <= spread; oy++)
+                                {
+                                    if (ox == 0 && oy == 0) continue;
+                                    int sx = px + ox, sy = py + oy;
+                                    if (sx < 0 || sx >= width || sy < 0 || sy >= height) continue;
+
+                                    int sidx = (sy * width + sx) * 4;
+                                    frame[sidx] = 0;
+                                    frame[sidx + 1] = 0;
+                                    frame[sidx + 2] = 0;
+                                    frame[sidx + 3] = 255;
+                                }
+                            }
+                            continue;
+                        }
+
+                        int idx = (py * width + px) * 4;
+                        frame[idx] = 255;
+                        frame[idx + 1] = 255;
+                        frame[idx + 2] = 255;
+                        frame[idx + 3] = 255;
+                    }
                 }
             }
         }

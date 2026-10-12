@@ -124,4 +124,64 @@ public class NotificationApiTests
         Assert.Same(req, ws.ConsumePendingNotification());
         Assert.Null(ws.ConsumePendingNotification());
     }
+
+    [Fact]
+    public void ParseNotifyRequest_OverlayFlag_IsHonored()
+    {
+        var on = WebServer.ParseNotifyRequest("""{"text":"Hi","overlay":true}""", out var error);
+        Assert.NotNull(on);
+        Assert.Null(error);
+        Assert.True(on.Overlay);
+
+        var off = WebServer.ParseNotifyRequest("""{"text":"Hi","overlay":false}""", out _);
+        Assert.NotNull(off);
+        Assert.False(off.Overlay);
+    }
+
+    [Fact]
+    public void ParseNotifyRequest_OverlayAbsent_LeavesTheDecisionToTheServer()
+    {
+        var req = WebServer.ParseNotifyRequest("""{"text":"Hi"}""", out _);
+        Assert.NotNull(req);
+        Assert.Null(req.Overlay); // "no opinion", resolved by WebServer.DefaultTextOverlay
+    }
+
+    [Theory]
+    [InlineData("""{"text":"Hi","overlay":"true"}""", true)]   // templates sometimes stringify it
+    [InlineData("""{"text":"Hi","overlay":"false"}""", false)]
+    public void ParseNotifyRequest_OverlayAsString_IsAccepted(string body, bool expected)
+    {
+        var req = WebServer.ParseNotifyRequest(body, out var error);
+        Assert.NotNull(req);
+        Assert.Null(error);
+        Assert.Equal(expected, req.Overlay);
+    }
+
+    [Theory]
+    [InlineData("""{"text":"Hi","overlay":1}""")]
+    [InlineData("""{"text":"Hi","overlay":"yes"}""")]
+    [InlineData("""{"text":"Hi","overlay":null}""")]
+    public void ParseNotifyRequest_OverlayNotBoolean_IsRejected(string body)
+    {
+        Assert.Null(WebServer.ParseNotifyRequest(body, out var error));
+        Assert.NotNull(error);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TryPostNotification_ResolvesDefaultOverlayWhenRequestIsSilent(bool serverDefault)
+    {
+        using var ws = new WebServer(0, Directory.GetCurrentDirectory(), "localhost")
+        {
+            DefaultTextOverlay = serverDefault
+        };
+
+        Assert.True(ws.TryPostNotification("""{"text":"Hi"}""", out _));
+        Assert.Equal(serverDefault, ws.ConsumePendingNotification()!.Overlay);
+
+        // An explicit value in the message always beats the server default.
+        Assert.True(ws.TryPostNotification("""{"text":"Hi","overlay":false}""", out _));
+        Assert.False(ws.ConsumePendingNotification()!.Overlay);
+    }
 }
