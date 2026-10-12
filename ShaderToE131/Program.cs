@@ -37,6 +37,13 @@ class Program : IDisposable
     private int _webPort = 8080;
     private string _webBindAddress = "0.0.0.0";
     private int _targetFps = 0;             // 0 = uncapped E.1.31 send rate
+    private bool _perfProbe;                // --perf-probe: per-phase timing in the headless loop
+    // Phase timings are accumulated every frame (a Stopwatch restart costs ~50 ns) and only
+    // printed when --perf-probe is set.
+    private readonly System.Diagnostics.Stopwatch _phaseSw = new();
+    private double _probeEventsMs, _probeDrawMs, _probeMapMs, _probeSendMs;
+    private int _probeIters, _probeSentBaseline;
+    private long _probeStartMs;
     private List<(int Index, string Name)>? _deviceListCache;
     private long _deviceListCacheMs;
     private int _offFramesRemaining;        // black frames left to send after turning off
@@ -251,6 +258,7 @@ void main()
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--no-preview") { prog._noPreview = true; }
+            else if (args[i] == "--perf-probe") { prog._perfProbe = true; }
             else if (args[i] == "--shader" && i + 1 < args.Length)
                 prog._shaderSource = args[++i];
             else if (args[i] == "--demo") { prog._demoMode = true; }
@@ -303,6 +311,7 @@ void main()
             Console.WriteLine();
             Console.WriteLine("Options:");
             Console.WriteLine("  --no-preview         Run headless (no OpenGL window)");
+            Console.WriteLine("  --perf-probe         Log headless loop phase timings and delivered fps every 2s");
             Console.WriteLine("  --shader <file>      Path to a .glsl shader file");
             Console.WriteLine("  --demo               Cycle through all shaders in shaders/");
             Console.WriteLine("  --demo-time <secs>   Seconds per shader in demo mode (default: 10)");
@@ -810,17 +819,60 @@ void main()
         _window.Initialize();
 
         long prevTickMs = Environment.TickCount64;
+        _probeStartMs = prevTickMs;
+        _probeSentBaseline = _framesSent;
+        var sw = new System.Diagnostics.Stopwatch();
+
         while (true)
         {
+            sw.Restart();
             _window.DoEvents();
+            _probeEventsMs += sw.Elapsed.TotalMilliseconds;
+            _probeIters++;
+
             long nowTickMs = Environment.TickCount64;
             OnRenderHeadless((nowTickMs - prevTickMs) / 1000.0);
             prevTickMs = nowTickMs;
-            _window.SwapBuffers();
 
-            // Render at the output cap, not faster than the frames we are allowed to send.
-            long wait = (long)Math.Ceiling(_nextSendMs - Environment.TickCount64);
-            if (wait > 0) Thread.Sleep((int)Math.Min(wait, 1000));
+            // No SwapBuffers: headless rendering never presents the default framebuffer,
+            // and on macOS GLFW always vsyncs (glfwSwapInterval is ignored there, and the
+            // wglSwapIntervalEXT call above is Windows-only). A swap measured 13-23 ms per
+            // frame, which put the loop's own period over the --fps slot budget so the cap
+            // could never be reached.
+            WaitForNextSlot();
+
+            if (_perfProbe)
+            {
+                long winMs = Environment.TickCount64 - _probeStartMs;
+                if (winMs >= 2000)
+                {
+                    int iters = Math.Max(1, _probeIters);
+                    int sent = _framesSent - _probeSentBaseline;
+                    Console.WriteLine($"[Perf] loop={_probeIters * 1000.0 / winMs:F1}/s sent={sent * 1000.0 / winMs:F1}/s"
+                        + $" | events={_probeEventsMs / iters:F1}ms draw={_probeDrawMs / iters:F1}ms"
+                        + $" map={_probeMapMs / iters:F1}ms send={_probeSendMs / iters:F1}ms");
+                    _probeIters = 0; _probeEventsMs = 0; _probeDrawMs = 0; _probeMapMs = 0; _probeSendMs = 0;
+                    _probeStartMs = Environment.TickCount64; _probeSentBaseline = _framesSent;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Sleep toward the next send deadline, then poll the last millisecond.
+    /// Thread.Sleep alone overshoots its request by tens of ms when the process is
+    /// throttled, which silently costs whole frames at 30 fps. Polling longer than
+    /// this is pure busy cost: 2 ms per slot measured 6.8% of a core instead of 4.2%.
+    /// </summary>
+    private void WaitForNextSlot()
+    {
+        if (_targetFps <= 0) return;
+        while (true)
+        {
+            double remain = _nextSendMs - Environment.TickCount64;
+            if (remain <= 0) return;
+            if (remain > 1.0) Thread.Sleep((int)Math.Max(1, remain - 1.0));
+            else Thread.SpinWait(2000);
         }
     }
 
@@ -839,22 +891,7 @@ void main()
             demoLoaded = true;
         }
 
-        // Disable VSync via wglSwapIntervalEXT
-        try
-        {
-            var hDC = UnsafeNativeMethods.GetDC(_window!.Handle);
-            if (hDC != IntPtr.Zero)
-            {
-                var proc = UnsafeNativeMethods.wglGetProcAddress("wglSwapIntervalEXT");
-                if (proc != IntPtr.Zero)
-                {
-                    var swapFn = Marshal.GetDelegateForFunctionPointer<UnsafeNativeMethods.WglSwapIntervalEXT>(proc);
-                    swapFn(0);
-                }
-                UnsafeNativeMethods.ReleaseDC(_window.Handle, hDC);
-            }
-        }
-        catch { /* VSync already off or extension not available */ }
+        // No VSync handling here: the headless loop never presents a frame (see RunHeadless).
 
         if (!demoLoaded)
         {
@@ -1341,12 +1378,15 @@ void main()
         }
         else
         {
+            _phaseSw.Restart();
             _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
+            _probeDrawMs += _phaseSw.Elapsed.TotalMilliseconds;
         }
 
         // Map the LED string row from the framebuffer BEFORE the banner is drawn: the string mirrors
         // the shader, so a notification never appears on it. Done every rendered frame; the send below
         // only transmits the slots its pacing allows.
+        _phaseSw.Restart();
         if (_stringSender != null)
             PixelMapper.MapRowToString(_frameBuffer.AsSpan(), _stringRowResolved, _stringSize, _stringBuffer.AsSpan());
 
@@ -1355,11 +1395,13 @@ void main()
 
         // Map to E.1.31 buffer (straight raster layout)
         PixelMapper.MapFrame(_frameBuffer.AsSpan(), _e131Buffer.AsSpan());
+        _probeMapMs += _phaseSw.Elapsed.TotalMilliseconds;
 
         // Send matrix + string together, paced by --fps when set, so both stay frame-aligned
         // SendDue() first: OffBurstDue() must only spend burst frames on slots that send.
         if (SendDue() && (!_isOff || OffBurstDue() || _notifyText != null))
         {
+            _phaseSw.Restart();
             // Send to LED matrix — 583 pixels × 3 channels = 1749 slots → needs 4 universes
             try
             {
@@ -1386,6 +1428,8 @@ void main()
                     Console.WriteLine($"[String] Send failed: {ex.Message}");
                 }
             }
+
+            _probeSendMs += _phaseSw.Elapsed.TotalMilliseconds;
 
             _frameCount++;
         }

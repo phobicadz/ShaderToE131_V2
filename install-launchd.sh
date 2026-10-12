@@ -89,6 +89,12 @@ EOF
     <string>$LOG_DIR/shadertoe131.err.log</string>
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <!-- Without ProcessType, launchd runs the agent as background QoS: App Nap
+         throttles its timers and Thread.Sleep overshoots by tens of ms, which
+         costs whole frames (a 30 fps setup delivered ~20 fps). Interactive restores
+         timer accuracy. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
 </dict>
 </plist>
 EOF

@@ -119,7 +119,8 @@ dotnet run --help
 
 | Option | Description |
 |--------|-------------|
-| `--no-preview` | Run headless: no preview window, own render loop (see "Idle cost" below) |
+| `--no-preview` | Run headless: no preview window, own render loop (see "Idle cost" below). Nothing is presented to the window, so the loop never calls `SwapBuffers` — on macOS GLFW always vsyncs and a swap there costs 13–23 ms per frame |
+| `--perf-probe` | Headless only: log delivered fps plus average per-phase loop timings every 2 s, for diagnosing an output rate below `--fps` |
 | `--shader <file>` | Path to a `.glsl` shader file |
 | `--demo` | Cycle through all shaders in `shaders/` directory |
 | `--demo-time <secs>` | Seconds per shader in demo mode (default: 10) |
@@ -529,12 +530,35 @@ shaders/
 
 Use `--no-preview` to run headless when OpenGL window creation fails or is not needed. The LED matrix output continues to work in headless mode.
 
+### Output slower than `--fps`
+
+`--fps` only paces the send; it cannot make the output faster than the render loop itself. If a
+frame costs more than one slot (33 ms at 30 fps), the schedule falls behind and the actual rate
+drags below the cap. Run with `--perf-probe` to see the delivered rate and where the time goes:
+
+```
+[Perf] loop=30.0/s sent=30.0/s | events=0.2ms draw=1.6ms map=0.0ms send=0.6ms
+```
+
+Both numbers matter: `loop` is how often the loop runs, `sent` is the rate actually reaching the
+matrix. If `loop` is below your `--fps`, something is costing time per iteration (`draw` is the GPU
+draw submission, which is cheap on the CPU until a swap forces it to finish).
+
+The service got stuck at ~20 fps with `--fps 30` while the same binary run from a terminal reached
+30. Two causes, both fixed:
+
+- Presenting the unused 64×64 headless window. GLFW always vsyncs on macOS, so `SwapBuffers` blocked
+  13–23 ms per frame; the headless loop never presents anything, so it no longer swaps.
+- Timer throttling. A launchd agent without `ProcessType` runs as background QoS, where App Nap
+  coalesces the process and `Thread.Sleep` overshoots by tens of ms. `install-launchd.sh` now writes
+  `ProcessType = Interactive` into the plist. Re-run it if your plist was written by an older version.
+
 ### Idle cost
 
 Headless mode owns its loop: it creates a minimal GL context, then renders, sends and sleeps on
 its own schedule instead of using Silk.NET's window loop (which keeps spinning to hold its own
-update cadence and ignores `--fps`). Combined with `--fps`, a 53×11 matrix runs at ~8% of a core
-instead of ~135%.
+update cadence and ignores `--fps`). Combined with `--fps`, a 53×11 matrix runs at ~5% of a core
+instead of ~135% (the installed service measured 4.8–5.1% while rendering at 30 fps).
 
 Selecting **Off (blank)** sends a short burst of black frames (10, enough to clear the controller
 and survive a lost packet), then the loop idles instead of streaming black frames forever — an idle
