@@ -52,7 +52,9 @@ echo "Using dotnet: $DOTNET"
 
 # --- Publish ----------------------------------------------------------------
 echo "Publishing ShaderToE131 to $PUBLISH_DIR ..."
-dotnet publish "$REPO_DIR/ShaderToE131/ShaderToE131.csproj" -c Release -o "$PUBLISH_DIR" --nologo
+# Use the resolved host, not a bare `dotnet`: this script is often run from a
+# non-interactive shell whose PATH does not include the SDK directory.
+"$DOTNET" publish "$REPO_DIR/ShaderToE131/ShaderToE131.csproj" -c Release -o "$PUBLISH_DIR" --nologo
 
 mkdir -p "$LOG_DIR" "$PLIST_DIR"
 
