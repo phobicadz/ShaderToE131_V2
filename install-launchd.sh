@@ -99,8 +99,17 @@ echo "Wrote $PLIST"
 GUI_DOMAIN="gui/$(id -u)"
 if launchctl bootout "$GUI_DOMAIN/$LABEL" 2>/dev/null; then
   echo "Stopped previous instance."
+  # launchd keeps the label registered for a moment after bootout; bootstrapping in the same
+  # breath fails with "Bootstrap failed: 5: Input/output error" even though the plist is fine.
+  for _ in 1 2 3 4 5; do
+    launchctl print "$GUI_DOMAIN/$LABEL" >/dev/null 2>&1 || break
+    sleep 1
+  done
 fi
-launchctl bootstrap "$GUI_DOMAIN" "$PLIST"
+if ! launchctl bootstrap "$GUI_DOMAIN" "$PLIST"; then
+  sleep 3
+  launchctl bootstrap "$GUI_DOMAIN" "$PLIST"
+fi
 echo "Installed and started $LABEL."
 
 # --- Quick verification -------------------------------------------------------
