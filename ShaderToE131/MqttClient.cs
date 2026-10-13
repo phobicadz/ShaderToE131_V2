@@ -565,6 +565,14 @@ public sealed class MqttClient : IDisposable
         if (!_client.IsConnected) return;
         _lastStatePublishMs = Environment.TickCount64;
 
+        // Re-assert availability with every state refresh. Availability is retained, and a second
+        // instance of this program (an old host being shut down after a move, a leftover service) can
+        // publish its own retained "offline" on the shared topic while this one is running happily -
+        // Home Assistant then shows the device as unavailable even though state keeps arriving.
+        // Republishing "online" here makes that self-heal within one heartbeat instead of needing a
+        // manual publish or a restart.
+        await PublishAsync(AvailabilityTopic, "online", retain: true, MqttQualityOfServiceLevel.AtLeastOnce);
+
         var snap = _web.StatusSnapshot;
         string? selected = snap?.SelectedShader;
         bool on = selected != null && !selected.Equals("off", StringComparison.OrdinalIgnoreCase);
