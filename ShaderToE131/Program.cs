@@ -88,6 +88,15 @@ class Program : IDisposable
     // thread, so a change arriving between a read and clear is never lost.
     private readonly System.Collections.Concurrent.ConcurrentQueue<WebServer.StringConfigChange> _pendingStringChanges = new();
 
+    // ─── PC motherboard LEDs (standalone LED agent) ───
+    // Mirrors the frame colour onto the RGB LEDs of another machine by streaming one colour
+    // per frame to the LedAgent service running there. Off unless --led-agent is given.
+    private bool _ledAgentEnabled = false;
+    private string _ledAgentHost = "127.0.0.1";
+    private int _ledAgentPort = LedAgentClient.DefaultPort;
+    private LedAgentMode _ledAgentMode = LedAgentMode.Dominant;
+    private LedAgentClient? _ledAgent;
+
     // ─── Text notifications (banner overlay on the matrix) ───
     private string? _notifyText;
     private bool _notifyOverlay;
@@ -302,6 +311,18 @@ void main()
             else if (args[i] == "--text-overlay") { prog._textOverlay = true; }
             else if (args[i] == "--text-shadow" && i + 1 < args.Length && int.TryParse(args[++i], out var ts))
                 prog._textShadow = Math.Clamp(ts, 0, TextRenderer.MaxShadowSpread);
+            else if (args[i] == "--led-agent") { prog._ledAgentEnabled = true; }
+            else if (args[i] == "--led-agent-host" && i + 1 < args.Length)
+                prog._ledAgentHost = args[++i];
+            else if (args[i] == "--led-agent-port" && i + 1 < args.Length && int.TryParse(args[++i], out var plp))
+                prog._ledAgentPort = plp;
+            else if (args[i] == "--led-agent-mode" && i + 1 < args.Length)
+            {
+                string m = args[++i].ToLowerInvariant();
+                if (m == "average") prog._ledAgentMode = LedAgentMode.Average;
+                else if (m == "dominant") prog._ledAgentMode = LedAgentMode.Dominant;
+                else Console.WriteLine($"[WARN] Unknown --led-agent-mode '{m}' (expected 'dominant' or 'average'); using 'dominant'.");
+            }
         }
 
         // Show available audio devices when --help, -h, or --list-devices is passed
@@ -330,6 +351,10 @@ void main()
             Console.WriteLine("  --fps <n>            Cap the output rate (matrix + string); headless mode paces its render loop to it. Default: uncapped");
             Console.WriteLine("  --text-overlay       Default banner style: draw text over the shader (with a black outline around the strokes) instead of blanking a band across it. Per-message \"overlay\" overrides it");
             Console.WriteLine("  --text-shadow <0-3>  Width of that outline (1 = 1px halo, 2 = 2px halo, 0 = none). Default: 1. Only applies to overlay banners");
+            Console.WriteLine("  --led-agent          Stream the frame colour to a standalone LED agent service driving another machine's motherboard RGB LEDs (start it with: dotnet run --project LedAgent)");
+            Console.WriteLine("  --led-agent-host <host>  LED agent address (default: 127.0.0.1)");
+            Console.WriteLine("  --led-agent-port <port>  LED agent port (default: 6743)");
+            Console.WriteLine("  --led-agent-mode <m>   'dominant' = frame hue at full brightness (default), 'average' = exact mean frame colour");
             Console.WriteLine("  --mqtt <host>        Connect to an MQTT broker and publish a Home Assistant light entity (effects = shaders)");
             Console.WriteLine("  --mqtt-port <port>   MQTT broker port (default: 1883)");
             Console.WriteLine("  --mqtt-topic <prefix> Topic prefix (default: shadertoe131)");
@@ -592,6 +617,16 @@ void main()
                 _stringSendErrors,
                 MatH
             );
+            _webServer.GetLiveLedAgent = () => _ledAgent == null ? null : new WebServer.LedAgentInfo(
+                true,
+                _ledAgent.Connected,
+                _ledAgent.BackendName,
+                _ledAgent.FramesSent,
+                _ledAgent.SendErrors,
+                _ledAgentHost,
+                _ledAgentPort,
+                _ledAgentMode.ToString().ToLowerInvariant()
+            );
             _webServer.Start();
         }
 
@@ -622,6 +657,16 @@ void main()
             _stringSender = new E131Sender(strIp, 5568);
             _stringBuffer = new byte[_stringSize * 3];
             Console.WriteLine($"LED string sender initialized ({_stringSize} LEDs → {strIp}:5568, universe={_stringUniverseResolved}).");
+        }
+
+        // PC motherboard LEDs via the standalone LED agent service. The client owns its own
+        // reconnecting background thread, so an agent on another machine — present or absent —
+        // never affects the E.1.31 output.
+        if (_ledAgentEnabled)
+        {
+            _ledAgent = new LedAgentClient(_ledAgentHost, _ledAgentPort, _ledAgentMode);
+            _ledAgent.Start();
+            Console.WriteLine($"LED agent output enabled: streaming colours to {_ledAgentHost}:{_ledAgentPort}, mode={_ledAgentMode}");
         }
 
         // Initialize audio capture if requested
@@ -1199,6 +1244,10 @@ void main()
         // Map to E.1.31 buffer (straight raster layout)
         PixelMapper.MapFrame(_frameBuffer.AsSpan(), _e131Buffer.AsSpan());
 
+        // Mirror the frame colour to the LED agent on the other machine. Non-blocking:
+        // the client's own thread rate-limits and coalesces to at most one update per tick.
+        _ledAgent?.UpdateFromFrame(_e131Buffer.AsSpan());
+
         // Send matrix + string together, paced by --fps when set, so both stay frame-aligned
         // SendDue() first: OffBurstDue() must only spend burst frames on slots that send.
         if (SendDue() && (!_isOff || OffBurstDue() || _notifyText != null))
@@ -1239,7 +1288,8 @@ void main()
             int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;
             int b = _e131Buffer.Length > 2 ? _e131Buffer[2] : 0;
             string strStats = _stringSender != null ? $" | stringSent={_stringFramesSent} | stringErr={_stringSendErrors}" : "";
-            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}{strStats}");
+            string agentStats = _ledAgent != null ? $" | ledAgent={(_ledAgent.Connected ? "on" : "down")} sent={_ledAgent.FramesSent} err={_ledAgent.SendErrors}" : "";
+            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}{strStats}{agentStats}");
             _frameCount = 0;
             _lastStatusLogMs = nowMs;
         }
@@ -1397,6 +1447,9 @@ void main()
         PixelMapper.MapFrame(_frameBuffer.AsSpan(), _e131Buffer.AsSpan());
         _probeMapMs += _phaseSw.Elapsed.TotalMilliseconds;
 
+        // Mirror the frame colour to the LED agent on the other machine, when enabled.
+        _ledAgent?.UpdateFromFrame(_e131Buffer.AsSpan());
+
         // Send matrix + string together, paced by --fps when set, so both stay frame-aligned
         // SendDue() first: OffBurstDue() must only spend burst frames on slots that send.
         if (SendDue() && (!_isOff || OffBurstDue() || _notifyText != null))
@@ -1440,7 +1493,8 @@ void main()
             int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;
             int b = _e131Buffer.Length > 2 ? _e131Buffer[2] : 0;
             string strStats = _stringSender != null ? $" | stringSent={_stringFramesSent} | stringErr={_stringSendErrors}" : "";
-            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/2s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}{strStats}");
+            string agentStats = _ledAgent != null ? $" | ledAgent={(_ledAgent.Connected ? "on" : "down")} sent={_ledAgent.FramesSent} err={_ledAgent.SendErrors}" : "";
+            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/2s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}{strStats}{agentStats}");
             _frameCount = 0;
             _lastStatusLogMs = nowMs;
         }
@@ -1461,6 +1515,7 @@ void main()
         _audioCapture?.Dispose();
         _sender?.Dispose();
         _stringSender?.Dispose();
+        _ledAgent?.Dispose();
         // Dispose the shader program before the window: its GL deletion calls
         // (DeleteProgram, DeleteTexture, DeleteBuffer, DeleteVertexArray, ...)
         // require a live GL context, which the window owns.

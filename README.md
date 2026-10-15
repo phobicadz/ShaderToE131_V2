@@ -138,6 +138,10 @@ dotnet run --help
 | `--fps <n>` | Cap the output rate for matrix + string (default: uncapped). Use `30`–`60` for typical pixel controllers — sending 4 universes per frame at thousands of fps overruns their refresh rate and drops frames. In headless mode the whole render loop is paced to this rate, so it also caps CPU use |
 | `--text-overlay` | Default banner style: draw text over the shader (with a black halo around the strokes) instead of blanking a black band across it. A per-message `overlay` field overrides it |
 | `--text-shadow <0-3>` | Width of that halo: 1 = 1 px outline, 2 = 2 px, 0 = none. Default 1. Only applies to overlay banners |
+| `--led-agent` | Stream each frame's colour to a standalone **LED agent** service that drives the motherboard RGB LEDs of another machine. Start the agent first — see "LED Agent" below |
+| `--led-agent-host <host>` | LED agent host (default: `127.0.0.1`) |
+| `--led-agent-port <port>` | LED agent port (default: 6743) |
+| `--led-agent-mode <dominant\|average>` | Colour reduction: `dominant` (default) keeps the frame's hue but scales it to full brightness; `average` sends the exact mean colour |
 | `--mqtt <host>` | Connect to an MQTT broker and publish Home Assistant discovery (a `light` plus a `select` of shaders). Requires the control API, i.e. not `--web-port 0` |
 | `--mqtt-port <port>` | MQTT broker port (default: 1883) |
 | `--mqtt-topic <prefix>` | MQTT topic prefix for all entities and topics (default: `shadertoe131`) |
@@ -312,6 +316,7 @@ http://localhost:<port>
 | `/api/set-audio-device` | POST | Select loopback device by index | `{"ok": true/false}` |
 | `/api/set-string` | POST | Configure LED string: `{enabled, size, row, ip, universe}` (omit fields to keep current values; `ip` accepts an IP or a hostname, e.g. `ledstring.local`; `ip: ""` resets to the matrix IP; `universe: 0` = auto) | `{"ok": true/false}` |
 | `/api/string-config` | GET | Current LED string config + live stats | JSON object (see below) |
+| `/api/led-agent` | GET | Live LED agent link state (`{"enabled": false}` when `--led-agent` is off) | JSON object (see "LED Agent") |
 | `/api/status` | GET | Get current status and stats | JSON object (see below) |
 
 #### Text banners
@@ -356,9 +361,13 @@ on the matrix only — the string keeps mirroring the shader.
   "stringIp": null,
   "stringUniverse": 0,
   "stringFramesSent": 1234,
-  "stringSendErrors": 0
+  "stringSendErrors": 0,
+  "ledAgent": null
 }
 ```
+
+`ledAgent` is `null` unless the service was started with `--led-agent`; otherwise it holds the same
+object as `GET /api/led-agent`.
 
 #### String Config Response
 
@@ -476,6 +485,124 @@ Pixels are nearest-neighbor sampled from the chosen matrix row (LED *i* takes ma
 
 Universe numbers follow the sACN contract (1..63999): at startup the string's base universe and the last universe the string occupies are validated, and `--string-size` is bounded by the channel capacity available from the base universe. Out-of-range settings abort startup with a clear error before any buffer is allocated.
 
+### LED Agent (PC motherboard LEDs on another machine)
+
+The RGB LEDs built into a motherboard — MSI Mystic Light, ASUS Aura, Gigabyte RGB Fusion, … — are
+wired to *one* machine, and it is usually not the machine you want to render shaders on. **LedAgent**
+is a small standalone service that runs on the machine that physically has the LEDs; ShaderToE131
+connects to it over the network and streams one colour per frame. No vendor SDK, driver, or NuGet
+package is needed on the shader machine.
+
+```
+┌─────────────────────────┐   TCP 6743    ┌──────────────────────────┐   vendor SDK   ┌────────┐
+│ ShaderToE131            │ ────────────► │ LedAgent                 │ ─────────────► │ Mother-│
+│ renders shaders → E1.31 │  RGB r g b    │ protocol + backend plug-in│   MSLight.dll  │ board  │
+│ (any machine)           │               │ (the machine with LEDs)  │                │ LEDs   │
+└─────────────────────────┘               └──────────────────────────┘                └────────┘
+```
+
+#### 1. Start the agent (on the LED machine)
+
+```bash
+dotnet run --project LedAgent -- --backend auto
+```
+
+| Parameter | Default | Option |
+|-----------|---------|--------|
+| Listen address | `*` (all interfaces) | `--bind <ip\|hostname>` |
+| Port | `6743` | `--port <port>` |
+| Backend | `auto` (first backend that works here) | `--backend auto\|msi\|mock` |
+| MSI SDK path | auto-detected | `--msi-dll C:\path\MSLight.dll` |
+| Blank the LEDs after | 120 s with no sender | `--idle-off <secs>` (0 disables) |
+
+Backends:
+
+| Backend | Drives | Notes |
+|---------|--------|-------|
+| `msi` | MSI motherboard LEDs via MSI's own Mystic Light SDK | Needs **MSI Center** installed, and the agent must be **32-bit**: `dotnet publish LedAgent -a x86`. `MSLight.dll` is found automatically under MSI Center / Dragon Center, or given with `--msi-dll`. |
+| `mock` | nothing — colours are logged | Works anywhere; use it to verify the network path, or as the template for a new vendor backend. |
+| `auto` | `msi` if it initialises, otherwise `mock` | Default. Says plainly why it picked what it picked. |
+
+Adding another vendor (ASUS, Gigabyte, ASRock, a USB LED bar) is one class that implements
+`LedAgent/ILedBackend.cs` — five members. The agent itself knows nothing about hardware.
+
+> **Why not OpenRGB?** OpenRGB drives every vendor, but it has to run on the machine with the LEDs,
+> which makes it a second service to install there. The agent instead talks to the vendor SDK
+> directly, so the LED machine only needs the vendor's own utility you likely already have. Port 6743
+> is deliberately *not* OpenRGB's 6742, so both can run side by side.
+
+#### 2. Point ShaderToE131 at it
+
+```bash
+ShaderToE131 --led-agent --led-agent-host 192.168.2.20
+```
+
+`--led-agent-mode dominant|average` chooses how a frame is reduced to one colour: `dominant`
+(default) keeps the frame's hue but scales it so its brightest channel reaches 255, so the LEDs stay
+vivid; `average` sends the exact mean, which is dimmer but faithful.
+
+The client runs on its own background thread: it never blocks or allocates in the render loop, sends
+at most one update per ~33 ms and only when the colour actually changed, keeps the link alive with
+`PING` when a static scene sends nothing, and reconnects every 10 s. An unreachable agent costs
+nothing beyond a throttled log line once a minute — the matrix output is unaffected.
+
+#### 3. The protocol
+
+Plain TCP, one ASCII command per `\n`-terminated line, so *anything* on the network can drive those
+LEDs — no client library. The server greets every connection with `LEDAGENT 1 <backend>`.
+
+| Command | Effect | Reply |
+|---------|--------|-------|
+| `HELLO <name>` | announce a client | `OK hello <name>` |
+| `RGB <r> <g> <b>` | set every LED to a colour (0–255) | `OK`, or `ERR bad RGB line: …` |
+| `OFF` | blank the LEDs | `OK` |
+| `STATUS` | agent state as JSON | `STATUS {json}` |
+| `PING` | keep-alive | `PONG` |
+| `QUIT` | close | `OK bye` |
+| anything else | — | `ERR unknown command '<x>'` |
+
+Try it by hand from any machine:
+
+```powershell
+# PowerShell
+$c = [Net.Sockets.TcpClient]::new('192.168.2.20', 6743); $w = [IO.StreamWriter]::new($c.GetStream())
+$w.WriteLine('RGB 255 40 0'); $w.Flush()
+```
+
+```bash
+# curl / netcat
+printf 'RGB 255 40 0\nSTATUS\nQUIT\n' | nc 192.168.2.20 6743
+```
+
+`--idle-off` exists because otherwise the machine stays lit at whatever the last frame was after
+ShaderToE131 stops.
+
+#### Live state
+
+The console status line shows `ledAgent=on sent=… err=…`, `/api/status` includes a `ledAgent`
+object, and `GET /api/led-agent` returns it on its own:
+
+```json
+{
+  "enabled": true,
+  "connected": true,
+  "backend": "msi-mystic-light",
+  "framesSent": 4321,
+  "sendErrors": 0,
+  "host": "192.168.2.20",
+  "port": 6743,
+  "mode": "dominant"
+}
+```
+
+`{"enabled": false}` when `--led-agent` is off. The agent's own `STATUS` command reports its side —
+backend, device count, uptime, connection count, and the last colour it received.
+
+#### Running the agent as a service
+
+`install-led-agent.cmd` installs LedAgent as a Windows service (Servy), mirroring
+`install-service.cmd` for the main app. Run it **as Administrator** on the LED machine.
+
 ## Audio Capture Details
 
 ### FFT Configuration
@@ -518,7 +645,18 @@ ShaderToE131/
   E131Sender.cs       ← E.1.31/sACN UDP packet builder and sender
   PixelMapper.cs      ← Framebuffer → LED channel mapping (53×11 matrix)
   AudioCapture.cs     ← NAudio audio capture, FFT, spectral band analysis
+  LedAgentClient.cs   ← LED agent client: stream frame colour to a remote machine's RGB LEDs
   ShaderToE131.csproj ← .NET 8.0 project file with NuGet dependencies
+
+LedAgent/
+  Program.cs          ← entry point + CLI (--port, --bind, --backend, --idle-off)
+  Protocol.cs         ← line protocol: parse commands, format replies
+  AgentServer.cs      ← TCP listener, client sessions, idle-off, STATUS JSON
+  ILedBackend.cs      ← hardware plug-in interface (5 members)
+  Backends/
+    MsiMysticLightBackend.cs ← MSI motherboard LEDs via MSLight.dll (32-bit)
+    MockLedBackend.cs        ← logs colours instead of driving hardware
+  LedAgent.csproj     ← .NET 8.0 project file (no dependencies)
 
 shaders/
   *.glsl              ← ShaderToy-style fragment shaders (mainImage signature)

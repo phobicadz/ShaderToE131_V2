@@ -87,6 +87,7 @@ public sealed class WebServer : IDisposable
     // Test hook: post a notification as the /api/notify handler would.
     internal void SetPendingNotificationForTest(NotificationRequest request) => _pendingNotification = request;
     public Func<LiveStringState>? GetLiveStringState { get; set; }  // current string config + live stats
+    public Func<LedAgentInfo?>? GetLiveLedAgent { get; set; }       // live LED agent link state, null when disabled
 
     // Shader list is rebuilt into a NEW array and published with a single
     // reference assignment. Readers (HTTP handlers, render loop) always see a
@@ -140,7 +141,21 @@ public sealed class WebServer : IDisposable
         int StringFramesSent,
         int StringSendErrors,
         string? ActiveNotification,
-        double NotificationRemainingSecs
+        double NotificationRemainingSecs,
+        // Optional: live state of the LED agent output (--led-agent). Null when disabled.
+        LedAgentInfo? LedAgent = null
+    );
+
+    /// <summary>Live state of the link to the standalone LED agent service.</summary>
+    public record LedAgentInfo(
+        bool Enabled,
+        bool Connected,
+        string Backend,
+        int FramesSent,
+        int SendErrors,
+        string Host,
+        int Port,
+        string Mode
     );
 
     private static readonly JsonSerializerOptions JsonCamelCase = new()
@@ -422,6 +437,10 @@ public sealed class WebServer : IDisposable
                     if (method == "GET") ServeStatus(clientSocket);
                     else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
                     break;
+                case "/api/led-agent":
+                    if (method == "GET") ServeLedAgent(clientSocket);
+                    else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
+                    break;
                 default:
                     // Try to serve shader files directly for preview
                     if (path.StartsWith("/shaders/") && path.EndsWith(".glsl"))
@@ -688,6 +707,7 @@ public sealed class WebServer : IDisposable
           <div class=""status-item""><div class=""status-label"">Uptime</div><div class=""status-value"" id=""stUptime"">—</div></div>
           <div class=""status-item""><div class=""status-label"">Matrix Frames</div><div class=""status-value"" id=""stFrames"">0</div></div>
           <div class=""status-item""><div class=""status-label"">Send Errors</div><div class=""status-value"" id=""stErrors"">0</div></div>
+          <div class=""status-item""><div class=""status-label"">LED agent</div><div class=""status-value"" id=""stLedAgent"">off</div></div>
         </div>
         <div class=""hint"">Auto-refreshes every 2 s. Changes apply immediately.</div>
       </section>
@@ -976,6 +996,12 @@ async function refreshStatus() {
 
     $('stFrames').textContent = (d.framesSent ?? 0).toLocaleString();
     $('stErrors').textContent = (d.sendErrors ?? 0).toLocaleString();
+
+const agent = d.ledAgent;
+    $('stLedAgent').textContent = !agent ? 'off'
+      : (agent.connected
+        ? (agent.backend + ' · ' + (agent.framesSent ?? 0).toLocaleString())
+        : 'connecting… (' + agent.host + ':' + agent.port + ')');
 
     const notifyEl = $('notifyStatus');
     if (notifyEl) {
@@ -1483,6 +1509,7 @@ setInterval(refreshStatus, 2000);
             var devicesRaw = GetAvailableDevices?.Invoke() ?? snap.AvailableDevices;
             var devices = devicesRaw.Select(d => new { Index = d.Index, Name = d.Name }).ToList();
             var loopbackName = GetLoopbackDeviceName?.Invoke() ?? snap.LoopbackDeviceName;
+            var ledAgent = GetLiveLedAgent?.Invoke() ?? snap.LedAgent;
 
             SendJson(clientSocket, new
             {
@@ -1504,7 +1531,8 @@ setInterval(refreshStatus, 2000);
                 snap.StringFramesSent,
                 snap.StringSendErrors,
                 snap.ActiveNotification,
-                snap.NotificationRemainingSecs
+                snap.NotificationRemainingSecs,
+                ledAgent
             });
         }
         else
@@ -1519,6 +1547,22 @@ setInterval(refreshStatus, 2000);
                     GetLoopbackDeviceName?.Invoke(), devicesRaw,
                     false, 50, (PixelMapper.Height - 1) / 2, null, 0, 0, 0, null, 0));
         }
+    }
+
+    /// <summary>
+    /// Live status of the LED agent output (--led-agent). Reports the current link state
+    /// straight from the client, so it reflects an agent that went up or down since startup.
+    /// {"enabled":false} when the output is off.
+    /// </summary>
+    private void ServeLedAgent(Socket clientSocket)
+    {
+        var live = GetLiveLedAgent?.Invoke();
+        if (live == null)
+        {
+            SendJson(clientSocket, new { enabled = false });
+            return;
+        }
+        SendJson(clientSocket, live);
     }
 
     public void Dispose() => Stop();

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RollForward>Major</RollForward>
+    <RootNamespace>LedAgent</RootNamespace>
+    <AssemblyName>LedAgent</AssemblyName>
+    <!-- The MSI Mystic Light SDK (MSLight.dll) is 32-bit. Build/publish with -a x86
+         to drive MSI motherboard LEDs; x64 works for every other backend. -->
+    <Platforms>x64;x86</Platforms>
+  </PropertyGroup>
+
+</Project>
