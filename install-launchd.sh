@@ -29,7 +29,16 @@ PLIST="$PLIST_DIR/$LABEL.plist"
 PARAMS=(
   --no-preview
   --string
-  --string-ip ledstring.local
+  # The LED string controller, by address. Its mDNS name is not reliable from this
+  # machine: the name lives on the .3 VLAN and the Mac is on .2, so answering it
+  # depends on a reflector, and the app's own log shows that name resolving to
+  # 192.168.3.18 nineteen times and to 192.168.3.95 thirteen - the device has moved
+  # address before. A literal address is what the sender can always use.
+  #
+  # That makes this line a promise about the device's lease: if it ever moves again
+  # this has to move with it, so give it a DHCP reservation (or a static address on
+  # the device itself) and this stops being something anyone has to remember.
+  --string-ip 192.168.3.95
   --string-universe 1
   --audio
   --loopback 0
