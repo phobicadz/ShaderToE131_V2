@@ -45,4 +45,31 @@ internal static class StringOutput
             return $"--string-size {ledCount} needs {universes} universes starting at {baseUniverse} (last universe {lastUniverse}), but universes are limited to {MinUniverse}..{MaxUniverse}; use a smaller --string-size or a lower --string-universe.";
         return null;
     }
+
+    /// <summary>
+    /// Build the sACN sender for a string target, or report why it cannot be built.
+    ///
+    /// A string target is normally an mDNS name, and an mDNS name disappears with the
+    /// device it describes. That is a disabled output with a reason attached to it, not
+    /// a reason the program cannot run: the LED matrix is a separate device reached by
+    /// a literal address, and it stays lit. The alternative is an unhandled exception
+    /// out of Main, which is what took the matrix down with an absent string
+    /// controller and left launchd restarting a process that died again ten seconds
+    /// later, 2000-odd times.
+    /// </summary>
+    public static bool TryCreateSender(string target, int port, out E131Sender? sender, out string? failure)
+    {
+        try
+        {
+            sender = new E131Sender(target, port);
+            failure = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            sender = null;
+            failure = ex.Message;
+            return false;
+        }
+    }
 }

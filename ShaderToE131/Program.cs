@@ -84,6 +84,12 @@ class Program : IDisposable
     private int _stringRowResolved;
     private int _stringFramesSent;
     private int _stringSendErrors;
+    // The two questions about the LED string output are not the same question:
+    // _stringEnabled is what the configuration asks for and stays true while its
+    // controller is off the network; _stringSender is what is live at this moment.
+    // Conflating them is what made an unreachable mDNS name fatal.
+    private long _stringNextRetryMs;
+    private static readonly TimeSpan StringRetryDelay = TimeSpan.FromSeconds(30);
     // Thread-safe hand-off from the web server's single volatile slot to the render
     // thread, so a change arriving between a read and clear is never lost.
     private readonly System.Collections.Concurrent.ConcurrentQueue<WebServer.StringConfigChange> _pendingStringChanges = new();
@@ -653,10 +659,14 @@ void main()
 
         if (_stringEnabled)
         {
+            // An absent LED string controller is a disabled output, not a reason to not
+            // start. This line used to be the only one of the three places that build a
+            // sender which did not know that (ApplyStringChange and the send loop both
+            // already handle it), so one unresolvable mDNS name killed the process and
+            // the matrix - a different device, on a literal address - went dark with it.
             string strIp = _stringIp ?? TargetIp;
-            _stringSender = new E131Sender(strIp, 5568);
-            _stringBuffer = new byte[_stringSize * 3];
-            Console.WriteLine($"LED string sender initialized ({_stringSize} LEDs → {strIp}:5568, universe={_stringUniverseResolved}).");
+            if (TryCreateStringSender(strIp, "[WARN]"))
+                Console.WriteLine($"LED string sender initialized ({_stringSize} LEDs → {strIp}:5568, universe={_stringUniverseResolved}).");
         }
 
         // PC motherboard LEDs via the standalone LED agent service. The client owns its own
@@ -947,13 +957,61 @@ void main()
     }
 
     /// <summary>
+    /// Build the LED string sender for <paramref name="strIp"/>, or report why it cannot
+    /// be built and when it will be tried again.
+    ///
+    /// On failure the previous sender, if there is one, is left running: a target that
+    /// has gone away is not a reason to stop an output that is currently working. The
+    /// callers keep their own success wording, because "initialized", "configured" and
+    /// "recovered" are three different things to log.
+    /// </summary>
+    private bool TryCreateStringSender(string strIp, string logPrefix)
+    {
+        if (!StringOutput.TryCreateSender(strIp, 5568, out var sender, out string? failure))
+        {
+            _stringNextRetryMs = Environment.TickCount64 + (long)StringRetryDelay.TotalMilliseconds;
+            Console.WriteLine($"{logPrefix} LED string target '{strIp}' unavailable ({failure}); "
+                + $"string output disabled until it resolves again, retrying in "
+                + $"{(int)StringRetryDelay.TotalSeconds}s.");
+            return false;
+        }
+
+        _stringSender?.Dispose();
+        _stringSender = sender;
+        _stringBuffer = new byte[_stringSize * 3];
+        _stringNextRetryMs = 0;
+        return true;
+    }
+
+    /// <summary>
+    /// Try a string target that is configured but unreachable, on the render thread -
+    /// which is the thread that owns the sender, so this needs no lock and no new
+    /// thread. Runs only while the configuration still asks for the string, so a string
+    /// deliberately turned off from the web UI stays off.
+    /// </summary>
+    private void RetryStringSender()
+    {
+        if (!_stringEnabled || _stringSender != null) return;
+        if (Environment.TickCount64 < _stringNextRetryMs) return;
+
+        string strIp = _stringIp ?? TargetIp;
+        if (TryCreateStringSender(strIp, "[String]"))
+            Console.WriteLine($"[String] LED string target '{strIp}' resolved again "
+                + $"({_stringSize} LEDs → {strIp}:5568, universe={_stringUniverseResolved}).");
+    }
+
+    /// <summary>
     /// Apply a runtime LED string configuration change (from the web UI) on the render
     /// thread. Fields that are null keep their current value. Ip="" resets to the
     /// matrix IP; universe 0 means auto (first universe after the matrix's).
     /// </summary>
     private void ApplyStringChange(WebServer.StringConfigChange change)
     {
-        bool enabled = change.Enabled ?? _stringSender != null;
+        // "Wanted" and "live" are different questions now that a configured string can
+        // be temporarily without a sender. Reading it from _stringSender meant a request
+        // that only changes the IP was also a request to disable the string, whenever
+        // the controller happened to be down.
+        bool enabled = change.Enabled ?? _stringEnabled;
         int size = change.Size ?? _stringSize;
         int row = change.Row ?? _stringRow;
         string? ip = change.Ip;              // null = keep; "" = reset to matrix IP
@@ -983,6 +1041,7 @@ void main()
 
         // Commit the configured (and resolved) values regardless of enabled state,
         // so a request that only preconfigures a disabled string is not discarded.
+        _stringEnabled = enabled;
         _stringSize = size;
         _stringRow = row;
         _stringIp = effectiveIp;
@@ -1005,19 +1064,7 @@ void main()
         // failure (e.g. an mDNS name that dropped off the network) keeps the
         // previous sender running instead of killing the render thread.
         string strIp = effectiveIp ?? TargetIp;
-        E131Sender newSender;
-        try
-        {
-            newSender = new E131Sender(strIp, 5568);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[Web] LED string sender failed for target '{strIp}': {ex.Message} (previous sender left running).");
-            return;
-        }
-        _stringSender?.Dispose();
-        _stringSender = newSender;
-        _stringBuffer = new byte[size * 3];
+        if (!TryCreateStringSender(strIp, "[Web]")) return;
         _stringFramesSent = 0;
         _stringSendErrors = 0;
         Console.WriteLine($"[Web] LED string configured: {size} LEDs, row={effectiveRow}, universe={baseUniverse}, target={strIp}");
@@ -1088,6 +1135,11 @@ void main()
         {
             ApplyStringChange(queued);
         }
+
+        // A string target that was unreachable when the process started, or that has
+        // since dropped off the network, is retried here rather than being a reason for
+        // the whole service - and the LED matrix with it - to be down.
+        RetryStringSender();
 
         // Consume any pending text notification from the web UI/API.
         ApplyPendingNotification();
@@ -1316,6 +1368,11 @@ void main()
         {
             ApplyStringChange(queued);
         }
+
+        // A string target that was unreachable when the process started, or that has
+        // since dropped off the network, is retried here rather than being a reason for
+        // the whole service - and the LED matrix with it - to be down.
+        RetryStringSender();
 
         // Consume any pending text notification from the web UI/API.
         ApplyPendingNotification();
