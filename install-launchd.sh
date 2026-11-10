@@ -46,6 +46,10 @@ PARAMS=(
   # reflector in the path. That is a promise about the controller's lease, so it
   # should get a DHCP reservation (or a static address on the device itself).
   --matrix2-ip 192.168.2.186
+  # Universe 1 — what the panel listens on by default. Universe numbers are
+  # per-destination: the main matrix (1–4) and the string (1) are other hosts,
+  # so neither sees this panel's packets and the overlap is harmless.
+  --matrix2-universe 1
   --audio
   --loopback 0
   --fps 30
