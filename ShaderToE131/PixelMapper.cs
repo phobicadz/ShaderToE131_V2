@@ -37,22 +37,27 @@ public static class PixelMapper
     /// Fill the E.1.31 buffer from a shader framebuffer (width×height RGBA array).
     /// </summary>
     public static void MapFrame(ReadOnlySpan<byte> framebuffer, Span<byte> e131Buffer)
+        => MapFrame(framebuffer, Width, Height, e131Buffer);
+
+    /// <summary>
+    /// Fill the E.1.31 buffer from a framebuffer of an arbitrary size, in the same
+    /// straight raster layout. Used by outputs that render natively at their own
+    /// resolution (e.g. the second matrix) instead of sampling this matrix.
+    /// </summary>
+    public static void MapFrame(ReadOnlySpan<byte> framebuffer, int width, int height, Span<byte> e131Buffer)
     {
         // Clear buffer
         e131Buffer.Fill(0);
 
-        for (int y = 0; y < Height; y++)
+        // Map only whole RGB triples that fit in both buffers.
+        int pixels = Math.Min(width * height, e131Buffer.Length / 3);
+        for (int i = 0; i < pixels; i++)
         {
-            for (int x = 0; x < Width; x++)
-            {
-                int srcIdx = (y * Width + x) * 4; // RGBA in framebuffer
-                int rCh, gCh, bCh;
-                (rCh, gCh, bCh) = ToRgbChannels(x, y);
-
-                e131Buffer[rCh] = framebuffer[srcIdx];     // R
-                e131Buffer[gCh] = framebuffer[srcIdx + 1]; // G
-                e131Buffer[bCh] = framebuffer[srcIdx + 2]; // B
-            }
+            int srcIdx = i * 4;   // RGBA in framebuffer
+            int dstIdx = i * 3;   // RGB in E.1.31 buffer
+            e131Buffer[dstIdx]     = framebuffer[srcIdx];     // R
+            e131Buffer[dstIdx + 1] = framebuffer[srcIdx + 1]; // G
+            e131Buffer[dstIdx + 2] = framebuffer[srcIdx + 2]; // B
         }
     }
 

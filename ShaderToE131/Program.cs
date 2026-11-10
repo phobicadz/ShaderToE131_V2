@@ -94,6 +94,32 @@ class Program : IDisposable
     // thread, so a change arriving between a read and clear is never lost.
     private readonly System.Collections.Concurrent.ConcurrentQueue<WebServer.StringConfigChange> _pendingStringChanges = new();
 
+    // ─── Second LED matrix (parallel output) ───
+    // The same shader rendered a second time at the second matrix's own resolution
+    // and aspect ratio (its own GL program), sent to its own unicast target at its
+    // own frame rate. Default target shape: 32×24 at 30 fps.
+    private bool _matrix2Enabled = false;
+    private string? _matrix2Ip = null;          // required with --matrix2
+    private int _matrix2W = 32;
+    private int _matrix2H = 24;
+    private int _matrix2Universe = 0;           // 0 = auto (after the matrix's and the string's universes)
+    private int _matrix2Fps = 30;               // this output's own send pacing
+    private E131Sender? _matrix2Sender;
+    private ShaderProgram? _shaderProgram2;
+    private byte[] _matrix2FrameBuffer = Array.Empty<byte>();
+    private byte[] _matrix2E131Buffer = Array.Empty<byte>();
+    private int _matrix2UniverseResolved;
+    private int _matrix2FramesSent;
+    private int _matrix2SendErrors;
+    private int _matrix2OffFramesRemaining;     // black frames left to send after turning off
+    private double _matrix2NextSendMs;
+    // Same "configured vs live" distinction as the LED string: an unreachable
+    // matrix-2 target is a disabled output with a retry timer, not a dead process.
+    private long _matrix2NextRetryMs;
+    // Last spectrum read this frame (ReadSpectrum drains the capture queue, so it
+    // may only be called once per frame); shared with the matrix-2 program.
+    private AudioCapture.SpectrumValues? _lastSpectrum;
+
     // ─── PC motherboard LEDs (standalone LED agent) ───
     // Mirrors the frame colour onto the RGB LEDs of another machine by streaming one colour
     // per frame to the LedAgent service running there. Off unless --led-agent is given.
@@ -127,18 +153,21 @@ class Program : IDisposable
         return string.Join("\n", missing);
     }
 
+    private string BuildFragmentShader(string rawSource)
+        => BuildFragmentShader(rawSource, PixelMapper.AspectRatio);
+
     /// <summary>
     /// Build the final GLSL fragment shader source.
     /// Wraps raw ShaderToy-style mainImage code with required boilerplate,
     /// or returns the built-in default if no custom shader was provided.
     /// </summary>
-    private string BuildFragmentShader(string rawSource)
+    private string BuildFragmentShader(string rawSource, float aspectRatio)
     {
         // "built-in default" arrives from the control front-ends as a token; expand it here,
         // where the built-in source is visible, so the normal wrapping rules still apply.
         if (rawSource == WebServer.BuiltInShaderToken)
             rawSource = DefaultFragmentShader;
-        string arValue = PixelMapper.AspectRatio.ToString();
+        string arValue = aspectRatio.ToString();
 
         // A shader is "complete" only if it provides its own entry point (void main()).
         // ShaderToy-style shaders define mainImage(...) and rely on us adding void main().
@@ -314,6 +343,23 @@ void main()
                 prog._stringIp = args[++i];
             else if (args[i] == "--string-universe" && i + 1 < args.Length && int.TryParse(args[++i], out var su))
                 prog._stringUniverse = su;
+            else if (args[i] == "--matrix2") { prog._matrix2Enabled = true; }
+            else if (args[i] == "--matrix2-ip" && i + 1 < args.Length)
+                prog._matrix2Ip = args[++i];
+            else if (args[i] == "--matrix2-size" && i + 1 < args.Length)
+            {
+                if (!TryParseMatrixSize(args[++i], out int m2w, out int m2h))
+                {
+                    Console.WriteLine($"[ERROR] --matrix2-size expects \"WxH\" (e.g. 32x24), got '{args[i]}'.");
+                    return;
+                }
+                prog._matrix2W = m2w;
+                prog._matrix2H = m2h;
+            }
+            else if (args[i] == "--matrix2-universe" && i + 1 < args.Length && int.TryParse(args[++i], out var mu))
+                prog._matrix2Universe = mu;
+            else if (args[i] == "--matrix2-fps" && i + 1 < args.Length && int.TryParse(args[++i], out var mfps))
+                prog._matrix2Fps = mfps;
             else if (args[i] == "--text-overlay") { prog._textOverlay = true; }
             else if (args[i] == "--text-shadow" && i + 1 < args.Length && int.TryParse(args[++i], out var ts))
                 prog._textShadow = Math.Clamp(ts, 0, TextRenderer.MaxShadowSpread);
@@ -354,6 +400,11 @@ void main()
             Console.WriteLine("  --string-row <y>       Matrix row to sample the string from (default: center row)");
             Console.WriteLine("  --string-ip <ip|host>  Target IP or hostname for the string (default: same as matrix)");
             Console.WriteLine("  --string-universe <n>  Universe for the string (default: first after the matrix's universes)");
+            Console.WriteLine("  --matrix2              Also stream the shader to a second LED matrix in parallel (its own GL program at its own resolution/aspect)");
+            Console.WriteLine("  --matrix2-ip <ip|host> Target IP or hostname for the second matrix (required with --matrix2)");
+            Console.WriteLine("  --matrix2-size <WxH>   Second matrix dimensions, e.g. 32x24 (default: 32x24)");
+            Console.WriteLine("  --matrix2-universe <n> Universe for the second matrix (default: first after the matrix's and the string's universes)");
+            Console.WriteLine("  --matrix2-fps <n>      Send rate for the second matrix (default: 30; 0 = uncapped). Independent of --fps, which paces the render loop itself — set --fps to at least --matrix2-fps if you want both aligned and CPU-capped");
             Console.WriteLine("  --fps <n>            Cap the output rate (matrix + string); headless mode paces its render loop to it. Default: uncapped");
             Console.WriteLine("  --text-overlay       Default banner style: draw text over the shader (with a black outline around the strokes) instead of blanking a band across it. Per-message \"overlay\" overrides it");
             Console.WriteLine("  --text-shadow <0-3>  Width of that outline (1 = 1px halo, 2 = 2px halo, 0 = none). Default: 1. Only applies to overlay banners");
@@ -376,6 +427,19 @@ void main()
         }
 
         prog.Run();
+    }
+
+    /// <summary>
+    /// Parse a \"WxH\" matrix size (e.g. \"32x24\", case-insensitive). Both dimensions
+    /// must be positive and bounded so W×H cannot overflow int before validation.
+    /// </summary>
+    private static bool TryParseMatrixSize(string text, out int width, out int height)
+    {
+        width = height = 0;
+        var parts = text.Split('x', 'X');
+        return parts.Length == 2
+            && int.TryParse(parts[0], out width) && int.TryParse(parts[1], out height)
+            && width >= 1 && width <= 4096 && height >= 1 && height <= 4096;
     }
 
     /// <summary>
@@ -463,6 +527,40 @@ void main()
                 return;
             }
             Console.WriteLine($"  String: {_stringSize} LEDs, row={_stringRowResolved}, universe={_stringUniverseResolved}, target={_stringIp ?? TargetIp}");
+        }
+
+        // Resolve second matrix settings (if enabled)
+        if (_matrix2Enabled)
+        {
+            if (string.IsNullOrWhiteSpace(_matrix2Ip))
+            {
+                Console.WriteLine("[ERROR] --matrix2 needs a target: --matrix2-ip <ip|host>");
+                return;
+            }
+            if ((long)_matrix2W * _matrix2H > int.MaxValue)
+            {
+                Console.WriteLine($"[ERROR] --matrix2-size {_matrix2W}x{_matrix2H} is too large.");
+                return;
+            }
+            int matrixUniverses = (PixelMapper.TotalChannels + 509) / 510; // 4 for the 53×11 matrix
+            int nextUniverse = UniverseId + matrixUniverses;
+            if (_stringEnabled)
+                nextUniverse += (int)StringOutput.UniversesRequired(_stringSize);
+            int baseUniverse = _matrix2Universe > 0 ? _matrix2Universe : nextUniverse;
+
+            int ledCount = _matrix2W * _matrix2H;
+            string? error = StringOutput.Validate(ledCount, baseUniverse, "--matrix2-size", "--matrix2-universe");
+            if (error != null)
+            {
+                Console.WriteLine($"[ERROR] {error}");
+                return;
+            }
+            _matrix2UniverseResolved = baseUniverse;
+            _matrix2FrameBuffer = new byte[ledCount * 4];
+            _matrix2E131Buffer = new byte[ledCount * 3];
+            long universes = StringOutput.UniversesRequired(ledCount);
+            string universeRange = universes > 1 ? $"..{baseUniverse + universes - 1}" : "";
+            Console.WriteLine($"  Matrix 2: {_matrix2W}×{_matrix2H} ({ledCount} pixels) → {_matrix2Ip}:5568 (unicast, universe={baseUniverse}{universeRange}, {(_matrix2Fps > 0 ? _matrix2Fps.ToString() : "uncapped")} fps)");
         }
         Console.WriteLine();
 
@@ -633,6 +731,17 @@ void main()
                 _ledAgentPort,
                 _ledAgentMode.ToString().ToLowerInvariant()
             );
+            _webServer.GetLiveMatrix2 = () => !_matrix2Enabled ? null : new WebServer.Matrix2Info(
+                true,
+                _matrix2Sender != null,
+                _matrix2W,
+                _matrix2H,
+                _matrix2Ip,
+                _matrix2UniverseResolved,
+                _matrix2Fps,
+                _matrix2FramesSent,
+                _matrix2SendErrors
+            );
             _webServer.Start();
         }
 
@@ -667,6 +776,14 @@ void main()
             string strIp = _stringIp ?? TargetIp;
             if (TryCreateStringSender(strIp, "[WARN]"))
                 Console.WriteLine($"LED string sender initialized ({_stringSize} LEDs → {strIp}:5568, universe={_stringUniverseResolved}).");
+        }
+
+        // Second matrix: same "an absent controller is a disabled output, not a fatal
+        // error" rule as the string — one unreachable target must not take the matrix down.
+        if (_matrix2Enabled)
+        {
+            if (TryCreateMatrix2Sender(_matrix2Ip!, "[WARN]"))
+                Console.WriteLine($"Matrix 2 sender initialized ({_matrix2W}×{_matrix2H} → {_matrix2Ip}:5568, universe={_matrix2UniverseResolved}).");
         }
 
         // PC motherboard LEDs via the standalone LED agent service. The client owns its own
@@ -764,6 +881,116 @@ void main()
         string fragShader = BuildFragmentShader(_shaderSource!);
         _shaderProgram = new ShaderProgram(_gl, fragShader, MatW, MatH, _window, _audioEnabled);
         Console.WriteLine($"[Reload] Shader program created.");
+        CreateMatrix2Program();
+    }
+
+    /// <summary>
+    /// Build the matrix-2 ShaderProgram: the same shader source, but compiled for the
+    /// second matrix's own resolution — its vertex shader and u_resolution use its
+    /// dimensions, so it renders natively instead of resampling the main framebuffer.
+    /// </summary>
+    private unsafe void CreateMatrix2Program()
+    {
+        if (!_matrix2Enabled || _gl == null || _window == null || _shaderSource == null) return;
+        _shaderProgram2?.Dispose();
+        string fragShader = BuildFragmentShader(_shaderSource, _matrix2W / (float)_matrix2H);
+        _shaderProgram2 = new ShaderProgram(_gl, fragShader, _matrix2W, _matrix2H, _window, _audioEnabled);
+        Console.WriteLine($"[Matrix2] Shader program created ({_matrix2W}x{_matrix2H}).");
+    }
+
+    /// <summary>
+    /// Dispose the matrix-2 program with the main one (Off, or before a recompile).
+    /// </summary>
+    private void DisposeMatrix2Program()
+    {
+        _shaderProgram2?.Dispose();
+        _shaderProgram2 = null;
+    }
+
+    /// <summary>
+    /// Build the matrix-2 sender, or report why it cannot be built and when it will
+    /// be tried again. Same disabled-output-not-fatal-error rule as the string.
+    /// </summary>
+    private bool TryCreateMatrix2Sender(string matrix2Ip, string logPrefix)
+    {
+        if (!StringOutput.TryCreateSender(matrix2Ip, 5568, out var sender, out string? failure))
+        {
+            _matrix2NextRetryMs = Environment.TickCount64 + (long)StringRetryDelay.TotalMilliseconds;
+            Console.WriteLine($"{logPrefix} Matrix 2 target '{matrix2Ip}' unavailable ({failure}); "
+                + $"matrix 2 output disabled until it resolves again, retrying in "
+                + $"{(int)StringRetryDelay.TotalSeconds}s.");
+            return false;
+        }
+
+        _matrix2Sender?.Dispose();
+        _matrix2Sender = sender;
+        _matrix2NextRetryMs = 0;
+        return true;
+    }
+
+    /// <summary>
+    /// Retry a configured-but-unreachable matrix-2 target on the render thread, only
+    /// while the configuration still asks for it. Mirrors RetryStringSender.
+    /// </summary>
+    private void RetryMatrix2Sender()
+    {
+        if (!_matrix2Enabled || _matrix2Sender != null) return;
+        if (Environment.TickCount64 < _matrix2NextRetryMs) return;
+        if (string.IsNullOrWhiteSpace(_matrix2Ip)) return;
+
+        if (TryCreateMatrix2Sender(_matrix2Ip, "[Matrix2]"))
+            Console.WriteLine($"[Matrix2] Matrix 2 target '{_matrix2Ip}' resolved again "
+                + $"({_matrix2W}×{_matrix2H} → {_matrix2Ip}:5568, universe={_matrix2UniverseResolved}).");
+    }
+
+    /// <summary>
+    /// True when a matrix-2 frame is due. Same fixed-interval deadline logic as
+    /// SendDue(), but its own rate (--matrix2-fps, default 30) and its own cursor,
+    /// so the main matrix's rate — uncapped or --fps — does not decide when this
+    /// output transmits.
+    /// </summary>
+    private bool Matrix2SendDue()
+    {
+        if (_matrix2Fps <= 0) return true;
+
+        double now = Environment.TickCount64;
+        double interval = 1000.0 / _matrix2Fps;
+        if (now < _matrix2NextSendMs) return false;
+        _matrix2NextSendMs = (now - _matrix2NextSendMs > interval) ? now : _matrix2NextSendMs + interval;
+        return true;
+    }
+
+    /// <summary>Black-frame burst for matrix 2, paced by Matrix2SendDue().</summary>
+    private bool Matrix2OffBurstDue()
+    {
+        if (_matrix2OffFramesRemaining <= 0) return false;
+        _matrix2OffFramesRemaining--;
+        return true;
+    }
+
+    /// <summary>
+    /// Render the current shader at matrix 2's own resolution into its framebuffer
+    /// and map it to its E.1.31 buffer (straight raster). Like the LED string, it
+    /// mirrors the shader only — a notification banner never appears on it. Called
+    /// before the banner is drawn on the main framebuffer.
+    /// </summary>
+    private unsafe void RenderMatrix2(bool isOff)
+    {
+        if (_matrix2Sender == null) return;
+
+        if (isOff || _shaderProgram2 == null)
+        {
+            Array.Clear(_matrix2FrameBuffer);
+        }
+        else
+        {
+            // Bind program 2 before setting audio uniforms: uniform values apply to
+            // whichever program is current at the call.
+            _shaderProgram2.Use(_gl!);
+            if (_lastSpectrum is { } spectrum) _shaderProgram2.SetAudioValues(spectrum);
+            _shaderProgram2.Render(_gl!, _matrix2W, _matrix2H, _matrix2FrameBuffer);
+        }
+        PixelMapper.MapFrame(_matrix2FrameBuffer.AsSpan(), _matrix2W, _matrix2H, _matrix2E131Buffer.AsSpan());
     }
 
     private unsafe void OnLoad()
@@ -783,6 +1010,7 @@ void main()
             string fragShader = BuildFragmentShader(_shaderSource!);
             _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
             Console.WriteLine("Shader program created.");
+            CreateMatrix2Program();
         }
         // Disable VSync via wglSwapIntervalEXT
         try
@@ -953,6 +1181,7 @@ void main()
             string fragShader = BuildFragmentShader(_shaderSource!);
             _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
             Console.WriteLine("Shader program created.");
+            CreateMatrix2Program();
         }
     }
 
@@ -1083,7 +1312,11 @@ void main()
             _notifyText = null;
             // Off output: the controller still holds the banner. Re-arm the clear burst
             // so black frames are actually sent and the display clears.
-            if (_shaderProgram == null) _offFramesRemaining = OffClearFrames;
+            if (_shaderProgram == null)
+            {
+                _offFramesRemaining = OffClearFrames;
+                _matrix2OffFramesRemaining = OffClearFrames;
+            }
             Console.WriteLine("[Web] Notification cleared.");
             return;
         }
@@ -1107,7 +1340,11 @@ void main()
             _notifyText = null;
             // Same as the explicit clear path: re-arm the Off clear burst so the
             // banner is replaced by black frames on the controller.
-            if (_shaderProgram == null) _offFramesRemaining = OffClearFrames;
+            if (_shaderProgram == null)
+            {
+                _offFramesRemaining = OffClearFrames;
+                _matrix2OffFramesRemaining = OffClearFrames;
+            }
             return;
         }
         TextRenderer.DrawBanner(_frameBuffer.AsSpan(), MatW, MatH, _notifyText, nowMs - _notifyStartMs, _notifyOverlay, _textShadow);
@@ -1160,6 +1397,7 @@ void main()
             _shaderProgram?.Dispose();
             _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
             Console.WriteLine($"[Web] Shader changed: {newName ?? "unknown"}");
+            CreateMatrix2Program();
 
             // Reinitialize audio capture with current loopback device index if enabled
             if (_audioEnabled && _audioSource == AudioCapture.AudioSource.Loopback)
@@ -1193,6 +1431,11 @@ void main()
 
         if (_sender == null) return;
 
+        // A matrix-2 target that was unreachable when the process started, or that has
+        // since dropped off the network, is retried here rather than being a reason for
+        // the whole service - and the LED matrix with it - to be down.
+        RetryMatrix2Sender();
+
         // ─── Pending shader swap from web server (main-thread GL work) ───
         // No program means the output is blank — keep sending black frames. Returning
         // early here would stop sending entirely and the controller holds its last lit frame.
@@ -1207,6 +1450,8 @@ void main()
             _currentShaderFileName = "Off";
             _isOff = true;
             _offFramesRemaining = OffClearFrames;
+            DisposeMatrix2Program();
+            _matrix2OffFramesRemaining = OffClearFrames;
         }
 
         // Update web server status (with live stats)
@@ -1251,6 +1496,7 @@ void main()
         {
             var spectrum = _audioCapture.ReadSpectrum();
             _shaderProgram?.SetAudioValues(spectrum);
+            _lastSpectrum = spectrum; // shared with the matrix-2 program; ReadSpectrum drains once per frame
             if (++_audioDebugCount % 60 == 0)
                 Console.WriteLine($"[Audio] bass={spectrum.Bass:F3} lowmid={spectrum.LowMid:F3} mid={spectrum.Mid:F3} highmid={spectrum.HighMid:F3} treble={spectrum.Treble:F3} vol={spectrum.Volume:F3}");
         }
@@ -1267,8 +1513,10 @@ void main()
         }
 
         // Burst spent and output off: idle the loop. Spinning it at full speed doing
-        // nothing is why "off" cost as much CPU as a running shader.
-        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null)
+        // nothing is why "off" cost as much CPU as a running shader. Matrix 2's own
+        // black-frame burst must finish before the loop goes quiet, or those frames
+        // would never be sent.
+        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null && _matrix2OffFramesRemaining <= 0)
         {
             Thread.Sleep(OffIdleSleepMs);
             return;
@@ -1283,6 +1531,9 @@ void main()
         {
             _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
         }
+
+        // Matrix 2: the same shader at its own resolution, mapped to its own buffer.
+        RenderMatrix2(_isOff);
 
         // Map the LED string row from the framebuffer BEFORE the banner is drawn: the string mirrors
         // the shader, so a notification never appears on it. Done every rendered frame; the send below
@@ -1333,15 +1584,35 @@ void main()
 
             _frameCount++;
         }
+
+        // Matrix 2 sends on its own pacing (--matrix2-fps, default 30): the main
+        // matrix's rate — uncapped or --fps — does not decide when this output
+        // transmits. Matrix2SendDue() first: its Off burst may only spend frames
+        // on slots that actually send.
+        if (_matrix2Sender != null && Matrix2SendDue() && (!_isOff || Matrix2OffBurstDue()))
+        {
+            try
+            {
+                _matrix2Sender.SendFrameMultiUniverse(_matrix2E131Buffer, (ushort)_matrix2UniverseResolved);
+                _matrix2FramesSent++;
+            }
+            catch (Exception ex)
+            {
+                _matrix2SendErrors++;
+                Console.WriteLine($"[Matrix2] Send failed: {ex.Message}");
+            }
+        }
+
         long nowMs = Environment.TickCount64;
-        if (nowMs - _lastStatusLogMs >= 1000 && (!_isOff || _offFramesRemaining > 0))
+        if (nowMs - _lastStatusLogMs >= 1000 && (!_isOff || _offFramesRemaining > 0 || _matrix2OffFramesRemaining > 0))
         {
             int r = _e131Buffer.Length > 0 ? _e131Buffer[0] : 0;
             int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;
             int b = _e131Buffer.Length > 2 ? _e131Buffer[2] : 0;
             string strStats = _stringSender != null ? $" | stringSent={_stringFramesSent} | stringErr={_stringSendErrors}" : "";
             string agentStats = _ledAgent != null ? $" | ledAgent={(_ledAgent.Connected ? "on" : "down")} sent={_ledAgent.FramesSent} err={_ledAgent.SendErrors}" : "";
-            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}{strStats}{agentStats}");
+            string m2Stats = _matrix2Sender != null ? $" | matrix2Sent={_matrix2FramesSent} matrix2Err={_matrix2SendErrors}" : "";
+            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}{strStats}{agentStats}{m2Stats}");
             _frameCount = 0;
             _lastStatusLogMs = nowMs;
         }
@@ -1393,9 +1664,15 @@ void main()
             _shaderProgram?.Dispose();
             _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
             Console.WriteLine($"[Web] Shader changed: {newName ?? "unknown"}");
+            CreateMatrix2Program();
         }
 
         if (_sender == null) return;
+
+        // A matrix-2 target that was unreachable when the process started, or that has
+        // since dropped off the network, is retried here rather than being a reason for
+        // the whole service - and the LED matrix with it - to be down.
+        RetryMatrix2Sender();
 
         // Check for pending shader change from web server (thread-safe polling)
         // No program means the output is blank — keep sending black frames. Returning
@@ -1411,6 +1688,8 @@ void main()
             _currentShaderFileName = "Off";
             _isOff = true;
             _offFramesRemaining = OffClearFrames;
+            DisposeMatrix2Program();
+            _matrix2OffFramesRemaining = OffClearFrames;
         }
 
         // Update web server status (with live stats)
@@ -1455,6 +1734,7 @@ void main()
         {
             var spectrum = _audioCapture.ReadSpectrum();
             _shaderProgram?.SetAudioValues(spectrum);
+            _lastSpectrum = spectrum; // shared with the matrix-2 program; ReadSpectrum drains once per frame
             if (++_audioDebugCount % 60 == 0)
                 Console.WriteLine($"[Audio] bass={spectrum.Bass:F3} lowmid={spectrum.LowMid:F3} mid={spectrum.Mid:F3} highmid={spectrum.HighMid:F3} treble={spectrum.Treble:F3} vol={spectrum.Volume:F3}");
         }
@@ -1471,8 +1751,10 @@ void main()
         }
 
         // Burst spent and output off: idle the loop. Spinning it at full speed doing
-        // nothing is why "off" cost as much CPU as a running shader.
-        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null)
+        // nothing is why "off" cost as much CPU as a running shader. Matrix 2's own
+        // black-frame burst must finish before the loop goes quiet, or those frames
+        // would never be sent.
+        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null && _matrix2OffFramesRemaining <= 0)
         {
             Thread.Sleep(OffIdleSleepMs);
             return;
@@ -1489,6 +1771,9 @@ void main()
             _shaderProgram.Render(_gl!, MatW, MatH, _frameBuffer);
             _probeDrawMs += _phaseSw.Elapsed.TotalMilliseconds;
         }
+
+        // Matrix 2: the same shader at its own resolution, mapped to its own buffer.
+        RenderMatrix2(_isOff);
 
         // Map the LED string row from the framebuffer BEFORE the banner is drawn: the string mirrors
         // the shader, so a notification never appears on it. Done every rendered frame; the send below
@@ -1543,15 +1828,35 @@ void main()
 
             _frameCount++;
         }
+
+        // Matrix 2 sends on its own pacing (--matrix2-fps, default 30): the main
+        // matrix's rate — uncapped or --fps — does not decide when this output
+        // transmits. Matrix2SendDue() first: its Off burst may only spend frames
+        // on slots that actually send.
+        if (_matrix2Sender != null && Matrix2SendDue() && (!_isOff || Matrix2OffBurstDue()))
+        {
+            try
+            {
+                _matrix2Sender.SendFrameMultiUniverse(_matrix2E131Buffer, (ushort)_matrix2UniverseResolved);
+                _matrix2FramesSent++;
+            }
+            catch (Exception ex)
+            {
+                _matrix2SendErrors++;
+                Console.WriteLine($"[Matrix2] Send failed: {ex.Message}");
+            }
+        }
+
         long nowMs = Environment.TickCount64;
-        if (nowMs - _lastStatusLogMs >= 2000 && (!_isOff || _offFramesRemaining > 0))
+        if (nowMs - _lastStatusLogMs >= 2000 && (!_isOff || _offFramesRemaining > 0 || _matrix2OffFramesRemaining > 0))
         {
             int r = _e131Buffer.Length > 0 ? _e131Buffer[0] : 0;
             int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;
             int b = _e131Buffer.Length > 2 ? _e131Buffer[2] : 0;
             string strStats = _stringSender != null ? $" | stringSent={_stringFramesSent} | stringErr={_stringSendErrors}" : "";
             string agentStats = _ledAgent != null ? $" | ledAgent={(_ledAgent.Connected ? "on" : "down")} sent={_ledAgent.FramesSent} err={_ledAgent.SendErrors}" : "";
-            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/2s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}{strStats}{agentStats}");
+            string m2Stats = _matrix2Sender != null ? $" | matrix2Sent={_matrix2FramesSent} matrix2Err={_matrix2SendErrors}" : "";
+            Console.WriteLine($"[E1.31] Sending to {TargetIp}:5568 uni={UniverseId} | fps~{_frameCount}/2s | sent={_framesSent} | errors={_sendErrors} | firstRGB={r},{g},{b}{strStats}{agentStats}{m2Stats}");
             _frameCount = 0;
             _lastStatusLogMs = nowMs;
         }
@@ -1572,11 +1877,13 @@ void main()
         _audioCapture?.Dispose();
         _sender?.Dispose();
         _stringSender?.Dispose();
+        _matrix2Sender?.Dispose();
         _ledAgent?.Dispose();
-        // Dispose the shader program before the window: its GL deletion calls
+        // Dispose the shader programs before the window: their GL deletion calls
         // (DeleteProgram, DeleteTexture, DeleteBuffer, DeleteVertexArray, ...)
         // require a live GL context, which the window owns.
         _shaderProgram?.Dispose();
+        _shaderProgram2?.Dispose();
         _window?.Dispose();
     }
 }
@@ -1736,6 +2043,13 @@ void main(){ fragColor = texture(tex, UV); }";
             Console.WriteLine($"Compile failed ({type}): {gl.GetShaderInfoLog(shader)}");
         return shader;
     }
+
+    /// <summary>
+    /// Bind this program as current, so uniform calls made before Render target
+    /// it (a second output's audio uniforms, for example) rather than whichever
+    /// program was bound from the previous frame.
+    /// </summary>
+    public void Use(GL gl) => gl.UseProgram(_program);
 
     public void SetUniform(string name, float value)
     {

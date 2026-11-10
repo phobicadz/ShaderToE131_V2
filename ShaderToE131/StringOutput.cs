@@ -33,16 +33,24 @@ internal static class StringOutput
     /// Returns a human-readable error message, or null if the settings are valid.
     /// </summary>
     public static string? Validate(int ledCount, int baseUniverse)
+        => Validate(ledCount, baseUniverse, "--string-size", "--string-universe");
+
+    /// <summary>
+    /// Same validation for any parallel output; the flag names only appear in the
+    /// error messages so each output can report the flag the user actually typed
+    /// (--string-size vs --matrix2-size).
+    /// </summary>
+    public static string? Validate(int ledCount, int baseUniverse, string sizeFlag, string universeFlag)
     {
         if (ledCount < 1)
-            return $"--string-size must be >= 1 (got {ledCount}).";
+            return $"{sizeFlag} must be >= 1 (got {ledCount}).";
 
         long universes = UniversesRequired(ledCount);
         long lastUniverse = (long)baseUniverse + universes - 1;
         if (baseUniverse < MinUniverse || baseUniverse > MaxUniverse)
-            return $"--string-universe must be {MinUniverse}..{MaxUniverse} (got {baseUniverse}).";
+            return $"{universeFlag} must be {MinUniverse}..{MaxUniverse} (got {baseUniverse}).";
         if (lastUniverse > MaxUniverse)
-            return $"--string-size {ledCount} needs {universes} universes starting at {baseUniverse} (last universe {lastUniverse}), but universes are limited to {MinUniverse}..{MaxUniverse}; use a smaller --string-size or a lower --string-universe.";
+            return $"{sizeFlag} {ledCount} needs {universes} universes starting at {baseUniverse} (last universe {lastUniverse}), but universes are limited to {MinUniverse}..{MaxUniverse}; use a smaller {sizeFlag} or a lower {universeFlag}.";
         return null;
     }
 

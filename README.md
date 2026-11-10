@@ -13,6 +13,7 @@ ShaderToE131 takes [ShaderToy-style](https://www.shadertoy.com/) GLSL shaders (`
 - 🌐 **Web control panel** — select shaders, switch audio source/devices, configure the LED string, and view live status — all without restarting
 - 📡 **E.1.31/sACN output** — UDP multicast/unicast to LED matrix controllers (4 universes: 583 pixels × 3 channels = 1749 DMX slots)
 - 🧵 **Optional LED string output** — stream a separate N-LED string (default 50) in parallel with the matrix, mirroring a matrix row
+- 🔲 **Optional second matrix output** — render the same shader natively at another matrix's own resolution (default 32×24) and send it to its own unicast target at its own frame rate (default 30 fps)
 - 🎭 **Demo mode** — auto-cycle through all shaders in directory
 - 🔇 **"Off" blank** — dispose shader program to stop GPU rendering entirely
 
@@ -108,6 +109,13 @@ dotnet run --string
 # 100-LED string on a different controller, universe 7, sampled from matrix row 2
 dotnet run --string --string-size 100 --string-ip 192.168.2.151 --string-universe 7 --string-row 2
 
+# Also stream the shader to a second 32×24 matrix at 30 fps (its own GL program,
+# its own unicast target; 32×24 is the default so --matrix2-size can be omitted)
+dotnet run --matrix2 --matrix2-ip 192.168.2.151
+
+# A differently-shaped second matrix, explicit universe, its own uncapped rate
+dotnet run --matrix2 --matrix2-ip panel.local --matrix2-size 48x16 --matrix2-universe 20 --matrix2-fps 0
+
 # List available audio devices and exit
 dotnet run --list-devices
 
@@ -135,6 +143,11 @@ dotnet run --help
 | `--string-row <y>` | Matrix row to sample the string from (default: center row) |
 | `--string-ip <ip\|host>` | Target IP or hostname (e.g. `ledstring.local`) for the string (default: same as matrix) |
 | `--string-universe <n>` | Universe for the string (default: first after the matrix's universes) |
+| `--matrix2` | Also stream the shader to a second LED matrix in parallel. Unlike the string (which samples a matrix row), the shader is compiled and rendered a second time at the second matrix's own resolution and aspect ratio — no resampling, no distortion |
+| `--matrix2-ip <ip\|host>` | Target IP or hostname for the second matrix (**required** with `--matrix2`; mDNS names are resolved with the same retry-on-failure behaviour as the string) |
+| `--matrix2-size <WxH>` | Second matrix dimensions, e.g. `32x24` (default: `32x24` → 768 pixels → 2304 slots → 5 universes) |
+| `--matrix2-universe <n>` | Universe for the second matrix (default: first after the matrix's and the string's universes) |
+| `--matrix2-fps <n>` | Send rate for the second matrix (default: `30`; `0` = uncapped). Independent of `--fps`: the main matrix's rate never decides when the second matrix transmits. Note the headless render loop itself is paced only by `--fps` — pass `--fps` at or above `--matrix2-fps` if you want both outputs frame-aligned and the loop CPU-capped |
 | `--fps <n>` | Cap the output rate for matrix + string (default: uncapped). Use `30`–`60` for typical pixel controllers — sending 4 universes per frame at thousands of fps overruns their refresh rate and drops frames. In headless mode the whole render loop is paced to this rate, so it also caps CPU use |
 | `--text-overlay` | Default banner style: draw text over the shader (with a black halo around the strokes) instead of blanking a black band across it. A per-message `overlay` field overrides it |
 | `--text-shadow <0-3>` | Width of that halo: 1 = 1 px outline, 2 = 2 px, 0 = none. Default 1. Only applies to overlay banners |
@@ -154,7 +167,7 @@ These are the parameters this instance runs with as a Windows service (Servy ser
 `ShaderToE131`, started automatically at boot):
 
 ```bash
---no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30 --mqtt 192.168.2.11
+--no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30 --matrix2 --matrix2-ip macm2.mancave --mqtt 192.168.2.11
 ```
 
 | Flag | Why |
@@ -165,11 +178,13 @@ These are the parameters this instance runs with as a Windows service (Servy ser
 | `--string-ip ledstring.local` | String controller host (resolves to `192.168.3.18`) |
 | `--string-universe 1` | Universe for the string. Same number as the matrix is safe — the two targets are different hosts, so neither sees the other's packets |
 | `--audio --loopback 0` | Capture system playback (the default render endpoint) instead of a microphone. Works under the LocalSystem service account; the active device is reported as `loopbackDeviceName` in `/api/status` |
-| `--fps 30` | Caps matrix + string output to 30 fps, which matches the controllers' refresh rate and keeps headless CPU use low |
+| `--fps 30` | Caps matrix + string output to 30 fps, which matches the controllers' refresh rate and keeps headless CPU use low. It also paces the render loop, so the second matrix's 30 fps cap is met exactly and both outputs stay frame-aligned |
+| `--matrix2 --matrix2-ip macm2.mancave` | Streams the same shader natively at 32×24 (the default `--matrix2-size`) to `macm2.mancave` (`192.168.2.2`) at its default 30 fps cap. The name lives on the `.2` VLAN — the same one the Windows host, the main matrix and the broker are on — so it resolves without a cross-VLAN mDNS reflector, unlike the string's `.3` name |
 | `--mqtt 192.168.2.11` | Mosquitto on `pi5.mancave` (`~/docker/pi5/mosquitto`). Publishes Home Assistant discovery so the matrix is a `light` plus a `select` of shaders |
 
 Defaults left alone: `--web-port 8080` (control panel on `0.0.0.0`), `--string-size 50`,
-`--string-row` = center row.
+`--string-row` = center row, `--matrix2-size 32x24`, `--matrix2-fps 30`, and the auto universe
+range for the second matrix (universes 6–10: after the main matrix's 1–4 and the string's one).
 
 > Note: the built-in default shader does not reference the audio uniforms, so the log shows
 > `[Audio] WARNING: Some audio uniforms not found in shader program` and the band values stay at
@@ -182,7 +197,7 @@ Defaults left alone: `--web-port 8080` (control panel on `0.0.0.0`), `--string-s
 Install-ServyService -Name ShaderToE131 -DisplayName 'ShaderToE131 E1.31 Server' -Quiet `
     -Path 'C:\Users\Chamb\source\repos\ShaderToE131_V2\publish\ShaderToE131.exe' `
     -StartupDir 'C:\Users\Chamb\source\repos\ShaderToE131_V2\publish' `
-    -Params '--no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30 --mqtt 192.168.2.11' `
+    -Params '--no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30 --matrix2 --matrix2-ip macm2.mancave --mqtt 192.168.2.11' `
     -StartupType Automatic `
     -Stdout 'C:\ProgramData\Servy\logs\ShaderToE131-stdout.log' `
     -Stderr 'C:\ProgramData\Servy\logs\ShaderToE131-stderr.log'
@@ -316,6 +331,7 @@ http://localhost:<port>
 | `/api/set-audio-device` | POST | Select loopback device by index | `{"ok": true/false}` |
 | `/api/set-string` | POST | Configure LED string: `{enabled, size, row, ip, universe}` (omit fields to keep current values; `ip` accepts an IP or a hostname, e.g. `ledstring.local`; `ip: ""` resets to the matrix IP; `universe: 0` = auto) | `{"ok": true/false}` |
 | `/api/string-config` | GET | Current LED string config + live stats | JSON object (see below) |
+| `/api/matrix2` | GET | Live second-matrix output state: `{enabled, active, width, height, ip, universe, fps, framesSent, sendErrors}` (`{"enabled": false}` when `--matrix2` is off; `active: false` = configured but the target currently cannot be resolved) | JSON object |
 | `/api/led-agent` | GET | Live LED agent link state (`{"enabled": false}` when `--led-agent` is off) | JSON object (see "LED Agent") |
 | `/api/status` | GET | Get current status and stats | JSON object (see below) |
 
@@ -340,7 +356,8 @@ Text limits: 5×7 ASCII bitmap font (200 characters max, unsupported characters 
 12 px/s, which needs about 5 s to cross the panel.
 
 The LED string is sampled from the framebuffer **before** the banner is drawn, so text always appears
-on the matrix only — the string keeps mirroring the shader.
+on the matrix only — the string keeps mirroring the shader. The second matrix (`--matrix2`) behaves
+the same way: it mirrors the shader (rendered at its own resolution), never the banner.
 
 #### Status Response
 

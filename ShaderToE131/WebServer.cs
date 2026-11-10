@@ -87,6 +87,7 @@ public sealed class WebServer : IDisposable
     // Test hook: post a notification as the /api/notify handler would.
     internal void SetPendingNotificationForTest(NotificationRequest request) => _pendingNotification = request;
     public Func<LiveStringState>? GetLiveStringState { get; set; }  // current string config + live stats
+    public Func<Matrix2Info?>? GetLiveMatrix2 { get; set; }        // current second-matrix config + live stats
     public Func<LedAgentInfo?>? GetLiveLedAgent { get; set; }       // live LED agent link state, null when disabled
 
     // Shader list is rebuilt into a NEW array and published with a single
@@ -156,6 +157,23 @@ public sealed class WebServer : IDisposable
         string Host,
         int Port,
         string Mode
+    );
+
+    /// <summary>
+    /// Live state of the second LED matrix output (--matrix2). 'Active' is whether it
+    /// currently has a sender — a configured target that cannot be resolved is a
+    /// disabled output with a retry timer, not a dead process.
+    /// </summary>
+    public record Matrix2Info(
+        bool Enabled,
+        bool Active,
+        int Width,
+        int Height,
+        string? Ip,
+        int Universe,   // resolved base universe
+        int Fps,        // this output's send cap (0 = uncapped)
+        int FramesSent,
+        int SendErrors
     );
 
     private static readonly JsonSerializerOptions JsonCamelCase = new()
@@ -439,6 +457,10 @@ public sealed class WebServer : IDisposable
                     break;
                 case "/api/led-agent":
                     if (method == "GET") ServeLedAgent(clientSocket);
+                    else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
+                    break;
+                case "/api/matrix2":
+                    if (method == "GET") ServeMatrix2(clientSocket);
                     else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
                     break;
                 default:
@@ -1557,6 +1579,22 @@ setInterval(refreshStatus, 2000);
     private void ServeLedAgent(Socket clientSocket)
     {
         var live = GetLiveLedAgent?.Invoke();
+        if (live == null)
+        {
+            SendJson(clientSocket, new { enabled = false });
+            return;
+        }
+        SendJson(clientSocket, live);
+    }
+
+    /// <summary>
+    /// Live state of the second matrix output (--matrix2): configured dimensions,
+    /// target, universe and send stats, straight from the render thread's fields.
+    /// {"enabled":false} when the output is off.
+    /// </summary>
+    private void ServeMatrix2(Socket clientSocket)
+    {
+        var live = GetLiveMatrix2?.Invoke();
         if (live == null)
         {
             SendJson(clientSocket, new { enabled = false });
