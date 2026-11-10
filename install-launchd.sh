@@ -41,11 +41,11 @@ PARAMS=(
   --string-ip 192.168.3.95
   --string-universe 1
   --matrix2
-  # The second matrix (32×24 at its default 30 fps cap) is driven by macm2 on the
-  # .2 VLAN — the same VLAN this Mac, the main matrix and the broker are on — so
-  # its mDNS name resolves directly here, with no reflector involved. Unlike the
-  # string's .3 name above, the name is the reliable thing to use.
-  --matrix2-ip macm2.mancave
+  # The 32×24 panel's controller, by address — same reasoning as the string above:
+  # a literal address is what the sender can always use, with no mDNS name or
+  # reflector in the path. That is a promise about the controller's lease, so it
+  # should get a DHCP reservation (or a static address on the device itself).
+  --matrix2-ip 192.168.2.186
   --audio
   --loopback 0
   --fps 30

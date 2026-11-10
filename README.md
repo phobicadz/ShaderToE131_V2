@@ -167,7 +167,7 @@ These are the parameters this instance runs with as a Windows service (Servy ser
 `ShaderToE131`, started automatically at boot):
 
 ```bash
---no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30 --matrix2 --matrix2-ip macm2.mancave --mqtt 192.168.2.11
+--no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30 --matrix2 --matrix2-ip 192.168.2.186 --mqtt 192.168.2.11
 ```
 
 | Flag | Why |
@@ -179,7 +179,7 @@ These are the parameters this instance runs with as a Windows service (Servy ser
 | `--string-universe 1` | Universe for the string. Same number as the matrix is safe — the two targets are different hosts, so neither sees the other's packets |
 | `--audio --loopback 0` | Capture system playback (the default render endpoint) instead of a microphone. Works under the LocalSystem service account; the active device is reported as `loopbackDeviceName` in `/api/status` |
 | `--fps 30` | Caps matrix + string output to 30 fps, which matches the controllers' refresh rate and keeps headless CPU use low. It also paces the render loop, so the second matrix's 30 fps cap is met exactly and both outputs stay frame-aligned |
-| `--matrix2 --matrix2-ip macm2.mancave` | Streams the same shader natively at 32×24 (the default `--matrix2-size`) to `macm2.mancave` (`192.168.2.2`) at its default 30 fps cap. The name lives on the `.2` VLAN — the same one the Windows host, the main matrix and the broker are on — so it resolves without a cross-VLAN mDNS reflector, unlike the string's `.3` name |
+| `--matrix2 --matrix2-ip 192.168.2.186` | Streams the same shader natively at 32×24 (the default `--matrix2-size`) to the panel controller at `192.168.2.186`, at its default 30 fps cap, on universes 6–10. Given as a literal address — no mDNS name in the send path — so the controller should have a DHCP reservation |
 | `--mqtt 192.168.2.11` | Mosquitto on `pi5.mancave` (`~/docker/pi5/mosquitto`). Publishes Home Assistant discovery so the matrix is a `light` plus a `select` of shaders |
 
 Defaults left alone: `--web-port 8080` (control panel on `0.0.0.0`), `--string-size 50`,
@@ -197,7 +197,7 @@ range for the second matrix (universes 6–10: after the main matrix's 1–4 and
 Install-ServyService -Name ShaderToE131 -DisplayName 'ShaderToE131 E1.31 Server' -Quiet `
     -Path 'C:\Users\Chamb\source\repos\ShaderToE131_V2\publish\ShaderToE131.exe' `
     -StartupDir 'C:\Users\Chamb\source\repos\ShaderToE131_V2\publish' `
-    -Params '--no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30 --matrix2 --matrix2-ip macm2.mancave --mqtt 192.168.2.11' `
+    -Params '--no-preview --string --string-ip ledstring.local --string-universe 1 --audio --loopback 0 --fps 30 --matrix2 --matrix2-ip 192.168.2.186 --mqtt 192.168.2.11' `
     -StartupType Automatic `
     -Stdout 'C:\ProgramData\Servy\logs\ShaderToE131-stdout.log' `
     -Stderr 'C:\ProgramData\Servy\logs\ShaderToE131-stderr.log'
