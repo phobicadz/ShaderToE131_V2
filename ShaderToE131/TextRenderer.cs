@@ -138,6 +138,14 @@ public static class TextRenderer
     /// static; longer text scrolls right-to-left as a marquee. Rows outside the band
     /// keep the underlying frame, so the banner overlays the shader output.
     /// </summary>
+    /// <remarks>
+    /// A '\n' in the text is a line break. Each line gets its own band (glyph height +
+    /// 1 px of padding above and below) and its own centering/marquee, and the block of
+    /// lines is centered as a whole. How many lines a display can show is decided by its
+    /// height — one on the 11-row main matrix, two on a 24-row panel. Text asking for
+    /// more lines than the display has room for is rendered as a single scrolling line
+    /// rather than dropping content, so the same message can be sent to both displays.
+    /// </remarks>
     /// <param name="frame">Width×Height RGBA framebuffer in the same bottom-up order the rest of
     /// the pipeline uses: row 0 is the BOTTOM row of the panel (see Program.Render, which copies
     /// ReadPixels output without flipping so the panel, the preview and the shader all agree).</param>
@@ -154,35 +162,58 @@ public static class TextRenderer
         if (frame.Length < width * height * 4)
             throw new ArgumentException("Framebuffer is smaller than width*height*4 bytes.", nameof(frame));
 
-        int textWidth = MeasureWidth(text);
+        // Band: glyph height plus 1px padding above and below. Rows outside a band are untouched.
+        int bandHeight = GlyphHeight + 2;
+        int maxLines = Math.Max(1, height / bandHeight);
 
-        // Band: glyph height plus 1px padding above and below. Rows outside it are untouched.
-        int bandTop = Math.Max(0, (height - GlyphHeight) / 2 - 1);
-        int bandBottom = Math.Min(height, bandTop + GlyphHeight + 2);
-        // Glyph rows occupy band indices [bandTop + 1, bandTop + GlyphHeight]. Index order is
-        // bottom-up, so the glyph's OWN top row (font bit 0) must map to the HIGHEST index in
-        // that range; drawing it at the lowest index renders the text upside down.
-        int glyphTopIndex = Math.Min(height - 1, bandTop + GlyphHeight);
-
-        if (!overlay)
+        string[] lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+        int lineCount = lines.Length;
+        while (lineCount > 1 && lines[lineCount - 1].Length == 0) lineCount--; // trailing newlines are not blank lines
+        if (lineCount > maxLines)
         {
-            for (int y = bandTop; y < bandBottom; y++)
-                frame.Slice(y * width * 4, width * 4).Clear();
+            // No room for the lines asked for (e.g. two lines on an 11-row panel): keep
+            // everything as one scrolling line instead of discarding half the message.
+            lines = new[] { string.Join(" ", lines) };
+            lineCount = 1;
         }
 
-        int x;
-        if (textWidth <= width)
+        // The block of stacked lines is centered vertically as a whole. Frame rows are
+        // bottom-up, so the FIRST text line gets the HIGHEST row indices.
+        int blockGlyphHeight = lineCount * GlyphHeight + (lineCount - 1) * 2;
+        int blockTopIndex = height - 1 - (height - blockGlyphHeight) / 2;
+
+        int[] glyphTops = new int[lineCount];
+        int[] lineXs = new int[lineCount];
+        for (int li = 0; li < lineCount; li++)
         {
-            x = (width - textWidth) / 2; // fits: centered, static
-        }
-        else
-        {
-            // Marquee: travel from just off the right edge to just off the left edge, looping.
-            long travel = width + textWidth;
-            long pos = (elapsedMs * ScrollPixelsPerSecond / 1000) % travel;
-            x = (int)(width - pos);
+            glyphTops[li] = blockTopIndex - li * bandHeight;
+
+            int textWidth = MeasureWidth(lines[li]);
+            if (textWidth <= width)
+            {
+                lineXs[li] = (width - textWidth) / 2; // fits: centered, static
+            }
+            else
+            {
+                // Marquee: travel from just off the right edge to just off the left edge, looping.
+                long travel = width + textWidth;
+                long pos = (elapsedMs * ScrollPixelsPerSecond / 1000) % travel;
+                lineXs[li] = (int)(width - pos);
+            }
+
+            if (!overlay)
+            {
+                // Clear this line's band: glyph rows [glyphTop-6 .. glyphTop] plus 1px padding.
+                int bandTop = Math.Max(0, glyphTops[li] - GlyphHeight);
+                int bandBottom = Math.Min(height, glyphTops[li] + 2);
+                for (int y = bandTop; y < bandBottom; y++)
+                    frame.Slice(y * width * 4, width * 4).Clear();
+            }
         }
 
+        // Glyph rows occupy indices [glyphTop - 6, glyphTop]. Index order is bottom-up, so
+        // the glyph's OWN top row (font bit 0) must map to the HIGHEST index in that range;
+        // drawing it at the lowest index renders the text upside down.
         // Two passes in overlay mode: shadows first, then the glyphs, so a shadow can never dim a
         // glyph pixel drawn later in the same pass.
         for (int pass = overlay ? 0 : 1; pass <= 1; pass++)
@@ -191,55 +222,62 @@ public static class TextRenderer
             int spread = Math.Clamp(shadowSpread, 0, MaxShadowSpread);
             if (shadowPass && spread == 0) continue;
 
-            for (int i = 0; i < text.Length; i++)
+            for (int li = 0; li < lineCount; li++)
             {
-                int gx = x + i * GlyphAdvance;
-                if (gx >= width || gx + GlyphWidth <= 0) continue;
+                string line = lines[li];
+                int x = lineXs[li];
+                int glyphTopIndex = glyphTops[li];
 
-                char c = text[i];
-                if (c < FirstChar || c > LastChar) continue; // unsupported characters render as a gap
-                int fontOffset = (c - FirstChar) * 5;
-
-                for (int col = 0; col < GlyphWidth; col++)
+                for (int i = 0; i < line.Length; i++)
                 {
-                    int px = gx + col;
-                    if (px < 0 || px >= width) continue;
-                    byte bits = Font[fontOffset + col];
-                    if (bits == 0) continue;
+                    int gx = x + i * GlyphAdvance;
+                    if (gx >= width || gx + GlyphWidth <= 0) continue;
 
-                    for (int row = 0; row < GlyphHeight; row++)
+                    char c = line[i];
+                    if (c < FirstChar || c > LastChar) continue; // unsupported characters render as a gap
+                    int fontOffset = (c - FirstChar) * 5;
+
+                    for (int col = 0; col < GlyphWidth; col++)
                     {
-                        if ((bits & (1 << row)) == 0) continue;
-                        int py = glyphTopIndex - row;
-                        if (py >= height) continue;
+                        int px = gx + col;
+                        if (px < 0 || px >= width) continue;
+                        byte bits = Font[fontOffset + col];
+                        if (bits == 0) continue;
 
-                        if (shadowPass)
+                        for (int row = 0; row < GlyphHeight; row++)
                         {
-                            // A solid black halo all the way around the stroke, not just a smudge to
-                            // one side: overlay text has to stay readable over any shader.
-                            for (int ox = -spread; ox <= spread; ox++)
+                            if ((bits & (1 << row)) == 0) continue;
+                            int py = glyphTopIndex - row;
+                            if (py >= height) continue;
+
+                            if (shadowPass)
                             {
-                                for (int oy = -spread; oy <= spread; oy++)
+                                // A solid black halo all the way around the stroke, not just a smudge to
+                                // one side: overlay text has to stay readable over any shader.
+                                for (int ox = -spread; ox <= spread; ox++)
                                 {
-                                    if (ox == 0 && oy == 0) continue;
-                                    int sx = px + ox, sy = py + oy;
-                                    if (sx < 0 || sx >= width || sy < 0 || sy >= height) continue;
+                                    for (int oy = -spread; oy <= spread; oy++)
+                                    {
+                                        if (ox == 0 && oy == 0) continue;
+                                        int sx = px + ox, sy = py + oy;
+                                        if (sx < 0 || sx >= width || sy < 0 || sy >= height) continue;
 
-                                    int sidx = (sy * width + sx) * 4;
-                                    frame[sidx] = 0;
-                                    frame[sidx + 1] = 0;
-                                    frame[sidx + 2] = 0;
-                                    frame[sidx + 3] = 255;
+                                        int sidx = (sy * width + sx) * 4;
+                                        frame[sidx] = 0;
+                                        frame[sidx + 1] = 0;
+                                        frame[sidx + 2] = 0;
+                                        frame[sidx + 3] = 255;
+                                    }
                                 }
+                                continue;
                             }
-                            continue;
-                        }
 
-                        int idx = (py * width + px) * 4;
-                        frame[idx] = 255;
-                        frame[idx + 1] = 255;
-                        frame[idx + 2] = 255;
-                        frame[idx + 3] = 255;
+                            int idx = (py * width + px) * 4;
+                            frame[idx] = 255;
+                            frame[idx + 1] = 255;
+                            frame[idx + 2] = 255;
+                            frame[idx + 3] = 255;
+                        }
                     }
                 }
             }

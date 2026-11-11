@@ -643,16 +643,17 @@ public sealed class WebServer : IDisposable
   .card.matrix2 h2::before { background: #ec6cb9; }
 
   label { display: block; font-weight: 600; font-size: .8rem; margin-bottom: 6px; }
-  select, input[type=number], input[type=text] {
+  select, input[type=number], input[type=text], textarea {
     width: 100%; padding: 10px 12px; font-size: .9rem; color: var(--text);
     background: #0c1219; border: 1px solid var(--line); border-radius: 10px; transition: border-color .15s, box-shadow .15s; }
+  textarea { resize: vertical; min-height: 60px; font-family: inherit; }
   select { appearance: none; -webkit-appearance: none; padding-right: 34px; cursor: pointer;
     background-image: url('data:image/svg+xml;utf8,<svg xmlns=""http://www.w3.org/2000/svg"" width=""12"" height=""8"" viewBox=""0 0 12 8"" fill=""none"" stroke=""%238b98a9"" stroke-width=""2"" stroke-linecap=""round"" stroke-linejoin=""round""><path d=""M1 1l5 5 5-5""/></svg>');
     background-repeat: no-repeat; background-position: right 12px center; }
   ::placeholder { color: #58657a; }
-  select:hover, input:hover { border-color: #354458; }
-  select:focus, input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(77,163,255,.18); }
-  select:disabled, input:disabled { opacity: .45; cursor: not-allowed; }
+  select:hover, input:hover, textarea:hover { border-color: #354458; }
+  select:focus, input:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(77,163,255,.18); }
+  select:disabled, input:disabled, textarea:disabled { opacity: .45; cursor: not-allowed; }
 
   button { width: 100%; padding: 11px 14px; margin-top: 12px; border-radius: 10px; font-size: .9rem;
     cursor: pointer; border: 1px solid var(--line); background: #0c1219; color: var(--text);
@@ -750,7 +751,7 @@ public sealed class WebServer : IDisposable
       <section class=""card notify"">
         <h2>Notifications</h2>
         <label for=""notifyText"">Message</label>
-        <input type=""text"" id=""notifyText"" maxlength=""200"" placeholder=""Text to show on the LED matrix"">
+        <textarea id=""notifyText"" rows=""2"" maxlength=""200"" placeholder=""Text to show on the LED matrix — a second line appears on the 32×24 panel""></textarea>
         <div class=""fields"">
           <div>
             <label for=""notifyDuration"">Duration (s)</label>
@@ -770,7 +771,7 @@ public sealed class WebServer : IDisposable
           </div>
         </div>
         <button id=""sendNotifyBtn"">Send Notification</button>
-        <div class=""hint"">Overlay draws the text on top of the shader (with a black outline) instead of blanking a band across it. Target sends the banner to the main matrix, the second matrix, or both — each keeps its own copy and lifetime.</div>
+        <div class=""hint"">Overlay draws the text on top of the shader (with a black outline) instead of blanking a band across it. Target sends the banner to the main matrix, the second matrix, or both — each keeps its own copy and lifetime. A line break makes a second line on the 32×24 panel; the main matrix shows such text as one scrolling line. Ctrl+Enter sends.</div>
         <div class=""hint"" id=""notifyStatus"">No active notification.</div>
       </section>
     </div>
@@ -1147,7 +1148,7 @@ $('applyShaderBtn').addEventListener('click', applyShader);
 $('applyMatrix2Btn').addEventListener('click', applyMatrix2Shader);
 $('applyStringBtn').addEventListener('click', applyString);
 $('sendNotifyBtn').addEventListener('click', sendNotification);
-$('notifyText').addEventListener('keydown', e => { if (e.key === 'Enter') sendNotification(); });
+$('notifyText').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) sendNotification(); });
 loadShaders();
 loadDevices();
 loadStringConfig();

@@ -9,7 +9,7 @@ ShaderToE131 takes [ShaderToy-style](https://www.shadertoy.com/) GLSL shaders (`
 ### Features
 
 - 🎨 **ShaderToy-compatible GLSL shaders** — auto-wrapped with uniforms (`u_time`, `u_resolution`, `u_frame`)
-- 🔤 **Text banners** — draw a message over any display: the main matrix, the second matrix, or both, each with its own copy, lifetime and overlay style
+- 🔤 **Text banners** — draw a message over any display: the main matrix, the second matrix, or both, each with its own copy, lifetime and overlay style; the 32×24 panel shows two lines
 - 🔊 **Audio reactivity** — FFT spectral analysis (2048-point, ~21.5 Hz resolution) feeds bass/mid/treble bands as shader uniforms
 - 🌐 **Web control panel** — select shaders, switch audio source/devices, configure the LED string, and view live status — all without restarting
 - 📡 **E.1.31/sACN output** — UDP multicast/unicast to LED matrix controllers (4 universes: 583 pixels × 3 channels = 1749 DMX slots)
@@ -300,7 +300,8 @@ shader visible behind the text, or send to both displays at once:
 ```
 
 Clear a banner early with an empty value. Limits: 200 characters, printable ASCII; anything wider
-than the panel scrolls as a marquee at 12 px/s.
+than the panel scrolls as a marquee at 12 px/s. A `\n` in the value is a line break — two lines show
+on the 32×24 panel (the main matrix collapses them onto one scrolling line).
 
 Broker side on this network: Mosquitto in `~/docker/pi5/mosquitto` on `pi5.mancave`
 (`192.168.2.11:1883`, host networking, anonymous on the LAN, retained-message persistence in
@@ -387,7 +388,15 @@ dropdown in the Notifications card.
 
 Text limits: 5×7 ASCII bitmap font (200 characters max, unsupported characters render as gaps). Up to
 9 characters fit the 53 px panel and are centered and static; anything longer scrolls as a marquee at
-12 px/s, which needs about 5 s to cross the panel. The same renderer runs on matrix 2 at its own
+12 px/s, which needs about 5 s to cross the panel.
+
+**Two lines on the second matrix**: a `\n` in the message is a line break, and each display shows as
+many lines as its rows allow — the 24-row panel stacks **two lines** (each centered or scrolling
+independently), while the 11-row main matrix has room for one band, so text with more lines than the
+display fits is rendered as a single scrolling line rather than dropping content. The same two-line
+message can therefore be sent to `both`: the panel shows two lines, the main matrix one scrolling
+line. The web UI's message box is a textarea (Enter adds a line, Ctrl+Enter sends); from MQTT or
+automations just put `\n` in the text. The same renderer runs on matrix 2 at its own
 size, so the number of characters that fit before it scrolls is decided per display.
 
 The LED string is sampled from the framebuffer **before** the banner is drawn, so text always appears
