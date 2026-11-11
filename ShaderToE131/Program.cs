@@ -993,22 +993,14 @@ void main()
 
     /// <summary>
     /// The shader name matrix 2 is showing, for status reporting: its own selection when
-    /// independent, "off" when explicitly off, or the main matrix's name when mirroring.
+    /// independent, "off" when explicitly off, or the literal "mirror (main matrix)" when
+    /// mirroring — what is on screen is then whatever the main matrix reports.
     /// </summary>
     private string Matrix2SelectedShaderName()
     {
         if (_matrix2ExplicitOff) return "off";
         if (_matrix2ShaderSource != null) return (_currentMatrix2ShaderFileName ?? "built-in default") + ".glsl";
-        return MainSelectedShaderName();
-    }
-
-    /// <summary>The main matrix's current shader label, same form as the status snapshot's.</summary>
-    private string MainSelectedShaderName()
-    {
-        if (_shaderProgram == null) return "off";
-        if (_demoShaders != null && _demoIndex >= 0) return Path.GetFileName(_demoShaders[_demoIndex]);
-        if (!string.IsNullOrEmpty(_currentShaderFileName)) return _currentShaderFileName + ".glsl";
-        return "built-in default";
+        return "mirror (main matrix)";
     }
 
     /// <summary>
