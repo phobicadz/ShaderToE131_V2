@@ -100,6 +100,13 @@ class Program : IDisposable
     // own frame rate. Default target shape: 32×24 at 30 fps.
     private bool _matrix2Enabled = false;
     private string? _matrix2Ip = null;          // required with --matrix2
+    // Matrix 2's own shader selection. Null = mirror the main matrix's shader (the
+    // default relationship); non-null = an independent source of its own. Audio
+    // capture is the only thing the two matrices share.
+    private string? _matrix2ShaderSource = null;
+    private string? _matrix2ShaderFile = null;  // --matrix2-shader <file|off>
+    private bool _matrix2ExplicitOff = false;   // matrix 2 is off regardless of the main matrix
+    private string? _currentMatrix2ShaderFileName;
     private int _matrix2W = 32;
     private int _matrix2H = 24;
     private int _matrix2Universe = 0;           // 0 = auto (after the matrix's and the string's universes)
@@ -360,6 +367,8 @@ void main()
                 prog._matrix2Universe = mu;
             else if (args[i] == "--matrix2-fps" && i + 1 < args.Length && int.TryParse(args[++i], out var mfps))
                 prog._matrix2Fps = mfps;
+            else if (args[i] == "--matrix2-shader" && i + 1 < args.Length)
+                prog._matrix2ShaderFile = args[++i];
             else if (args[i] == "--text-overlay") { prog._textOverlay = true; }
             else if (args[i] == "--text-shadow" && i + 1 < args.Length && int.TryParse(args[++i], out var ts))
                 prog._textShadow = Math.Clamp(ts, 0, TextRenderer.MaxShadowSpread);
@@ -405,6 +414,7 @@ void main()
             Console.WriteLine("  --matrix2-size <WxH>   Second matrix dimensions, e.g. 32x24 (default: 32x24)");
             Console.WriteLine("  --matrix2-universe <n> Universe for the second matrix (default: first after the matrix's and the string's universes)");
             Console.WriteLine("  --matrix2-fps <n>      Send rate for the second matrix (default: 30; 0 = uncapped). Independent of --fps, which paces the render loop itself — set --fps to at least --matrix2-fps if you want both aligned and CPU-capped");
+            Console.WriteLine("  --matrix2-shader <f>   Give the second matrix its OWN shader (a .glsl file, or 'off'); without it the second matrix mirrors the main matrix's shader");
             Console.WriteLine("  --fps <n>            Cap the output rate (matrix + string); headless mode paces its render loop to it. Default: uncapped");
             Console.WriteLine("  --text-overlay       Default banner style: draw text over the shader (with a black outline around the strokes) instead of blanking a band across it. Per-message \"overlay\" overrides it");
             Console.WriteLine("  --text-shadow <0-3>  Width of that outline (1 = 1px halo, 2 = 2px halo, 0 = none). Default: 1. Only applies to overlay banners");
@@ -604,6 +614,32 @@ void main()
             _shaderSource = DefaultFragmentShader;
         }
 
+        // Matrix 2's own shader (--matrix2-shader): an independent selection from the very
+        // start. Without it matrix 2 mirrors the main matrix's shader (the default).
+        if (_matrix2Enabled && !string.IsNullOrWhiteSpace(_matrix2ShaderFile))
+        {
+            if (_matrix2ShaderFile.Trim().Equals("off", StringComparison.OrdinalIgnoreCase))
+            {
+                _matrix2ExplicitOff = true;
+                Console.WriteLine("  Matrix 2 shader: off (blank, independent of the main matrix)");
+            }
+            else
+            {
+                var m2Path = ResolveShaderPath(_matrix2ShaderFile);
+                if (m2Path != null && File.Exists(m2Path))
+                {
+                    _matrix2ShaderSource = File.ReadAllText(m2Path);
+                    _currentMatrix2ShaderFileName = Path.GetFileNameWithoutExtension(m2Path);
+                    Console.WriteLine($"  Matrix 2 shader (independent): {m2Path}");
+                }
+                else
+                {
+                    Console.WriteLine($"[ERROR] --matrix2-shader file not found: {_matrix2ShaderFile}");
+                    return;
+                }
+            }
+        }
+
         // Resolve shader directory for web server
         string resolvedShaderDir = ResolveShaderDirectory(_shaderDirPath);
 
@@ -740,8 +776,8 @@ void main()
                 _matrix2UniverseResolved,
                 _matrix2Fps,
                 _matrix2FramesSent,
-                _matrix2SendErrors
-            );
+                _matrix2SendErrors,
+                Matrix2SelectedShaderName());
             _webServer.Start();
         }
 
@@ -881,21 +917,98 @@ void main()
         string fragShader = BuildFragmentShader(_shaderSource!);
         _shaderProgram = new ShaderProgram(_gl, fragShader, MatW, MatH, _window, _audioEnabled);
         Console.WriteLine($"[Reload] Shader program created.");
-        CreateMatrix2Program();
+        // Demo/main cycles only pull matrix 2 along while it mirrors the main matrix;
+        // an independent matrix-2 shader is untouched by demo rotation.
+        if (_matrix2ShaderSource == null) CreateMatrix2Program();
     }
 
     /// <summary>
-    /// Build the matrix-2 ShaderProgram: the same shader source, but compiled for the
-    /// second matrix's own resolution — its vertex shader and u_resolution use its
-    /// dimensions, so it renders natively instead of resampling the main framebuffer.
+    /// Build the matrix-2 ShaderProgram. By default this is the same shader source as the
+    /// main matrix, compiled for the second matrix's own resolution — its vertex shader and
+    /// u_resolution use its dimensions, so it renders natively instead of resampling the
+    /// main framebuffer. When matrix 2 has its own selected shader (_matrix2ShaderSource)
+    /// it renders that instead; when it is explicitly off it gets no program at all.
     /// </summary>
     private unsafe void CreateMatrix2Program()
     {
-        if (!_matrix2Enabled || _gl == null || _window == null || _shaderSource == null) return;
+        if (!_matrix2Enabled || _gl == null || _window == null) return;
+        string? source = _matrix2ExplicitOff ? null : (_matrix2ShaderSource ?? _shaderSource);
+        if (source == null) { _shaderProgram2?.Dispose(); _shaderProgram2 = null; return; }
         _shaderProgram2?.Dispose();
-        string fragShader = BuildFragmentShader(_shaderSource, _matrix2W / (float)_matrix2H);
+        string fragShader = BuildFragmentShader(source, _matrix2W / (float)_matrix2H);
         _shaderProgram2 = new ShaderProgram(_gl, fragShader, _matrix2W, _matrix2H, _window, _audioEnabled);
-        Console.WriteLine($"[Matrix2] Shader program created ({_matrix2W}x{_matrix2H}).");
+        string label = _matrix2ShaderSource != null
+            ? (_currentMatrix2ShaderFileName ?? "built-in default") + ".glsl"
+            : "mirrors main matrix";
+        Console.WriteLine($"[Matrix2] Shader program created ({_matrix2W}x{_matrix2H}, {label}).");
+    }
+
+    /// <summary>
+    /// Apply a pending matrix-2 shader selection (from the web UI/API) on the render
+    /// thread. Matrix 2 has three states: mirror (follows the main matrix — the
+    /// default), independent (its own shader source), and explicitly off. Only the
+    /// audio capture is shared with the main matrix.
+    /// </summary>
+    private unsafe void ApplyPendingMatrix2Shader()
+    {
+        var pending = _webServer?.ConsumePendingMatrix2Shader();
+        if (pending == null) return;
+        if (!_matrix2Enabled)
+        {
+            Console.WriteLine("[Web] Matrix 2 shader change ignored — matrix 2 output is off (--matrix2 not enabled).");
+            return;
+        }
+
+        if (pending.Source == WebServer.Matrix2MirrorToken)
+        {
+            _matrix2ShaderSource = null;
+            _matrix2ExplicitOff = false;
+            _currentMatrix2ShaderFileName = null;
+            CreateMatrix2Program();   // follows the main matrix's current program state
+            Console.WriteLine("[Web] Matrix 2 shader mirrors the main matrix again.");
+            return;
+        }
+
+        if (pending.FileName == "Off")
+        {
+            _matrix2ExplicitOff = true;
+            _matrix2ShaderSource = null;
+            _currentMatrix2ShaderFileName = null;
+            _shaderProgram2?.Dispose();
+            _shaderProgram2 = null;
+            _matrix2OffFramesRemaining = OffClearFrames;
+            Console.WriteLine("[Web] Matrix 2 stopped — Off (blank); the main matrix is unaffected.");
+            return;
+        }
+
+        if (!string.IsNullOrEmpty(pending.Source))
+        {
+            _matrix2ShaderSource = pending.Source;
+            _matrix2ExplicitOff = false;
+            _currentMatrix2ShaderFileName = pending.FileName;
+            CreateMatrix2Program();
+            Console.WriteLine($"[Web] Matrix 2 shader changed: {pending.FileName ?? "unknown"}");
+        }
+    }
+
+    /// <summary>
+    /// The shader name matrix 2 is showing, for status reporting: its own selection when
+    /// independent, "off" when explicitly off, or the main matrix's name when mirroring.
+    /// </summary>
+    private string Matrix2SelectedShaderName()
+    {
+        if (_matrix2ExplicitOff) return "off";
+        if (_matrix2ShaderSource != null) return (_currentMatrix2ShaderFileName ?? "built-in default") + ".glsl";
+        return MainSelectedShaderName();
+    }
+
+    /// <summary>The main matrix's current shader label, same form as the status snapshot's.</summary>
+    private string MainSelectedShaderName()
+    {
+        if (_shaderProgram == null) return "off";
+        if (_demoShaders != null && _demoIndex >= 0) return Path.GetFileName(_demoShaders[_demoIndex]);
+        if (!string.IsNullOrEmpty(_currentShaderFileName)) return _currentShaderFileName + ".glsl";
+        return "built-in default";
     }
 
     /// <summary>
@@ -969,16 +1082,18 @@ void main()
     }
 
     /// <summary>
-    /// Render the current shader at matrix 2's own resolution into its framebuffer
-    /// and map it to its E.1.31 buffer (straight raster). Like the LED string, it
-    /// mirrors the shader only — a notification banner never appears on it. Called
-    /// before the banner is drawn on the main framebuffer.
+    /// Render matrix 2's shader — its own selection, or the main matrix's while it
+    /// mirrors it — at matrix 2's own resolution into its framebuffer and map it to its
+    /// E.1.31 buffer (straight raster). Like the LED string, it mirrors the shader only
+    /// — a notification banner never appears on it. Called before the banner is drawn on
+    /// the main framebuffer. No program (mirroring while the main matrix is off, or
+    /// explicitly off) means a black frame.
     /// </summary>
-    private unsafe void RenderMatrix2(bool isOff)
+    private unsafe void RenderMatrix2()
     {
         if (_matrix2Sender == null) return;
 
-        if (isOff || _shaderProgram2 == null)
+        if (_shaderProgram2 == null)
         {
             Array.Clear(_matrix2FrameBuffer);
         }
@@ -1315,7 +1430,8 @@ void main()
             if (_shaderProgram == null)
             {
                 _offFramesRemaining = OffClearFrames;
-                _matrix2OffFramesRemaining = OffClearFrames;
+                // Only the mirror relationship pulls matrix 2 dark along with the main one.
+                if (_matrix2ShaderSource == null && !_matrix2ExplicitOff) _matrix2OffFramesRemaining = OffClearFrames;
             }
             Console.WriteLine("[Web] Notification cleared.");
             return;
@@ -1343,7 +1459,8 @@ void main()
             if (_shaderProgram == null)
             {
                 _offFramesRemaining = OffClearFrames;
-                _matrix2OffFramesRemaining = OffClearFrames;
+                // Only the mirror relationship pulls matrix 2 dark along with the main one.
+                if (_matrix2ShaderSource == null && !_matrix2ExplicitOff) _matrix2OffFramesRemaining = OffClearFrames;
             }
             return;
         }
@@ -1397,7 +1514,7 @@ void main()
             _shaderProgram?.Dispose();
             _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
             Console.WriteLine($"[Web] Shader changed: {newName ?? "unknown"}");
-            CreateMatrix2Program();
+            if (_matrix2ShaderSource == null) CreateMatrix2Program();  // mirror mode only — an independent matrix 2 keeps its own shader
 
             // Reinitialize audio capture with current loopback device index if enabled
             if (_audioEnabled && _audioSource == AudioCapture.AudioSource.Loopback)
@@ -1436,6 +1553,9 @@ void main()
         // the whole service - and the LED matrix with it - to be down.
         RetryMatrix2Sender();
 
+        // Matrix 2's own shader selection, applied on the GL thread like everything else.
+        ApplyPendingMatrix2Shader();
+
         // ─── Pending shader swap from web server (main-thread GL work) ───
         // No program means the output is blank — keep sending black frames. Returning
         // early here would stop sending entirely and the controller holds its last lit frame.
@@ -1450,8 +1570,13 @@ void main()
             _currentShaderFileName = "Off";
             _isOff = true;
             _offFramesRemaining = OffClearFrames;
-            DisposeMatrix2Program();
-            _matrix2OffFramesRemaining = OffClearFrames;
+            // Off only blanks matrix 2 while it mirrors the main matrix; an
+            // independent (or already explicitly off) matrix 2 is untouched.
+            if (_matrix2ShaderSource == null && !_matrix2ExplicitOff)
+            {
+                DisposeMatrix2Program();
+                _matrix2OffFramesRemaining = OffClearFrames;
+            }
         }
 
         // Update web server status (with live stats)
@@ -1492,7 +1617,7 @@ void main()
         }
 
         // Feed audio spectrum into shader uniforms each frame
-        if (_audioCapture != null && !_isOff)
+        if (_audioCapture != null && (!_isOff || _shaderProgram2 != null))
         {
             var spectrum = _audioCapture.ReadSpectrum();
             _shaderProgram?.SetAudioValues(spectrum);
@@ -1516,7 +1641,7 @@ void main()
         // nothing is why "off" cost as much CPU as a running shader. Matrix 2's own
         // black-frame burst must finish before the loop goes quiet, or those frames
         // would never be sent.
-        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null && _matrix2OffFramesRemaining <= 0)
+        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null && _matrix2OffFramesRemaining <= 0 && _shaderProgram2 == null)
         {
             Thread.Sleep(OffIdleSleepMs);
             return;
@@ -1533,7 +1658,7 @@ void main()
         }
 
         // Matrix 2: the same shader at its own resolution, mapped to its own buffer.
-        RenderMatrix2(_isOff);
+        RenderMatrix2();
 
         // Map the LED string row from the framebuffer BEFORE the banner is drawn: the string mirrors
         // the shader, so a notification never appears on it. Done every rendered frame; the send below
@@ -1589,7 +1714,7 @@ void main()
         // matrix's rate — uncapped or --fps — does not decide when this output
         // transmits. Matrix2SendDue() first: its Off burst may only spend frames
         // on slots that actually send.
-        if (_matrix2Sender != null && Matrix2SendDue() && (!_isOff || Matrix2OffBurstDue()))
+        if (_matrix2Sender != null && Matrix2SendDue() && (_shaderProgram2 != null || Matrix2OffBurstDue()))
         {
             try
             {
@@ -1604,7 +1729,7 @@ void main()
         }
 
         long nowMs = Environment.TickCount64;
-        if (nowMs - _lastStatusLogMs >= 1000 && (!_isOff || _offFramesRemaining > 0 || _matrix2OffFramesRemaining > 0))
+        if (nowMs - _lastStatusLogMs >= 1000 && (!_isOff || _offFramesRemaining > 0 || _matrix2OffFramesRemaining > 0 || _shaderProgram2 != null))
         {
             int r = _e131Buffer.Length > 0 ? _e131Buffer[0] : 0;
             int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;
@@ -1664,7 +1789,7 @@ void main()
             _shaderProgram?.Dispose();
             _shaderProgram = new ShaderProgram(_gl!, fragShader, MatW, MatH, _window!, _audioEnabled);
             Console.WriteLine($"[Web] Shader changed: {newName ?? "unknown"}");
-            CreateMatrix2Program();
+            if (_matrix2ShaderSource == null) CreateMatrix2Program();  // mirror mode only — an independent matrix 2 keeps its own shader
         }
 
         if (_sender == null) return;
@@ -1673,6 +1798,9 @@ void main()
         // since dropped off the network, is retried here rather than being a reason for
         // the whole service - and the LED matrix with it - to be down.
         RetryMatrix2Sender();
+
+        // Matrix 2's own shader selection, applied on the GL thread like everything else.
+        ApplyPendingMatrix2Shader();
 
         // Check for pending shader change from web server (thread-safe polling)
         // No program means the output is blank — keep sending black frames. Returning
@@ -1688,8 +1816,13 @@ void main()
             _currentShaderFileName = "Off";
             _isOff = true;
             _offFramesRemaining = OffClearFrames;
-            DisposeMatrix2Program();
-            _matrix2OffFramesRemaining = OffClearFrames;
+            // Off only blanks matrix 2 while it mirrors the main matrix; an
+            // independent (or already explicitly off) matrix 2 is untouched.
+            if (_matrix2ShaderSource == null && !_matrix2ExplicitOff)
+            {
+                DisposeMatrix2Program();
+                _matrix2OffFramesRemaining = OffClearFrames;
+            }
         }
 
         // Update web server status (with live stats)
@@ -1730,7 +1863,7 @@ void main()
         }
 
         // Feed audio spectrum into shader uniforms each frame
-        if (_audioCapture != null && !_isOff)
+        if (_audioCapture != null && (!_isOff || _shaderProgram2 != null))
         {
             var spectrum = _audioCapture.ReadSpectrum();
             _shaderProgram?.SetAudioValues(spectrum);
@@ -1754,7 +1887,7 @@ void main()
         // nothing is why "off" cost as much CPU as a running shader. Matrix 2's own
         // black-frame burst must finish before the loop goes quiet, or those frames
         // would never be sent.
-        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null && _matrix2OffFramesRemaining <= 0)
+        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null && _matrix2OffFramesRemaining <= 0 && _shaderProgram2 == null)
         {
             Thread.Sleep(OffIdleSleepMs);
             return;
@@ -1773,7 +1906,7 @@ void main()
         }
 
         // Matrix 2: the same shader at its own resolution, mapped to its own buffer.
-        RenderMatrix2(_isOff);
+        RenderMatrix2();
 
         // Map the LED string row from the framebuffer BEFORE the banner is drawn: the string mirrors
         // the shader, so a notification never appears on it. Done every rendered frame; the send below
@@ -1833,7 +1966,7 @@ void main()
         // matrix's rate — uncapped or --fps — does not decide when this output
         // transmits. Matrix2SendDue() first: its Off burst may only spend frames
         // on slots that actually send.
-        if (_matrix2Sender != null && Matrix2SendDue() && (!_isOff || Matrix2OffBurstDue()))
+        if (_matrix2Sender != null && Matrix2SendDue() && (_shaderProgram2 != null || Matrix2OffBurstDue()))
         {
             try
             {
@@ -1848,7 +1981,7 @@ void main()
         }
 
         long nowMs = Environment.TickCount64;
-        if (nowMs - _lastStatusLogMs >= 2000 && (!_isOff || _offFramesRemaining > 0 || _matrix2OffFramesRemaining > 0))
+        if (nowMs - _lastStatusLogMs >= 2000 && (!_isOff || _offFramesRemaining > 0 || _matrix2OffFramesRemaining > 0 || _shaderProgram2 != null))
         {
             int r = _e131Buffer.Length > 0 ? _e131Buffer[0] : 0;
             int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;

@@ -13,7 +13,7 @@ ShaderToE131 takes [ShaderToy-style](https://www.shadertoy.com/) GLSL shaders (`
 - 🌐 **Web control panel** — select shaders, switch audio source/devices, configure the LED string, and view live status — all without restarting
 - 📡 **E.1.31/sACN output** — UDP multicast/unicast to LED matrix controllers (4 universes: 583 pixels × 3 channels = 1749 DMX slots)
 - 🧵 **Optional LED string output** — stream a separate N-LED string (default 50) in parallel with the matrix, mirroring a matrix row
-- 🔲 **Optional second matrix output** — render the same shader natively at another matrix's own resolution (default 32×24) and send it to its own unicast target at its own frame rate (default 30 fps)
+- 🔲 **Optional second matrix output** — render natively at another matrix's own resolution (default 32×24) and send it to its own unicast target at its own frame rate (default 30 fps). By default it mirrors the main matrix's shader, but it can be given **its own independent shader** (`--matrix2-shader`, `POST /api/select-matrix2-shader`, the web UI, or a dedicated Home Assistant select entity); the only thing the two matrices share is the audio capture
 - 🎭 **Demo mode** — auto-cycle through all shaders in directory
 - 🔇 **"Off" blank** — dispose shader program to stop GPU rendering entirely
 
@@ -116,6 +116,10 @@ dotnet run --matrix2 --matrix2-ip 192.168.2.151
 # A differently-shaped second matrix, explicit universe, its own uncapped rate
 dotnet run --matrix2 --matrix2-ip panel.local --matrix2-size 48x16 --matrix2-universe 20 --matrix2-fps 0
 
+# Give the second matrix its OWN shader, independent of the main matrix
+# (only the audio capture is shared; switch either one at runtime from the web UI)
+dotnet run --matrix2 --matrix2-ip 192.168.2.186 --matrix2-shader shaders/snowfall.glsl
+
 # List available audio devices and exit
 dotnet run --list-devices
 
@@ -148,6 +152,7 @@ dotnet run --help
 | `--matrix2-size <WxH>` | Second matrix dimensions, e.g. `32x24` (default: `32x24` → 768 pixels → 2304 slots → 5 universes) |
 | `--matrix2-universe <n>` | Universe for the second matrix (default: first after the matrix's and the string's universes) |
 | `--matrix2-fps <n>` | Send rate for the second matrix (default: `30`; `0` = uncapped). Independent of `--fps`: the main matrix's rate never decides when the second matrix transmits. Note the headless render loop itself is paced only by `--fps` — pass `--fps` at or above `--matrix2-fps` if you want both outputs frame-aligned and the loop CPU-capped |
+| `--matrix2-shader <file\|off>` | Give the second matrix its **own** shader from startup (a `.glsl` file, or `off` to keep it blank while the main matrix runs). Without it the second matrix mirrors the main matrix's shader — the default relationship. At runtime either matrix can be switched independently via `POST /api/select-matrix2-shader` (or the web UI / MQTT select); `name: "mirror"` re-links matrix 2 to the main matrix. Audio uniforms are fed to both from the one shared capture |
 | `--fps <n>` | Cap the output rate for matrix + string (default: uncapped). Use `30`–`60` for typical pixel controllers — sending 4 universes per frame at thousands of fps overruns their refresh rate and drops frames. In headless mode the whole render loop is paced to this rate, so it also caps CPU use |
 | `--text-overlay` | Default banner style: draw text over the shader (with a black halo around the strokes) instead of blanking a black band across it. A per-message `overlay` field overrides it |
 | `--text-shadow <0-3>` | Width of that halo: 1 = 1 px outline, 2 = 2 px, 0 = none. Default 1. Only applies to overlay banners |
@@ -179,7 +184,7 @@ These are the parameters this instance runs with as a Windows service (Servy ser
 | `--string-universe 1` | Universe for the string. Same number as the matrix is safe — the two targets are different hosts, so neither sees the other's packets |
 | `--audio --loopback 0` | Capture system playback (the default render endpoint) instead of a microphone. Works under the LocalSystem service account; the active device is reported as `loopbackDeviceName` in `/api/status` |
 | `--fps 30` | Caps matrix + string output to 30 fps, which matches the controllers' refresh rate and keeps headless CPU use low. It also paces the render loop, so the second matrix's 30 fps cap is met exactly and both outputs stay frame-aligned |
-| `--matrix2 --matrix2-ip 192.168.2.186 --matrix2-universe 1` | Streams the same shader natively at 32×24 (the default `--matrix2-size`) to the panel controller at `192.168.2.186` at its default 30 fps cap, on universes 1–5 (2304 slots). Universe 1 is what panels listen on by default, and the same number as the main matrix is safe — different destination hosts, so neither sees the other's packets. Given as a literal address — no mDNS name in the send path — so the controller should have a DHCP reservation |
+| `--matrix2 --matrix2-ip 192.168.2.186 --matrix2-universe 1` | Streams the same shader natively at 32×24 (the default `--matrix2-size`) to the panel controller at `192.168.2.186` at its default 30 fps cap, on universes 1–5 (2304 slots). Universe 1 is what panels listen on by default, and the same number as the main matrix is safe — different destination hosts, so neither sees the other's packets. Given as a literal address — no mDNS name in the send path — so the controller should have a DHCP reservation. Add `--matrix2-shader <file>` to start the panel with its own independent shader instead of mirroring; either way both matrices can be switched separately at runtime from the web UI or `select.shadertoe131_shader_matrix2` in Home Assistant |
 | `--mqtt 192.168.2.11` | Mosquitto on `pi5.mancave` (`~/docker/pi5/mosquitto`). Publishes Home Assistant discovery so the matrix is a `light` plus a `select` of shaders |
 
 Defaults left alone: `--web-port 8080` (control panel on `0.0.0.0`), `--string-size 50`,
@@ -244,8 +249,10 @@ Topics (prefix `shadertoe131`):
 | `shadertoe131/shader/set` | in | a shader name, `off`, or `built-in default` |
 | `shadertoe131/matrix/state` | out (retained) | `{"state":"ON","effect":"<shader>"}` |
 | `shadertoe131/shader/state` | out (retained) | current shader option |
-| `shadertoe131/matrix/attributes` | out (retained) | frames sent, send errors, audio state, string config, uptime |
+| `shadertoe131/matrix/attributes` | out (retained) | frames sent, send errors, audio state, string config, matrix 2 state, uptime |
 | `shadertoe131/matrix/availability` | out (retained) | `online` / `offline` (also the client's last-will) |
+| `shadertoe131/shader2/set` | in | matrix 2's own shader: a shader name, `off`, `mirror` (follow the main matrix again), or `built-in default` |
+| `shadertoe131/shader2/state` | out (retained) | matrix 2's current shader option |
 | `shadertoe131/notify/set` | in | banner text, plain text or `{"text":"…","duration":10,"overlay":true}` |
 | `shadertoe131/notify/state` | out (retained) | the banner currently on screen (empty when there is none) |
 | `shadertoe131/notify/duration/set` | in | banner lifetime in seconds, used for plain-text banners |
@@ -293,6 +300,17 @@ Broker side on this network: Mosquitto in `~/docker/pi5/mosquitto` on `pi5.manca
 `./data`). Home Assistant is configured with an MQTT config entry pointing at that address — the
 broker is reachable from both the Pi's Docker networks and the LAN.
 
+Matrix 2 (when started with `--matrix2`) gets its own select entity
+(`select.shadertoe131_shader_matrix2`, options = `mirror` / `off` / `built-in default` / every
+shader name). Its default option `mirror` means "show whatever the main matrix shows"; picking any
+real shader makes it independent — the two matrices then share nothing but the audio capture:
+
+```yaml
+- action: select.select_option
+  target: { entity_id: select.shadertoe131_shader_matrix2 }
+  data: { option: snowfall }
+```
+
 Notes:
 
 - Discovery must be published to `…/<component>/<unique_id>/config`: Home Assistant subscribes to
@@ -315,6 +333,7 @@ http://localhost:<port>
 - **Shader section** — browse and select from all `.glsl` files in shader directory, including an "Off (blank)" option; 🔊 marks audio-reactive shaders
 - **Audio section** — choose the audio source (off / microphone / loopback system audio) and pick a specific loopback capture device; changes apply without restarting
 - **LED String section** — enable/disable a parallel LED string stream and configure LED count, source matrix row, target IP, and sACN universe; settings apply on the next frame
+- **Second Matrix section** — when the app runs with `--matrix2`, pick the second matrix's own shader independently (or keep it mirroring the main matrix, or blank it on its own); live target/universe/frame stats
 - **Status grid** — shows current shader, audio source, string state, uptime, matrix frames sent, and send errors (auto-refreshes every 2 s)
 
 ### API Endpoints
@@ -330,7 +349,8 @@ http://localhost:<port>
 | `/api/set-audio-device` | POST | Select loopback device by index | `{"ok": true/false}` |
 | `/api/set-string` | POST | Configure LED string: `{enabled, size, row, ip, universe}` (omit fields to keep current values; `ip` accepts an IP or a hostname, e.g. `ledstring.local`; `ip: ""` resets to the matrix IP; `universe: 0` = auto) | `{"ok": true/false}` |
 | `/api/string-config` | GET | Current LED string config + live stats | JSON object (see below) |
-| `/api/matrix2` | GET | Live second-matrix output state: `{enabled, active, width, height, ip, universe, fps, framesSent, sendErrors}` (`{"enabled": false}` when `--matrix2` is off; `active: false` = configured but the target currently cannot be resolved) | JSON object |
+| `/api/matrix2` | GET | Live second-matrix output state: `{enabled, active, width, height, ip, universe, fps, selectedShader, framesSent, sendErrors}` (`selectedShader` is the matrix-2 shader name, `"off"`, or `"mirror (main matrix)"`; `{"enabled": false}` when `--matrix2` is off; `active: false` = configured but the target currently cannot be resolved) | JSON object |
+| `/api/select-matrix2-shader` | POST | Give matrix 2 its own shader: `{"name":"<shader>"}`, `"off"` (blank matrix 2 only), `"mirror"` (follow the main matrix again), or `"built-in default"` | `{"ok": true, "matrix2": "<file>"}` |
 | `/api/led-agent` | GET | Live LED agent link state (`{"enabled": false}` when `--led-agent` is off) | JSON object (see "LED Agent") |
 | `/api/status` | GET | Get current status and stats | JSON object (see below) |
 
@@ -356,7 +376,10 @@ Text limits: 5×7 ASCII bitmap font (200 characters max, unsupported characters 
 
 The LED string is sampled from the framebuffer **before** the banner is drawn, so text always appears
 on the matrix only — the string keeps mirroring the shader. The second matrix (`--matrix2`) behaves
-the same way: it mirrors the shader (rendered at its own resolution), never the banner.
+the same way: it renders its own (or the mirrored) shader at its own resolution, never the banner.
+Turning the main matrix **Off** only blanks matrix 2 while it mirrors the main one; an independently
+selected matrix-2 shader keeps running, and matrix 2 can be turned off on its own without touching
+the main matrix.
 
 #### Status Response
 

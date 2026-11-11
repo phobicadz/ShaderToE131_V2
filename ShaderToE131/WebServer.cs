@@ -44,6 +44,25 @@ public sealed class WebServer : IDisposable
     /// <summary>Queue a shader command atomically (source + display name travel together).
     /// A null <paramref name="source"/> is the "off" signal for the render loop.</summary>
     private void QueuePendingShader(string? source, string fileName) => _pendingShader = new PendingShader(source, fileName);
+
+    // ─── Second-matrix shader selection (independent from the main matrix) ───
+    // Same single-slot/atomic-consume pattern as the main matrix's pending shader.
+    // A null Source is matrix 2's "off" signal; Matrix2MirrorToken re-links it to the
+    // main matrix's shader. The render loop consumes it on the GL thread.
+    private volatile PendingShader? _pendingMatrix2Shader;
+
+    /// <summary>Sentinel queued by <see cref="SelectMatrix2ShaderByName"/> meaning "matrix 2
+    /// mirrors the main matrix's shader again" (the default relationship).</summary>
+    public const string Matrix2MirrorToken = "<<mirror-main>>";
+
+    public string? PendingMatrix2ShaderSource => _pendingMatrix2Shader?.Source;
+    public string? PendingMatrix2ShaderFileName => _pendingMatrix2Shader?.FileName;
+
+    /// <summary>Atomically take matrix 2's pending shader command (see ConsumePendingShader).</summary>
+    public PendingShader? ConsumePendingMatrix2Shader() => Interlocked.Exchange(ref _pendingMatrix2Shader, null);
+
+    private void QueuePendingMatrix2Shader(string? source, string fileName) => _pendingMatrix2Shader = new PendingShader(source, fileName);
+
     public Func<bool>? GetAudioEnabled { get; set; }              // current audio state
     public Action<bool>? SetAudioEnabled { get; set; }              // toggle audio on/off
     public Action<string>? SetAudioSource { get; set; }            // change audio source (microphone/loopback/off)
@@ -173,7 +192,8 @@ public sealed class WebServer : IDisposable
         int Universe,   // resolved base universe
         int Fps,        // this output's send cap (0 = uncapped)
         int FramesSent,
-        int SendErrors
+        int SendErrors,
+        string? SelectedShader = null  // "mirror (main matrix)" when it follows the main matrix
     );
 
     private static readonly JsonSerializerOptions JsonCamelCase = new()
@@ -463,6 +483,10 @@ public sealed class WebServer : IDisposable
                     if (method == "GET") ServeMatrix2(clientSocket);
                     else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
                     break;
+                case "/api/select-matrix2-shader":
+                    if (method == "POST") ServeSelectMatrix2Shader(clientSocket, body);
+                    else SendResponse(clientSocket, 405, "", "text/plain; charset=utf-8", corsHeaders);
+                    break;
                 default:
                     // Try to serve shader files directly for preview
                     if (path.StartsWith("/shaders/") && path.EndsWith(".glsl"))
@@ -602,6 +626,7 @@ public sealed class WebServer : IDisposable
   .card.audio h2::before { background: var(--violet); }
   .card.string h2::before { background: var(--green); }
   .card.status h2::before { background: var(--amber); }
+  .card.matrix2 h2::before { background: #ec6cb9; }
 
   label { display: block; font-weight: 600; font-size: .8rem; margin-bottom: 6px; }
   select, input[type=number], input[type=text] {
@@ -678,6 +703,15 @@ public sealed class WebServer : IDisposable
         <select id=""shaderSelect""><option value=""off"">Off (blank)</option><option value="""">— select shader —</option></select>
         <div class=""hint"" id=""shaderCount""></div>
         <button class=""primary"" id=""applyShaderBtn"">Apply Shader</button>
+      </section>
+
+      <section class=""card matrix2"">
+        <h2>Second Matrix</h2>
+        <label for=""matrix2Select"">Shader</label>
+        <select id=""matrix2Select""></select>
+        <button class=""primary"" id=""applyMatrix2Btn"">Apply Matrix 2 Shader</button>
+        <div class=""hint"" id=""matrix2Status"">Loading…</div>
+        <div class=""hint"">Matrix 2 mirrors the main matrix's shader until you pick its own. Both matrices always share the same audio capture.</div>
       </section>
 
       <section class=""card audio"">
@@ -787,6 +821,8 @@ function showBanner(msg, isError) {
 
 function truncate(s, n) { return s && s.length > n ? s.substring(0, n - 2) + '…' : (s || ''); }
 
+function PathNameNoExt(s) { const i = (s || '').lastIndexOf('/'); const f = i >= 0 ? s.substring(i + 1) : (s || ''); return f.replace(/\.glsl$/i, ''); }
+
 function setConn(ok) {
   $('connPill').classList.toggle('live', ok);
   $('connText').textContent = ok ? 'connected' : 'disconnected';
@@ -810,6 +846,13 @@ async function loadShaders(retries) {
       sel.add(new Option('— select shader —', ''));
       for (const s of data.shaders) sel.add(new Option(s.name + (s.isAudioReactive ? ' 🔊' : ''), s.name));
       if (prev !== '' && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+      const m2 = $('matrix2Select');
+      const prevM2 = m2.value;
+      m2.innerHTML = '';
+      m2.add(new Option('Mirror main matrix', 'mirror'));
+      m2.add(new Option('Off (blank)', 'off'));
+      for (const s of data.shaders) m2.add(new Option(s.name + (s.isAudioReactive ? ' 🔊' : ''), s.name));
+      if (prevM2 !== '' && [...m2.options].some(o => o.value === prevM2)) m2.value = prevM2;
       shadersLoaded = true;
       $('shaderCount').textContent = data.shaders.length === 0
         ? 'No .glsl shaders in the shader directory.'
@@ -838,6 +881,21 @@ async function applyShader() {
       showBanner(d.error || 'Failed to apply shader.', true);
     }
   } catch (e) { showBanner('Failed to apply shader: ' + e, true); }
+}
+
+async function applyMatrix2Shader() {
+  const name = $('matrix2Select').value;
+  if (!name) { showBanner('Pick a shader for matrix 2 — or ""Mirror main matrix"" / ""Off (blank)"".', true); return; }
+  try {
+    const r = await fetch(API + 'api/select-matrix2-shader', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+    const d = await r.json();
+    if (d.ok) {
+      showBanner('Matrix 2: ' + (d.matrix2 || name) + '.', false);
+      refreshStatus();
+    } else {
+      showBanner(d.error || 'Failed to apply matrix 2 shader.', true);
+    }
+  } catch (e) { showBanner('Failed to apply matrix 2 shader: ' + e, true); }
 }
 
 // ── Audio ────────────────────────────────────────────────────────
@@ -1012,6 +1070,29 @@ async function refreshStatus() {
     }
     window._shaderServerSel = d.selectedShader;
 
+    // Matrix 2's own shader selection (only when the output is enabled), same
+    // don't-clobber-a-staged-selection rule as the main dropdown.
+    const m2sel = $('matrix2Select');
+    const m2 = d.matrix2;
+    if (m2 && m2.enabled) {
+      const serverM2 = m2.selectedShader === 'off' ? 'off'
+        : (m2.selectedShader && m2.selectedShader !== 'mirror (main matrix)')
+          ? PathNameNoExt(m2.selectedShader) : 'mirror';
+      if (!shadersLoaded) loadShaders(0);
+      const prevM2Server = window._matrix2ServerSel;
+      if (prevM2Server === undefined || m2sel.value === prevM2Server) m2sel.value = serverM2;
+      window._matrix2ServerSel = serverM2;
+      m2sel.disabled = false;
+      $('applyMatrix2Btn').disabled = false;
+      $('matrix2Status').textContent = m2.width + '×' + m2.height + ' · universe ' + m2.universe + ' → ' + m2.ip
+        + (m2.active ? '' : ' (target unreachable — retrying)')
+        + ' · ' + (m2.framesSent ?? 0).toLocaleString() + ' frames';
+    } else {
+      m2sel.disabled = true;
+      $('applyMatrix2Btn').disabled = true;
+      $('matrix2Status').textContent = 'Matrix 2 output is off (start the app with --matrix2).';
+    }
+
     $('stString').textContent = !d.stringEnabled ? 'off'
       : (d.stringSize + ' LEDs · uni ' + (d.stringUniverse > 0 ? d.stringUniverse : 'auto') + ' → ' + (d.stringIp || 'matrix IP'));
     updateStringHint({ enabled: d.stringEnabled, size: d.stringSize, row: d.stringRow, ip: d.stringIp, universe: d.stringUniverse });
@@ -1040,6 +1121,7 @@ const agent = d.ledAgent;
 
 // ── Wire up ──────────────────────────────────────────────────────
 $('applyShaderBtn').addEventListener('click', applyShader);
+$('applyMatrix2Btn').addEventListener('click', applyMatrix2Shader);
 $('applyStringBtn').addEventListener('click', applyString);
 $('sendNotifyBtn').addEventListener('click', sendNotification);
 $('notifyText').addEventListener('keydown', e => { if (e.key === 'Enter') sendNotification(); });
@@ -1058,6 +1140,24 @@ setInterval(refreshStatus, 2000);
     {
         var data = CurrentShaders().Select(s => new { s.Name, s.FileName, s.IsAudioReactive }).ToArray();
         SendJson(clientSocket, new { shaders = data });
+    }
+
+    private void ServeSelectMatrix2Shader(Socket clientSocket, string body)
+    {
+        var jsonObj = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object>>(body);
+        string? name = jsonObj?.GetValueOrDefault("name")?.ToString();
+
+        if (string.IsNullOrEmpty(name))
+        {
+            SendJson(clientSocket, new { ok = false, error = "Missing 'name' field." });
+            return;
+        }
+
+        string? selected = SelectMatrix2ShaderByName(name, out string? error);
+        if (selected == null)
+            SendJson(clientSocket, new { ok = false, error });
+        else
+            SendJson(clientSocket, new { ok = true, matrix2 = selected });
     }
 
     private void ServeSelectShader(Socket clientSocket, string body)
@@ -1113,48 +1213,7 @@ setInterval(refreshStatus, 2000);
             return "Off (blank)";
         }
 
-        // Search for the shader file by name. Match exactly on the display name
-        // (filename without extension) or the full filename — never a substring,
-        // so "fire" won't accidentally select "fireworks.glsl".
-        string? fullPath = null;
-        foreach (var s in CurrentShaders())
-        {
-            string fileNameWithExt = Path.GetFileName(s.FileName);
-            if (s.Name.Equals(name!, StringComparison.OrdinalIgnoreCase)
-                || fileNameWithExt.Equals(name!, StringComparison.OrdinalIgnoreCase))
-            {
-                fullPath = s.FileName;
-                break;
-            }
-        }
-
-        // Fallback: try as a filename directly
-        if (fullPath == null && Directory.Exists(_shaderDirPath))
-        {
-            foreach (var f in Directory.GetFiles(_shaderDirPath, "*.glsl", SearchOption.TopDirectoryOnly))
-            {
-                if (Path.GetFileName(f).Equals(name, StringComparison.OrdinalIgnoreCase) ||
-                    Path.GetFileNameWithoutExtension(f).Equals(name, StringComparison.OrdinalIgnoreCase))
-                {
-                    fullPath = f;
-                    break;
-                }
-            }
-        }
-
-        // Also try current directory's shaders/ subfolder
-        if (fullPath == null && Directory.Exists(Path.Combine(Directory.GetCurrentDirectory(), "shaders")))
-        {
-            foreach (var f in Directory.GetFiles(Path.Combine(Directory.GetCurrentDirectory(), "shaders"), "*.glsl", SearchOption.TopDirectoryOnly))
-            {
-                if (Path.GetFileName(f).Equals(name, StringComparison.OrdinalIgnoreCase) ||
-                    Path.GetFileNameWithoutExtension(f).Equals(name, StringComparison.OrdinalIgnoreCase))
-                {
-                    fullPath = f;
-                    break;
-                }
-            }
-        }
+        string? fullPath = FindShaderFile(name!);
 
         if (fullPath == null || !File.Exists(fullPath))
         {
@@ -1166,6 +1225,103 @@ setInterval(refreshStatus, 2000);
         string fileName = Path.GetFileNameWithoutExtension(fullPath);
         QueuePendingShader(source, fileName);
         Console.WriteLine($"[WebServer] Shader changed via web: {fileName}");
+        return Path.GetFileName(fullPath);
+    }
+
+    /// <summary>
+    /// Search the shader list and the fallback directories for a shader file by name.
+    /// Match exactly on the display name (filename without extension) or the full
+    /// filename — never a substring, so "fire" won't accidentally select "fireworks.glsl".
+    /// </summary>
+    private string? FindShaderFile(string name)
+    {
+        foreach (var s in CurrentShaders())
+        {
+            string fileNameWithExt = Path.GetFileName(s.FileName);
+            if (s.Name.Equals(name, StringComparison.OrdinalIgnoreCase)
+                || fileNameWithExt.Equals(name, StringComparison.OrdinalIgnoreCase))
+                return s.FileName;
+        }
+
+        // Fallback: try as a filename directly
+        if (Directory.Exists(_shaderDirPath))
+        {
+            foreach (var f in Directory.GetFiles(_shaderDirPath, "*.glsl", SearchOption.TopDirectoryOnly))
+            {
+                if (Path.GetFileName(f).Equals(name, StringComparison.OrdinalIgnoreCase) ||
+                    Path.GetFileNameWithoutExtension(f).Equals(name, StringComparison.OrdinalIgnoreCase))
+                    return f;
+            }
+        }
+
+        // Also try current directory's shaders/ subfolder
+        if (Directory.Exists(Path.Combine(Directory.GetCurrentDirectory(), "shaders")))
+        {
+            foreach (var f in Directory.GetFiles(Path.Combine(Directory.GetCurrentDirectory(), "shaders"), "*.glsl", SearchOption.TopDirectoryOnly))
+            {
+                if (Path.GetFileName(f).Equals(name, StringComparison.OrdinalIgnoreCase) ||
+                    Path.GetFileNameWithoutExtension(f).Equals(name, StringComparison.OrdinalIgnoreCase))
+                    return f;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Queue a shader for the second matrix only. Matrix 2 mirrors the main matrix's
+    /// shader by default; any real selection makes it independent, "off" blanks it on
+    /// its own, and "mirror" re-links it to the main matrix. Shares the main matrix's
+    /// name resolution and audio capture — nothing else.
+    /// </summary>
+    /// <returns>The selected shader's file name, "Off (blank)", or "mirror (main matrix shader)";
+    /// null on failure, with <paramref name="error"/> describing why.</returns>
+    public string? SelectMatrix2ShaderByName(string name, out string? error)
+    {
+        error = null;
+        if (string.IsNullOrEmpty(name))
+        {
+            error = "Missing shader name.";
+            return null;
+        }
+
+        string lowerName = name.ToLowerInvariant();
+
+        // "mirror" re-links matrix 2 to whatever the main matrix is showing.
+        if (lowerName is "mirror" or "mirror main" or "same as matrix" or "follow main")
+        {
+            QueuePendingMatrix2Shader(Matrix2MirrorToken, "mirror");
+            Console.WriteLine("[WebServer] Matrix 2 shader set to mirror the main matrix.");
+            return "mirror (main matrix shader)";
+        }
+
+        // Special: "off" blanks matrix 2 only — the main matrix is untouched.
+        if (lowerName == "off")
+        {
+            QueuePendingMatrix2Shader(null, "Off");  // null source signals the render loop to blank matrix 2
+            Console.WriteLine("[WebServer] Matrix 2 shader set to Off — blank screen.");
+            return "Off (blank)";
+        }
+
+        // Special: "built-in default" — BuildFragmentShader expands the token.
+        if (lowerName == "built-in default" || lowerName == "built-in")
+        {
+            QueuePendingMatrix2Shader(BuiltInShaderToken, "built-in default");
+            Console.WriteLine("[WebServer] Matrix 2 shader set to the built-in default.");
+            return "built-in default";
+        }
+
+        string? fullPath = FindShaderFile(name);
+        if (fullPath == null || !File.Exists(fullPath))
+        {
+            error = $"Shader '{name}' not found.";
+            return null;
+        }
+
+        string source = File.ReadAllText(fullPath);
+        string fileName = Path.GetFileNameWithoutExtension(fullPath);
+        QueuePendingMatrix2Shader(source, fileName);
+        Console.WriteLine($"[WebServer] Matrix 2 shader changed via web: {fileName}");
         return Path.GetFileName(fullPath);
     }
 
@@ -1532,6 +1688,7 @@ setInterval(refreshStatus, 2000);
             var devices = devicesRaw.Select(d => new { Index = d.Index, Name = d.Name }).ToList();
             var loopbackName = GetLoopbackDeviceName?.Invoke() ?? snap.LoopbackDeviceName;
             var ledAgent = GetLiveLedAgent?.Invoke() ?? snap.LedAgent;
+            object matrix2 = (object?)GetLiveMatrix2?.Invoke() ?? new { enabled = false };
 
             SendJson(clientSocket, new
             {
@@ -1554,7 +1711,8 @@ setInterval(refreshStatus, 2000);
                 snap.StringSendErrors,
                 snap.ActiveNotification,
                 snap.NotificationRemainingSecs,
-                ledAgent
+                ledAgent,
+                matrix2
             });
         }
         else

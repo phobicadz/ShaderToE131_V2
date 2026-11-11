@@ -27,6 +27,10 @@ namespace ShaderToE131;
 /// how the effects are driven reliably: this HA build does not surface the light's
 /// <c>effect_list</c>, but select entities map 1:1 onto the shader names.
 ///
+/// A third entity, <c>select.&lt;prefix&gt;_shader_matrix2</c> (topics <c>&lt;prefix&gt;/shader2/set|state</c>),
+/// drives the optional second matrix's own shader independently — options add "mirror", the
+/// default relationship where matrix 2 shows whatever the main matrix shows.
+///
 /// Text banners have their own pair of entities: <c>text.&lt;prefix&gt;_message</c> (type something,
 /// it appears on the matrix; its state mirrors the banner currently showing) and
 /// <c>number.&lt;prefix&gt;_banner_seconds</c> (how long a plain-text banner stays up).
@@ -62,6 +66,9 @@ public sealed class MqttClient : IDisposable
     public string ShaderSelectCommandTopic => $"{_prefix}/shader/set";
     public string ShaderSelectStateTopic => $"{_prefix}/shader/state";
     public string ShaderSelectDiscoveryTopic => $"homeassistant/select/{_prefix}_shader/config";
+    public string Shader2SelectCommandTopic => $"{_prefix}/shader2/set";
+    public string Shader2SelectStateTopic => $"{_prefix}/shader2/state";
+    public string Shader2SelectDiscoveryTopic => $"homeassistant/select/{_prefix}_shader_matrix2/config";
     public string NotifyStateTopic => $"{_prefix}/notify/state";
     public string NotifyDurationSetTopic => $"{_prefix}/notify/duration/set";
     public string NotifyDurationStateTopic => $"{_prefix}/notify/duration/state";
@@ -124,6 +131,7 @@ public sealed class MqttClient : IDisposable
                     await PublishAsync(AvailabilityTopic, "online", retain: true, MqttQualityOfServiceLevel.AtLeastOnce);
                     await PublishDiscoveryAsync();
                     await PublishShaderSelectDiscoveryAsync();
+                    await PublishMatrix2ShaderSelectDiscoveryAsync();
                     await PublishBannerEntitiesDiscoveryAsync();
                     await PublishStateAsync();
                 }
@@ -150,8 +158,10 @@ public sealed class MqttClient : IDisposable
         await _client.SubscribeAsync(_factory.CreateSubscribeOptionsBuilder()
             .WithTopicFilter(ShaderSelectCommandTopic, MqttQualityOfServiceLevel.AtLeastOnce).Build());
         await _client.SubscribeAsync(_factory.CreateSubscribeOptionsBuilder()
+            .WithTopicFilter(Shader2SelectCommandTopic, MqttQualityOfServiceLevel.AtLeastOnce).Build());
+        await _client.SubscribeAsync(_factory.CreateSubscribeOptionsBuilder()
             .WithTopicFilter(NotifyDurationSetTopic, MqttQualityOfServiceLevel.AtLeastOnce).Build());
-        Console.WriteLine($"[Mqtt] subscribed to {SetTopic}, {NotifySetTopic}, {ShaderSelectCommandTopic}, {NotifyDurationSetTopic}.");
+        Console.WriteLine($"[Mqtt] subscribed to {SetTopic}, {NotifySetTopic}, {ShaderSelectCommandTopic}, {Shader2SelectCommandTopic}, {NotifyDurationSetTopic}.");
     }
 
     // ─── Home Assistant discovery ───
@@ -220,6 +230,35 @@ public sealed class MqttClient : IDisposable
 
         Console.WriteLine($"[Mqtt] publishing Home Assistant discovery for select '{_prefix}_shader' ({options.Count} options).");
         return PublishAsync(ShaderSelectDiscoveryTopic, JsonSerializer.Serialize(discovery), retain: true, MqttQualityOfServiceLevel.AtLeastOnce);
+    }
+
+    /// <summary>
+    /// Discovery payload for the second matrix's companion select entity: matrix 2's own
+    /// shader, independent from the main matrix (only the audio capture is shared).
+    /// Options carry the extra pseudo-shader "mirror", the default relationship.
+    /// </summary>
+    private Task PublishMatrix2ShaderSelectDiscoveryAsync()
+    {
+        var options = new List<string> { "mirror", "off", "built-in default" };
+        options.AddRange(_web.Shaders.Select(s => s.Name));
+
+        var discovery = new Dictionary<string, object>
+        {
+            ["name"] = "Matrix 2 Shader",
+            ["unique_id"] = $"{_prefix}_shader_matrix2",
+            ["options"] = options,
+            ["command_topic"] = Shader2SelectCommandTopic,
+            ["state_topic"] = Shader2SelectStateTopic,
+            ["availability_topic"] = AvailabilityTopic,
+            ["payload_available"] = "online",
+            ["payload_not_available"] = "offline",
+            ["icon"] = "mdi:shader",
+            ["qos"] = 1,
+            ["device"] = DeviceBlock(),
+        };
+
+        Console.WriteLine($"[Mqtt] publishing Home Assistant discovery for select '{_prefix}_shader_matrix2' ({options.Count} options).");
+        return PublishAsync(Shader2SelectDiscoveryTopic, JsonSerializer.Serialize(discovery), retain: true, MqttQualityOfServiceLevel.AtLeastOnce);
     }
 
     private Dictionary<string, object> DeviceBlock() => new()
@@ -354,6 +393,20 @@ public sealed class MqttClient : IDisposable
                 }
                 if (name != "off") _lastEffect = name;
                 Console.WriteLine($"[Mqtt] select command → {selected}");
+                ScheduleStatePublish();
+            }
+            else if (topic == Shader2SelectCommandTopic)
+            {
+                // Matrix 2's own shader select. Validation is the shared WebServer one;
+                // "mirror" re-links it to the main matrix, "off" blanks only matrix 2.
+                string name = payload.Trim();
+                string? selected = _web.SelectMatrix2ShaderByName(name, out string? selectError);
+                if (selected == null)
+                {
+                    Console.WriteLine($"[Mqtt] {selectError}");
+                    return;
+                }
+                Console.WriteLine($"[Mqtt] matrix 2 select command → {selected}");
                 ScheduleStatePublish();
             }
             else if (topic == NotifySetTopic)
@@ -560,6 +613,19 @@ public sealed class MqttClient : IDisposable
             ? "off"
             : Path.GetFileNameWithoutExtension(selected);
 
+    /// <summary>
+    /// Map matrix 2's reported shader onto one of its select entity's options:
+    /// "mirror" (it follows the main matrix), "off", or a bare shader name.
+    /// "mirror (main matrix shader)" is what the render loop reports for the default state.
+    /// </summary>
+    private static string Matrix2ShaderOption(string? selected)
+        => string.IsNullOrEmpty(selected)
+            || selected.Equals("off", StringComparison.OrdinalIgnoreCase)
+                ? "off"
+            : selected.StartsWith("mirror", StringComparison.OrdinalIgnoreCase)
+                ? "mirror"
+                : Path.GetFileNameWithoutExtension(selected);
+
     private async Task PublishStateAsync()
     {
         if (!_client.IsConnected) return;
@@ -581,6 +647,11 @@ public sealed class MqttClient : IDisposable
         await PublishAsync(StateTopic, JsonSerializer.Serialize(new { state = on ? "ON" : "OFF", effect }), retain: true);
         await PublishAsync(ShaderSelectStateTopic, ShaderOption(selected), retain: true);
 
+        // Matrix 2's own shader selection (only when the output is enabled).
+        var m2 = _web.GetLiveMatrix2?.Invoke();
+        if (m2 != null)
+            await PublishAsync(Shader2SelectStateTopic, Matrix2ShaderOption(m2.SelectedShader), retain: true);
+
         // Banner entities: what is on the matrix right now, and the configured lifetime.
         await PublishAsync(NotifyStateTopic, snap?.ActiveNotification ?? "", retain: true);
         await PublishAsync(NotifyDurationStateTopic,
@@ -599,6 +670,10 @@ public sealed class MqttClient : IDisposable
             string_universe = snap.StringUniverse,
             string_frames_sent = snap.StringFramesSent,
             string_send_errors = snap.StringSendErrors,
+            matrix2_enabled = m2?.Enabled ?? false,
+            matrix2_selected_shader = m2?.SelectedShader,
+            matrix2_frames_sent = m2?.FramesSent ?? 0,
+            matrix2_send_errors = m2?.SendErrors ?? 0,
             uptime_secs = (int)snap.UptimeSecs,
         }), retain: true);
     }
