@@ -9,6 +9,7 @@ ShaderToE131 takes [ShaderToy-style](https://www.shadertoy.com/) GLSL shaders (`
 ### Features
 
 - 🎨 **ShaderToy-compatible GLSL shaders** — auto-wrapped with uniforms (`u_time`, `u_resolution`, `u_frame`)
+- 🔤 **Text banners** — draw a message over any display: the main matrix, the second matrix, or both, each with its own copy, lifetime and overlay style
 - 🔊 **Audio reactivity** — FFT spectral analysis (2048-point, ~21.5 Hz resolution) feeds bass/mid/treble bands as shader uniforms
 - 🌐 **Web control panel** — select shaders, switch audio source/devices, configure the LED string, and view live status — all without restarting
 - 📡 **E.1.31/sACN output** — UDP multicast/unicast to LED matrix controllers (4 universes: 583 pixels × 3 channels = 1749 DMX slots)
@@ -234,7 +235,8 @@ It publishes Home Assistant **discovery**, so HA gets four entities under one de
 |-----------|---------|
 | `light.shadertoe131_led_matrix` | On/off for the matrix (`off` blanks the panel and keeps sending black frames) |
 | `select.shadertoe131_shader` | One option per shader, plus `off` and `built-in default` — this is how shaders are picked |
-| `text.shadertoe131_matrix_message` | Type text and it appears on the matrix; its state mirrors the banner currently on screen |
+| `text.shadertoe131_matrix_message` | Type text and it appears on the main matrix; its state mirrors the banner currently on screen |
+| `text.shadertoe131_matrix2_message` | The same for the second matrix (`--matrix2`): its own banner, its own state, independent of the main matrix |
 | `number.shadertoe131_banner_seconds` | How long a plain-text banner stays lit (1–300 s, default 10) |
 
 Topics (prefix `shadertoe131`):
@@ -243,7 +245,8 @@ Topics (prefix `shadertoe131`):
 |-------|-----------|----------|
 | `homeassistant/light/shadertoe131_matrix/config` | out (retained) | light discovery |
 | `homeassistant/select/shadertoe131_shader/config` | out (retained) | select discovery |
-| `homeassistant/text/shadertoe131_message/config` | out (retained) | text-entity discovery |
+| `homeassistant/text/shadertoe131_message/config` | out (retained) | main-matrix text-entity discovery |
+| `homeassistant/text/shadertoe131_matrix2_message/config` | out (retained) | matrix-2 text-entity discovery |
 | `homeassistant/number/shadertoe131_banner_seconds/config` | out (retained) | number-entity discovery |
 | `shadertoe131/matrix/set` | in | `{"state":"ON\|OFF"}`, `{"effect":"<shader>"}` or bare `ON`/`OFF` |
 | `shadertoe131/shader/set` | in | a shader name, `off`, or `built-in default` |
@@ -253,8 +256,10 @@ Topics (prefix `shadertoe131`):
 | `shadertoe131/matrix/availability` | out (retained) | `online` / `offline` (also the client's last-will) |
 | `shadertoe131/shader2/set` | in | matrix 2's own shader: a shader name, `off`, `mirror` (follow the main matrix again), or `built-in default` |
 | `shadertoe131/shader2/state` | out (retained) | matrix 2's current shader option |
-| `shadertoe131/notify/set` | in | banner text, plain text or `{"text":"…","duration":10,"overlay":true}` |
-| `shadertoe131/notify/state` | out (retained) | the banner currently on screen (empty when there is none) |
+| `shadertoe131/notify/set` | in | banner text for the main matrix, plain text or `{"text":"…","duration":10,"overlay":true,"target":"…"}` |
+| `shadertoe131/notify/state` | out (retained) | the main matrix's banner currently on screen (empty when there is none) |
+| `shadertoe131/notify2/set` | in | banner text for **matrix 2** (a bare string, or JSON; a JSON payload that names its own `target` is respected) |
+| `shadertoe131/notify2/state` | out (retained) | matrix 2's banner currently on screen (empty when there is none) |
 | `shadertoe131/notify/duration/set` | in | banner lifetime in seconds, used for plain-text banners |
 | `shadertoe131/notify/duration/state` | out (retained) | current banner lifetime |
 
@@ -273,23 +278,25 @@ Shaders — pick from the dropdown, or from an automation:
 ```
 
 Text banners — the `text` entity is the dashboard way to do it (note the field is `value`, not
-`text`; the banner length comes from `number.shadertoe131_banner_seconds`):
+`text`; the banner length comes from `number.shadertoe131_banner_seconds`). There are two: the main
+matrix's and, when `--matrix2` is on, `text.shadertoe131_matrix2_message` for the second matrix —
+each with its own state, independent of the other:
 
 ```yaml
 - action: text.set_value
-  target: { entity_id: text.shadertoe131_matrix_message }
+  target: { entity_id: text.shadertoe131_matrix_message }   # or …_matrix2_message for the panel
   data: { value: "Tea is ready" }
 ```
 
-or publish straight to the topic when you want to choose the duration per message, or keep the
-shader visible behind the text:
+or publish straight to the topic when you want to choose the duration per message, keep the
+shader visible behind the text, or send to both displays at once:
 
 ```yaml
 - action: mqtt.publish
   data:
-    topic: shadertoe131/notify/set
+    topic: shadertoe131/notify/set   # or shadertoe131/notify2/set for matrix 2 only
     payload: >-
-      {"text": "Tea is ready", "duration": 15, "overlay": true}
+      {"text": "Tea is ready", "duration": 15, "overlay": true, "target": "both"}
 ```
 
 Clear a banner early with an empty value. Limits: 200 characters, printable ASCII; anything wider
@@ -342,14 +349,14 @@ http://localhost:<port>
 |----------|--------|-------------|----------|
 | `/api/shaders` | GET | List all available shaders | JSON array of `{name, fileName, isAudioReactive}` |
 | `/api/select-shader` | POST | Select a shader by filename (`"off"` for blank) | `{"ok": true/false}` |
-| `/api/notify` | POST | Show a text banner: `{"text":"…","duration":10,"overlay":false}` (`"text":""` clears it) | `{"ok": true, "text", "duration", "overlay"}` |
+| `/api/notify` | POST | Show a text banner: `{"text":"…","duration":10,"overlay":false,"target":"matrix"}` (`"text":""` clears it; `target` is `matrix` (default), `matrix2` or `both`) | `{"ok": true, "text", "duration", "overlay", "target"}` |
 | `/api/set-audio` | POST | Enable/disable audio capture | `{"ok": true/false}` |
 | `/api/set-audio-source` | POST | Set source: `off`, `microphone`, or `loopback` | `{"ok": true, "source", "enabled"}` |
 | `/api/audio-devices` | GET | List available loopback devices | `{devices: [{index, name}]}` |
 | `/api/set-audio-device` | POST | Select loopback device by index | `{"ok": true/false}` |
 | `/api/set-string` | POST | Configure LED string: `{enabled, size, row, ip, universe}` (omit fields to keep current values; `ip` accepts an IP or a hostname, e.g. `ledstring.local`; `ip: ""` resets to the matrix IP; `universe: 0` = auto) | `{"ok": true/false}` |
 | `/api/string-config` | GET | Current LED string config + live stats | JSON object (see below) |
-| `/api/matrix2` | GET | Live second-matrix output state: `{enabled, active, width, height, ip, universe, fps, selectedShader, framesSent, sendErrors}` (`selectedShader` is the matrix-2 shader name, `"off"`, or `"mirror (main matrix)"`; `{"enabled": false}` when `--matrix2` is off; `active: false` = configured but the target currently cannot be resolved) | JSON object |
+| `/api/matrix2` | GET | Live second-matrix output state: `{enabled, active, width, height, ip, universe, fps, selectedShader, activeNotification, notificationRemainingSecs, framesSent, sendErrors}` (`selectedShader` is the matrix-2 shader name, `"off"`, or `"mirror (main matrix)"`; `activeNotification` is the banner currently on matrix 2, null when none; `{"enabled": false}` when `--matrix2` is off; `active: false` = configured but the target currently cannot be resolved) | JSON object |
 | `/api/select-matrix2-shader` | POST | Give matrix 2 its own shader: `{"name":"<shader>"}`, `"off"` (blank matrix 2 only), `"mirror"` (follow the main matrix again), or `"built-in default"` | `{"ok": true, "matrix2": "<file>"}` |
 | `/api/led-agent` | GET | Live LED agent link state (`{"enabled": false}` when `--led-agent` is off) | JSON object (see "LED Agent") |
 | `/api/status` | GET | Get current status and stats | JSON object (see below) |
@@ -357,7 +364,7 @@ http://localhost:<port>
 #### Text banners
 
 `/api/notify` (and the MQTT `…/notify/set` topic) takes `text`, an optional `duration` (1–300 s,
-default 10) and an optional `overlay`:
+default 10), an optional `overlay`, and an optional `target`:
 
 - **`overlay: false`** *(default)* — a black band is cleared across the panel and the text is drawn
   in white on it. The shader keeps rendering outside the band.
@@ -366,20 +373,29 @@ default 10) and an optional `overlay`:
   readable over bright output. Use this when the banner would otherwise cut a black stripe through a
   shader you care about.
 
+- **`target: "matrix"`** *(default)* — draw on the main 53×11 matrix only. Omitting `target` means
+  the main matrix, exactly as before the field existed.
+- **`target: "matrix2"`** — draw on the second matrix only (`--matrix2`), at its own dimensions.
+  Matrix 2 keeps its own banner, lifetime and expiry, independent of what the main matrix shows —
+  including while the main matrix is Off or running a different shader. `"panel"`/`"second"`/`"m2"`
+  are accepted aliases; `"main"`/`"matrix1"` alias the main matrix.
+- **`target: "both"`** — post an independent copy to each display.
+
 `--text-overlay` makes overlay the default for every banner that does not say otherwise; a per-message
-`overlay` always wins over it. The web control panel has an **Overlay** checkbox in the Notifications
-card.
+`overlay` always wins over it. The web control panel has an **Overlay** checkbox and a **Target**
+dropdown in the Notifications card.
 
 Text limits: 5×7 ASCII bitmap font (200 characters max, unsupported characters render as gaps). Up to
 9 characters fit the 53 px panel and are centered and static; anything longer scrolls as a marquee at
-12 px/s, which needs about 5 s to cross the panel.
+12 px/s, which needs about 5 s to cross the panel. The same renderer runs on matrix 2 at its own
+size, so the number of characters that fit before it scrolls is decided per display.
 
 The LED string is sampled from the framebuffer **before** the banner is drawn, so text always appears
-on the matrix only — the string keeps mirroring the shader. The second matrix (`--matrix2`) behaves
-the same way: it renders its own (or the mirrored) shader at its own resolution, never the banner.
-Turning the main matrix **Off** only blanks matrix 2 while it mirrors the main one; an independently
-selected matrix-2 shader keeps running, and matrix 2 can be turned off on its own without touching
-the main matrix.
+on the matrix only — the string keeps mirroring the shader. Matrix 2's banner is likewise drawn on
+its own framebuffer after its shader frame and before its mapping. Turning the main matrix **Off**
+only blanks matrix 2 while it mirrors the main one; an independently selected matrix-2 shader and a
+matrix-2 banner keep running, and matrix 2 can be turned off on its own without touching the main
+matrix.
 
 #### Status Response
 

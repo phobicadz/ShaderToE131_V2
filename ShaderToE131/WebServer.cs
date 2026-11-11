@@ -85,10 +85,16 @@ public sealed class WebServer : IDisposable
     /// An empty Text means "clear the active notification".
     /// </summary>
     /// <summary>A pending text banner. <see cref="Overlay"/> is null when the request did not say,
-    /// in which case <see cref="DefaultTextOverlay"/> decides it.</summary>
-    public record NotificationRequest(string Text, int DurationSec, bool? Overlay = null);
+    /// in which case <see cref="DefaultTextOverlay"/> decides it. <see cref="Target"/> is null when
+    /// the request did not name a display, which means the main matrix.</summary>
+    public record NotificationRequest(string Text, int DurationSec, bool? Overlay = null, string? Target = null);
 
     private volatile NotificationRequest? _pendingNotification;
+
+    // Matrix 2's own banner slot: same single-slot/atomic-consume pattern. A banner
+    // posted with target "matrix2" or "both" lands here as well as (or instead of)
+    // the main matrix's; the render loop applies both on its own thread.
+    private volatile NotificationRequest? _pendingMatrix2Notification;
 
     /// <summary>
     /// What a banner does when the request does not say: false (default) blanks a black band across
@@ -102,6 +108,12 @@ public sealed class WebServer : IDisposable
     /// Returns null when nothing is pending.
     /// </summary>
     public NotificationRequest? ConsumePendingNotification() => Interlocked.Exchange(ref _pendingNotification, null);
+
+    /// <summary>Atomically take matrix 2's pending banner (see ConsumePendingNotification).</summary>
+    public NotificationRequest? ConsumePendingMatrix2Notification() => Interlocked.Exchange(ref _pendingMatrix2Notification, null);
+
+    // Test hook: post a matrix-2 banner as the /api/notify handler would.
+    internal void SetPendingMatrix2NotificationForTest(NotificationRequest request) => _pendingMatrix2Notification = request;
 
     // Test hook: post a notification as the /api/notify handler would.
     internal void SetPendingNotificationForTest(NotificationRequest request) => _pendingNotification = request;
@@ -193,7 +205,9 @@ public sealed class WebServer : IDisposable
         int Fps,        // this output's send cap (0 = uncapped)
         int FramesSent,
         int SendErrors,
-        string? SelectedShader = null  // "mirror (main matrix)" when it follows the main matrix
+        string? SelectedShader = null,  // "mirror (main matrix)" when it follows the main matrix
+        string? ActiveNotification = null,      // banner currently on matrix 2 (null when none)
+        double NotificationRemainingSecs = 0    // seconds the matrix-2 banner has left
     );
 
     private static readonly JsonSerializerOptions JsonCamelCase = new()
@@ -746,9 +760,17 @@ public sealed class WebServer : IDisposable
             <label for=""notifyOverlay"">Overlay</label>
             <input type=""checkbox"" id=""notifyOverlay"">
           </div>
+          <div>
+            <label for=""notifyTarget"">Target</label>
+            <select id=""notifyTarget"">
+              <option value=""matrix"">Main matrix</option>
+              <option value=""matrix2"">Second matrix</option>
+              <option value=""both"">Both</option>
+            </select>
+          </div>
         </div>
         <button id=""sendNotifyBtn"">Send Notification</button>
-        <div class=""hint"">Overlay draws the text on top of the shader (with a black outline) instead of blanking a band across it.</div>
+        <div class=""hint"">Overlay draws the text on top of the shader (with a black outline) instead of blanking a band across it. Target sends the banner to the main matrix, the second matrix, or both — each keeps its own copy and lifetime.</div>
         <div class=""hint"" id=""notifyStatus"">No active notification.</div>
       </section>
     </div>
@@ -1036,7 +1058,7 @@ async function sendNotification() {
   const dur = Number(durRaw);
   if (!Number.isInteger(dur) || dur < 1 || dur > 300) { showBanner('Duration must be a whole number of seconds (1–300).', true); return; }
   try {
-    const r = await fetch(API + 'api/notify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, duration: dur, overlay: $('notifyOverlay').checked }) });
+    const r = await fetch(API + 'api/notify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, duration: dur, overlay: $('notifyOverlay').checked, target: $('notifyTarget').value }) });
     const d = await r.json();
     if (d.ok) showBanner(text ? 'Notification sent.' : 'Notification cleared.', false);
     else showBanner(d.error || 'Failed to send notification.', true);
@@ -1086,7 +1108,8 @@ async function refreshStatus() {
       $('applyMatrix2Btn').disabled = false;
       $('matrix2Status').textContent = m2.width + '×' + m2.height + ' · universe ' + m2.universe + ' → ' + m2.ip
         + (m2.active ? '' : ' (target unreachable — retrying)')
-        + ' · ' + (m2.framesSent ?? 0).toLocaleString() + ' frames';
+        + ' · ' + (m2.framesSent ?? 0).toLocaleString() + ' frames'
+        + (m2.activeNotification ? ' · banner: ' + truncate(m2.activeNotification, 24) + ' (' + Math.ceil(m2.notificationRemainingSecs || 0) + 's)' : '');
     } else {
       m2sel.disabled = true;
       $('applyMatrix2Btn').disabled = true;
@@ -1476,7 +1499,25 @@ setInterval(refreshStatus, 2000);
             else { error = "'overlay' must be true or false."; return null; }
         }
 
-        return new NotificationRequest(text, duration, overlay);
+        // Optional: which display the banner goes to. Absent means the main matrix,
+        // exactly as before this field existed. "both" posts to both independently.
+        string? target = null;
+        if (json.TryGetValue("target", out var tgEl))
+        {
+            if (tgEl.ValueKind != JsonValueKind.String)
+            { error = "'target' must be \"matrix\", \"matrix2\" or \"both\"."; return null; }
+            target = (tgEl.GetString() ?? "").Trim().ToLowerInvariant() switch
+            {
+                "matrix" or "main" or "matrix1" => "matrix",
+                "matrix2" or "m2" or "panel" or "second" => "matrix2",
+                "both" or "all" => "both",
+                _ => null
+            };
+            if (target == null)
+            { error = $"'target' must be \"matrix\", \"matrix2\" or \"both\" (got '{tgEl.GetString()}')."; return null; }
+        }
+
+        return new NotificationRequest(text, duration, overlay, target);
     }
 
     private void ServeNotify(Socket clientSocket, string body)
@@ -1488,21 +1529,27 @@ setInterval(refreshStatus, 2000);
         }
 
         var request = ParseNotifyRequest(body, out _)!;
+        string target = request.Target ?? "matrix";
         if (request.Text.Length == 0)
-            SendJson(clientSocket, new { ok = true, cleared = true });
+            SendJson(clientSocket, new { ok = true, cleared = true, target });
         else
-            SendJson(clientSocket, new { ok = true, text = request.Text, duration = request.DurationSec, overlay = request.Overlay == true });
+            SendJson(clientSocket, new { ok = true, text = request.Text, duration = request.DurationSec, overlay = request.Overlay == true, target });
     }
 
     /// <summary>
     /// Queue a banner notification from a non-HTTP front-end (the MQTT bridge).
-    /// Reuses the exact <c>POST /api/notify</c> validation, so both paths behave identically.
+    /// Reuses the exact <c>POST /api/notify</c> validation, so both paths behave identically —
+    /// including the optional <c>target</c>, which routes the banner to the main matrix,
+    /// matrix 2, or both.
     /// </summary>
     public bool TryPostNotification(string jsonBody, out string? error)
     {
         var request = ParseNotifyRequest(jsonBody, out error);
         if (request == null) return false;
-        _pendingNotification = request with { Overlay = request.Overlay ?? DefaultTextOverlay };
+        var resolved = request with { Overlay = request.Overlay ?? DefaultTextOverlay };
+        string target = request.Target ?? "matrix";
+        if (target is "matrix" or "both") _pendingNotification = resolved;
+        if (target is "matrix2" or "both") _pendingMatrix2Notification = resolved;
         return true;
     }
 

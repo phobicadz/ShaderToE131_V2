@@ -141,6 +141,13 @@ class Program : IDisposable
     private bool _notifyOverlay;
     private long _notifyStartMs;
     private long _notifyUntilMs;
+    // Matrix 2's own banner state. A notification posted with target "matrix2" or "both"
+    // draws onto matrix 2's framebuffer at its own dimensions, with its own lifetime and
+    // expiry — independent of what the main matrix is showing.
+    private string? _notifyText2;
+    private bool _notifyOverlay2;
+    private long _notifyStartMs2;
+    private long _notifyUntilMs2;
 
     private static readonly string[] AudioUniformNames =
         { "u_bass", "u_lowmid", "u_mid", "u_highmid", "u_treble", "u_volume" };
@@ -777,7 +784,9 @@ void main()
                 _matrix2Fps,
                 _matrix2FramesSent,
                 _matrix2SendErrors,
-                Matrix2SelectedShaderName());
+                Matrix2SelectedShaderName(),
+                _notifyText2,
+                Matrix2NotificationRemainingSecs());
             _webServer.Start();
         }
 
@@ -1097,6 +1106,10 @@ void main()
             if (_lastSpectrum is { } spectrum) _shaderProgram2.SetAudioValues(spectrum);
             _shaderProgram2.Render(_gl!, _matrix2W, _matrix2H, _matrix2FrameBuffer);
         }
+        // Matrix 2's own banner (posted with target "matrix2"/"both"), drawn after its
+        // shader frame and before the mapping — same position in the pipeline as the
+        // main matrix's banner.
+        DrawMatrix2Banner();
         PixelMapper.MapFrame(_matrix2FrameBuffer.AsSpan(), _matrix2W, _matrix2H, _matrix2E131Buffer.AsSpan());
     }
 
@@ -1459,6 +1472,56 @@ void main()
         TextRenderer.DrawBanner(_frameBuffer.AsSpan(), MatW, MatH, _notifyText, nowMs - _notifyStartMs, _notifyOverlay, _textShadow);
     }
 
+    /// <summary>
+    /// Consume any pending matrix-2 text notification (web UI / MQTT). Matrix 2 keeps its
+    /// own banner state and lifetime; an empty text clears only matrix 2's banner.
+    /// </summary>
+    private void ApplyPendingMatrix2Notification()
+    {
+        if (_webServer?.ConsumePendingMatrix2Notification() is not { } note) return;
+
+        if (note.Text.Length == 0)
+        {
+            _notifyText2 = null;
+            // A controller without a program still holds the banner on screen. Re-arm the
+            // clear burst so black frames are actually sent and the panel clears.
+            if (_shaderProgram2 == null)
+                _matrix2OffFramesRemaining = OffClearFrames;
+            Console.WriteLine("[Web] Matrix 2 notification cleared.");
+            return;
+        }
+
+        _notifyText2 = note.Text;
+        _notifyOverlay2 = note.Overlay == true;   // ParseNotifyRequest/TryPostNotification resolve the default
+        _notifyStartMs2 = Environment.TickCount64;
+        _notifyUntilMs2 = _notifyStartMs2 + (long)note.DurationSec * 1000;
+        Console.WriteLine($"[Web] Matrix 2 notification shown for {note.DurationSec}s: {note.Text}");
+    }
+
+    /// <summary>
+    /// Overlay matrix 2's own banner on its framebuffer, and clear it once expired.
+    /// Same rules as the main matrix's banner: expiry re-arms the Off clear burst when
+    /// matrix 2 has no program, so a finished banner is replaced by black frames rather
+    /// than burned into the controller forever.
+    /// </summary>
+    private void DrawMatrix2Banner()
+    {
+        if (_notifyText2 == null) return;
+        long nowMs = Environment.TickCount64;
+        if (nowMs >= _notifyUntilMs2)
+        {
+            _notifyText2 = null;
+            if (_shaderProgram2 == null)
+                _matrix2OffFramesRemaining = OffClearFrames;
+            return;
+        }
+        TextRenderer.DrawBanner(_matrix2FrameBuffer.AsSpan(), _matrix2W, _matrix2H, _notifyText2, nowMs - _notifyStartMs2, _notifyOverlay2, _textShadow);
+    }
+
+    /// <summary>Remaining seconds of matrix 2's active notification (0 when none).</summary>
+    private double Matrix2NotificationRemainingSecs()
+        => _notifyText2 == null ? 0 : Math.Max(0, (_notifyUntilMs2 - Environment.TickCount64) / 1000.0);
+
     /// <summary>Remaining seconds of the active notification (0 when none).</summary>
     private double NotificationRemainingSecs()
         => _notifyText == null ? 0 : Math.Max(0, (_notifyUntilMs - Environment.TickCount64) / 1000.0);
@@ -1489,6 +1552,7 @@ void main()
 
         // Consume any pending text notification from the web UI/API.
         ApplyPendingNotification();
+        ApplyPendingMatrix2Notification();
 
         // Consume any pending shader change BEFORE null guard — when coming from "Off",
         // _shaderProgram is null and we need to reload it before the guard would bail out.
@@ -1633,7 +1697,7 @@ void main()
         // nothing is why "off" cost as much CPU as a running shader. Matrix 2's own
         // black-frame burst must finish before the loop goes quiet, or those frames
         // would never be sent.
-        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null && _matrix2OffFramesRemaining <= 0 && _shaderProgram2 == null)
+        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null && _matrix2OffFramesRemaining <= 0 && _shaderProgram2 == null && _notifyText2 == null)
         {
             Thread.Sleep(OffIdleSleepMs);
             return;
@@ -1706,7 +1770,7 @@ void main()
         // matrix's rate — uncapped or --fps — does not decide when this output
         // transmits. Matrix2SendDue() first: its Off burst may only spend frames
         // on slots that actually send.
-        if (_matrix2Sender != null && Matrix2SendDue() && (_shaderProgram2 != null || Matrix2OffBurstDue()))
+        if (_matrix2Sender != null && Matrix2SendDue() && (_shaderProgram2 != null || Matrix2OffBurstDue() || _notifyText2 != null))
         {
             try
             {
@@ -1721,7 +1785,7 @@ void main()
         }
 
         long nowMs = Environment.TickCount64;
-        if (nowMs - _lastStatusLogMs >= 1000 && (!_isOff || _offFramesRemaining > 0 || _matrix2OffFramesRemaining > 0 || _shaderProgram2 != null))
+        if (nowMs - _lastStatusLogMs >= 1000 && (!_isOff || _offFramesRemaining > 0 || _matrix2OffFramesRemaining > 0 || _shaderProgram2 != null || _notifyText2 != null))
         {
             int r = _e131Buffer.Length > 0 ? _e131Buffer[0] : 0;
             int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;
@@ -1764,6 +1828,7 @@ void main()
 
         // Consume any pending text notification from the web UI/API.
         ApplyPendingNotification();
+        ApplyPendingMatrix2Notification();
 
         // Consume any pending shader change BEFORE null guard — when coming from "Off",
         // _shaderProgram is null and we need to reload it before the guard would bail out.
@@ -1879,7 +1944,7 @@ void main()
         // nothing is why "off" cost as much CPU as a running shader. Matrix 2's own
         // black-frame burst must finish before the loop goes quiet, or those frames
         // would never be sent.
-        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null && _matrix2OffFramesRemaining <= 0 && _shaderProgram2 == null)
+        if (_isOff && _offFramesRemaining <= 0 && _notifyText == null && _matrix2OffFramesRemaining <= 0 && _shaderProgram2 == null && _notifyText2 == null)
         {
             Thread.Sleep(OffIdleSleepMs);
             return;
@@ -1958,7 +2023,7 @@ void main()
         // matrix's rate — uncapped or --fps — does not decide when this output
         // transmits. Matrix2SendDue() first: its Off burst may only spend frames
         // on slots that actually send.
-        if (_matrix2Sender != null && Matrix2SendDue() && (_shaderProgram2 != null || Matrix2OffBurstDue()))
+        if (_matrix2Sender != null && Matrix2SendDue() && (_shaderProgram2 != null || Matrix2OffBurstDue() || _notifyText2 != null))
         {
             try
             {
@@ -1973,7 +2038,7 @@ void main()
         }
 
         long nowMs = Environment.TickCount64;
-        if (nowMs - _lastStatusLogMs >= 2000 && (!_isOff || _offFramesRemaining > 0 || _matrix2OffFramesRemaining > 0 || _shaderProgram2 != null))
+        if (nowMs - _lastStatusLogMs >= 2000 && (!_isOff || _offFramesRemaining > 0 || _matrix2OffFramesRemaining > 0 || _shaderProgram2 != null || _notifyText2 != null))
         {
             int r = _e131Buffer.Length > 0 ? _e131Buffer[0] : 0;
             int g = _e131Buffer.Length > 1 ? _e131Buffer[1] : 0;

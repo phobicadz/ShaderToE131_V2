@@ -31,6 +31,11 @@ namespace ShaderToE131;
 /// drives the optional second matrix's own shader independently — options add "mirror", the
 /// default relationship where matrix 2 shows whatever the main matrix shows.
 ///
+/// Text banners can name a target: <c>&lt;prefix&gt;/notify/set</c> goes to the main matrix (the
+/// default), <c>&lt;prefix&gt;/notify2/set</c> belongs to the companion text entity
+/// <c>text.&lt;prefix&gt;_matrix2_message</c> and goes to matrix 2; any JSON payload may also say
+/// <c>"target":"both"</c>. Each display keeps its own banner, lifetime and state independently.
+///
 /// Text banners have their own pair of entities: <c>text.&lt;prefix&gt;_message</c> (type something,
 /// it appears on the matrix; its state mirrors the banner currently showing) and
 /// <c>number.&lt;prefix&gt;_banner_seconds</c> (how long a plain-text banner stays up).
@@ -70,9 +75,12 @@ public sealed class MqttClient : IDisposable
     public string Shader2SelectStateTopic => $"{_prefix}/shader2/state";
     public string Shader2SelectDiscoveryTopic => $"homeassistant/select/{_prefix}_shader_matrix2/config";
     public string NotifyStateTopic => $"{_prefix}/notify/state";
+    public string Notify2SetTopic => $"{_prefix}/notify2/set";
+    public string Notify2StateTopic => $"{_prefix}/notify2/state";
     public string NotifyDurationSetTopic => $"{_prefix}/notify/duration/set";
     public string NotifyDurationStateTopic => $"{_prefix}/notify/duration/state";
     public string NotifyDiscoveryTopic => $"homeassistant/text/{_prefix}_message/config";
+    public string Notify2DiscoveryTopic => $"homeassistant/text/{_prefix}_matrix2_message/config";
     public string NotifyDurationDiscoveryTopic => $"homeassistant/number/{_prefix}_banner_seconds/config";
 
     /// <summary>Banner lifetime used for plain-text commands, set by the banner-seconds entity.</summary>
@@ -156,12 +164,14 @@ public sealed class MqttClient : IDisposable
         await _client.SubscribeAsync(_factory.CreateSubscribeOptionsBuilder()
             .WithTopicFilter(NotifySetTopic, MqttQualityOfServiceLevel.AtLeastOnce).Build());
         await _client.SubscribeAsync(_factory.CreateSubscribeOptionsBuilder()
+            .WithTopicFilter(Notify2SetTopic, MqttQualityOfServiceLevel.AtLeastOnce).Build());
+        await _client.SubscribeAsync(_factory.CreateSubscribeOptionsBuilder()
             .WithTopicFilter(ShaderSelectCommandTopic, MqttQualityOfServiceLevel.AtLeastOnce).Build());
         await _client.SubscribeAsync(_factory.CreateSubscribeOptionsBuilder()
             .WithTopicFilter(Shader2SelectCommandTopic, MqttQualityOfServiceLevel.AtLeastOnce).Build());
         await _client.SubscribeAsync(_factory.CreateSubscribeOptionsBuilder()
             .WithTopicFilter(NotifyDurationSetTopic, MqttQualityOfServiceLevel.AtLeastOnce).Build());
-        Console.WriteLine($"[Mqtt] subscribed to {SetTopic}, {NotifySetTopic}, {ShaderSelectCommandTopic}, {Shader2SelectCommandTopic}, {NotifyDurationSetTopic}.");
+        Console.WriteLine($"[Mqtt] subscribed to {SetTopic}, {NotifySetTopic}, {Notify2SetTopic}, {ShaderSelectCommandTopic}, {Shader2SelectCommandTopic}, {NotifyDurationSetTopic}.");
     }
 
     // ─── Home Assistant discovery ───
@@ -294,6 +304,27 @@ public sealed class MqttClient : IDisposable
         await PublishAsync(NotifyDiscoveryTopic, JsonSerializer.Serialize(message), retain: true, MqttQualityOfServiceLevel.AtLeastOnce);
         Console.WriteLine($"[Mqtt] publishing Home Assistant discovery for text '{_prefix}_message'.");
 
+        // Matrix 2's own banner entity: text typed here appears on the panel, with the
+        // same lifetime slider (the banner-seconds number entity applies to both).
+        var message2 = new Dictionary<string, object>
+        {
+            ["name"] = "Matrix 2 message",
+            ["unique_id"] = $"{_prefix}_matrix2_message",
+            ["command_topic"] = Notify2SetTopic,
+            ["state_topic"] = Notify2StateTopic,
+            ["min"] = 0,
+            ["max"] = TextRenderer.MaxTextLength,
+            ["mode"] = "text",
+            ["availability_topic"] = AvailabilityTopic,
+            ["payload_available"] = "online",
+            ["payload_not_available"] = "offline",
+            ["icon"] = "mdi:sign-side",
+            ["qos"] = 1,
+            ["device"] = DeviceBlock(),
+        };
+        await PublishAsync(Notify2DiscoveryTopic, JsonSerializer.Serialize(message2), retain: true, MqttQualityOfServiceLevel.AtLeastOnce);
+        Console.WriteLine($"[Mqtt] publishing Home Assistant discovery for text '{_prefix}_matrix2_message'.");
+
         var duration = new Dictionary<string, object>
         {
             ["name"] = "Banner seconds",
@@ -317,6 +348,23 @@ public sealed class MqttClient : IDisposable
     }
 
     // ─── Commands ───
+
+    /// <summary>
+    /// Add a "target" field to a JSON notification payload that does not name one, so a
+    /// topic dedicated to one display lands there even when the sender omitted the field.
+    /// A payload that already says "target" is respected as sent.
+    /// </summary>
+    private static string EnsureTarget(string json, string target)
+    {
+        try
+        {
+            var node = System.Text.Json.Nodes.JsonNode.Parse(json);
+            if (node is System.Text.Json.Nodes.JsonObject obj && !obj.ContainsKey("target"))
+                obj["target"] = target;
+            return node?.ToJsonString() ?? json;
+        }
+        catch (System.Text.Json.JsonException) { return json; }
+    }
 
     private async Task OnMessageAsync(MqttApplicationMessageReceivedEventArgs e)
     {
@@ -420,6 +468,22 @@ public sealed class MqttClient : IDisposable
                     Console.WriteLine($"[Mqtt] rejected notification: {notifyError}");
                 else
                     Console.WriteLine($"[Mqtt] notification queued: {payload}");
+
+                ScheduleStatePublish();
+            }
+            else if (topic == Notify2SetTopic)
+            {
+                // Matrix 2's own banner entity. A bare string gets the configured lifetime
+                // and target "matrix2"; a JSON payload is passed through unchanged so it can
+                // name its own target ("both" etc.) — same validation as every other path.
+                string body = payload.TrimStart().StartsWith('{')
+                    ? EnsureTarget(payload, "matrix2")
+                    : JsonSerializer.Serialize(new { text = payload, duration = _notifyDurationSec, target = "matrix2" });
+
+                if (!_web.TryPostNotification(body, out string? notifyError))
+                    Console.WriteLine($"[Mqtt] rejected matrix 2 notification: {notifyError}");
+                else
+                    Console.WriteLine($"[Mqtt] matrix 2 notification queued: {payload}");
 
                 ScheduleStatePublish();
             }
@@ -647,10 +711,13 @@ public sealed class MqttClient : IDisposable
         await PublishAsync(StateTopic, JsonSerializer.Serialize(new { state = on ? "ON" : "OFF", effect }), retain: true);
         await PublishAsync(ShaderSelectStateTopic, ShaderOption(selected), retain: true);
 
-        // Matrix 2's own shader selection (only when the output is enabled).
+        // Matrix 2's own shader selection and banner state (only when the output is enabled).
         var m2 = _web.GetLiveMatrix2?.Invoke();
         if (m2 != null)
+        {
             await PublishAsync(Shader2SelectStateTopic, Matrix2ShaderOption(m2.SelectedShader), retain: true);
+            await PublishAsync(Notify2StateTopic, m2.ActiveNotification ?? "", retain: true);
+        }
 
         // Banner entities: what is on the matrix right now, and the configured lifetime.
         await PublishAsync(NotifyStateTopic, snap?.ActiveNotification ?? "", retain: true);
@@ -674,6 +741,7 @@ public sealed class MqttClient : IDisposable
             matrix2_selected_shader = m2?.SelectedShader,
             matrix2_frames_sent = m2?.FramesSent ?? 0,
             matrix2_send_errors = m2?.SendErrors ?? 0,
+            matrix2_active_notification = m2?.ActiveNotification,
             uptime_secs = (int)snap.UptimeSecs,
         }), retain: true);
     }
