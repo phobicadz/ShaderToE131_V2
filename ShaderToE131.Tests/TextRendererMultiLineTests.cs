@@ -5,10 +5,11 @@ namespace ShaderToE131.Tests;
 
 /// <summary>
 /// Multi-line text banners: a '\n' in the text is a line break. A 24-row panel (the
-/// default --matrix2-size) shows two lines; an 11-row panel has room for one band, so
-/// text asking for more lines than fit is rendered as a single scrolling line rather
-/// than dropping content. Frame rows are bottom-up (row 0 = BOTTOM of the panel), so
-/// the first text line must land on the HIGHEST row indices.
+/// default --matrix2-size) shows two lines separated by a pixel gap (default 4 blank rows,
+/// --text-line-gap); an 11-row panel has room for one band, so text asking for more lines
+/// than fit is rendered as a single scrolling line rather than dropping content. Frame rows
+/// are bottom-up (row 0 = BOTTOM of the panel), so the first text line must land on the
+/// HIGHEST row indices.
 /// </summary>
 public class TextRendererMultiLineTests
 {
@@ -40,34 +41,57 @@ public class TextRendererMultiLineTests
     {
         // "!" is the unmistakable shape: column 2 (0x5F) is lit on glyph rows 0..4 and 6,
         // with a gap on row 5 — so the stroke reaches the top of the glyph box and the
-        // dot sits at the bottom. Two identical lines stack with the first one higher.
+        // dot sits at the bottom. Two identical lines stack with the first one higher,
+        // separated by the default 4-row gap.
         var frame = WhiteFrame(W, H);
         TextRenderer.DrawBanner(frame.AsSpan(), W, H, "!\n!", elapsedMs: 0);
 
         int col = (W - TextRenderer.MeasureWidth("!")) / 2 + 2; // centered "!" → x=15, its lit column
 
-        // Line 1 (first): glyph box tops out at row 19 (block of 16 glyph rows centered in 24).
-        Assert.True(IsLit(frame, W, col, 19), "first line stroke must reach its glyph top");
-        Assert.False(IsLit(frame, W, col, 14), "the gap inside '!' must be clear (first line)");
-        Assert.True(IsLit(frame, W, col, 13), "the dot of the first line's '!' must be at its glyph bottom");
+        // Line 1 (first): glyph box tops out at row 20 (block of 18 rows centered in 24).
+        Assert.True(IsLit(frame, W, col, 20), "first line stroke must reach its glyph top");
+        Assert.False(IsLit(frame, W, col, 15), "the gap inside '!' must be clear (first line)");
+        Assert.True(IsLit(frame, W, col, 14), "the dot of the first line's '!' must be at its glyph bottom");
 
-        // Line 2 (second): glyph box 9 rows lower (GlyphHeight + 2 band pitch).
-        Assert.True(IsLit(frame, W, col, 10), "second line stroke must reach its glyph top");
-        Assert.False(IsLit(frame, W, col, 5), "the gap inside '!' must be clear (second line)");
-        Assert.True(IsLit(frame, W, col, 4), "the dot of the second line's '!' must be at its glyph bottom");
+        // Line 2 (second): glyph box 11 rows lower (GlyphHeight + 4-row gap band pitch).
+        Assert.True(IsLit(frame, W, col, 9), "second line stroke must reach its glyph top");
+        Assert.False(IsLit(frame, W, col, 4), "the gap inside '!' must be clear (second line)");
+        Assert.True(IsLit(frame, W, col, 3), "the dot of the second line's '!' must be at its glyph bottom");
 
-        // The first line really is above the second: its dot (row 13) is higher than the
-        // second line's whole glyph (top row 10).
-        Assert.True(13 > 10);
+        // Exactly the requested gap: the four rows between the two glyph boxes are blank,
+        // and the whole block (gap included) is cleared as one continuous band.
+        for (int y = 10; y <= 13; y++)
+            Assert.False(IsLit(frame, W, col, y), $"row {y} is inside the line gap and must be blank");
 
-        // Rows outside both bands keep the underlying frame.
+        // Rows outside the block keep the underlying frame.
         for (int x = 0; x < W; x++)
         {
             Assert.True(IsLit(frame, W, x, 0), "row 0 should be untouched");
-            Assert.True(IsLit(frame, W, x, 2), "row 2 should be untouched");
-            Assert.True(IsLit(frame, W, x, 21), "row 21 should be untouched");
+            Assert.True(IsLit(frame, W, x, 1), "row 1 should be untouched");
+            Assert.True(IsLit(frame, W, x, 22), "row 22 should be untouched");
             Assert.True(IsLit(frame, W, x, 23), "row 23 should be untouched");
         }
+    }
+
+    [Fact]
+    public void DrawBanner_LineGapParameter_ChangesTheSpaceBetweenTheLines()
+    {
+        // lineGap 0 stacks the glyph boxes directly: first line's dot at row 12, second
+        // line's glyph top immediately below at row 11.
+        var tight = WhiteFrame(W, H);
+        TextRenderer.DrawBanner(tight.AsSpan(), W, H, "!\n!", elapsedMs: 0, lineGap: 0);
+        int col = (W - TextRenderer.MeasureWidth("!")) / 2 + 2;
+        Assert.True(IsLit(tight, W, col, 12), "lineGap 0: first line's dot");
+        Assert.True(IsLit(tight, W, col, 11), "lineGap 0: second line starts immediately below");
+
+        // The default gap puts four blank rows between the glyph boxes (dot at 14, next
+        // glyph top at 9 → rows 13..10 blank).
+        var gap = WhiteFrame(W, H);
+        TextRenderer.DrawBanner(gap.AsSpan(), W, H, "!\n!", elapsedMs: 0);
+        Assert.True(IsLit(gap, W, col, 14));
+        Assert.True(IsLit(gap, W, col, 9));
+        for (int y = 10; y <= 13; y++)
+            Assert.False(IsLit(gap, W, col, y), $"default gap: row {y} must be blank");
     }
 
     [Fact]
@@ -120,9 +144,9 @@ public class TextRendererMultiLineTests
         var frame = WhiteFrame(W, H);
         TextRenderer.DrawBanner(frame.AsSpan(), W, H, "OK\r\nTHE LONGER SECOND LINE SCROLLS", elapsedMs: 0);
 
-        // At t=0 the marquee line starts just off the right edge: its band (rows 3..11)
+        // At t=0 the marquee line starts just off the right edge: its band (rows 3..9)
         // is cleared but has nothing drawn in it yet.
-        for (int y = 3; y <= 11; y++)
+        for (int y = 3; y <= 9; y++)
             for (int x = 0; x < W; x++)
                 Assert.False(IsLit(frame, W, x, y), $"second-line band should be empty at t=0, found lit at ({x},{y})");
 
@@ -130,7 +154,7 @@ public class TextRendererMultiLineTests
         frame = WhiteFrame(W, H);
         TextRenderer.DrawBanner(frame.AsSpan(), W, H, "OK\r\nTHE LONGER SECOND LINE SCROLLS", elapsedMs: 5000);
         bool anyLit = false;
-        for (int y = 4; y <= 10 && !anyLit; y++)
+        for (int y = 3; y <= 9 && !anyLit; y++)
             for (int x = 0; x < W; x++)
                 if (IsLit(frame, W, x, y)) { anyLit = true; break; }
         Assert.True(anyLit, "the long second line should be visible after scrolling");
@@ -144,10 +168,10 @@ public class TextRendererMultiLineTests
 
         TextRenderer.DrawBanner(frame.AsSpan(), W, H, "!\n!", elapsedMs: 0, overlay: true);
 
-        Assert.Equal(255, frame[(19 * W + 15) * 4]);  // first line's glyph
-        Assert.Equal(255, frame[(10 * W + 15) * 4]);  // second line's glyph
-        Assert.Equal(0, frame[(14 * W + 15) * 4]);    // halo, not the shader, inside the gap row of a glyph
-        Assert.Equal(100, frame[(22 * W + 0) * 4]);   // outside both bands the shader is untouched
+        Assert.Equal(255, frame[(20 * W + 15) * 4]);  // first line's glyph
+        Assert.Equal(255, frame[(9 * W + 15) * 4]);   // second line's glyph
+        Assert.Equal(0, frame[(15 * W + 15) * 4]);    // halo, not the shader, inside the gap row of a glyph
+        Assert.Equal(100, frame[(22 * W + 0) * 4]);   // outside the block the shader is untouched
         Assert.Equal(100, frame[(1 * W + 0) * 4]);
     }
 }

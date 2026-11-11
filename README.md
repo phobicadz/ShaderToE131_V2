@@ -157,6 +157,7 @@ dotnet run --help
 | `--fps <n>` | Cap the output rate for matrix + string (default: uncapped). Use `30`–`60` for typical pixel controllers — sending 4 universes per frame at thousands of fps overruns their refresh rate and drops frames. In headless mode the whole render loop is paced to this rate, so it also caps CPU use |
 | `--text-overlay` | Default banner style: draw text over the shader (with a black halo around the strokes) instead of blanking a black band across it. A per-message `overlay` field overrides it |
 | `--text-shadow <0-3>` | Width of that halo: 1 = 1 px outline, 2 = 2 px, 0 = none. Default 1. Only applies to overlay banners |
+| `--text-line-gap <0-8>` | Blank rows between two text lines (a `\n` in the message). Default 4 |
 | `--led-agent` | Stream each frame's colour to a standalone **LED agent** service that drives the motherboard RGB LEDs of another machine. Start the agent first — see "LED Agent" below |
 | `--led-agent-host <host>` | LED agent host (default: `127.0.0.1`) |
 | `--led-agent-port <port>` | LED agent port (default: 6743) |
@@ -392,11 +393,12 @@ Text limits: 5×7 ASCII bitmap font (200 characters max, unsupported characters 
 
 **Two lines on the second matrix**: a `\n` in the message is a line break, and each display shows as
 many lines as its rows allow — the 24-row panel stacks **two lines** (each centered or scrolling
-independently), while the 11-row main matrix has room for one band, so text with more lines than the
-display fits is rendered as a single scrolling line rather than dropping content. The same two-line
-message can therefore be sent to `both`: the panel shows two lines, the main matrix one scrolling
-line. The web UI's message box is a textarea (Enter adds a line, Ctrl+Enter sends); from MQTT or
-automations just put `\n` in the text. The same renderer runs on matrix 2 at its own
+independently) separated by a **4-row pixel gap** (`--text-line-gap <0-8>` changes it), while the
+11-row main matrix has room for one band, so text with more lines than the display fits is rendered
+as a single scrolling line rather than dropping content. The same two-line message can therefore be
+sent to `both`: the panel shows two lines, the main matrix one scrolling line. The web UI's message
+box is a textarea (Enter adds a line, Ctrl+Enter sends); from MQTT or automations just put `\n` in
+the text. The same renderer runs on matrix 2 at its own
 size, so the number of characters that fit before it scrolls is decided per display.
 
 The LED string is sampled from the framebuffer **before** the banner is drawn, so text always appears

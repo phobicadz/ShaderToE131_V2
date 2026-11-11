@@ -129,6 +129,14 @@ public static class TextRenderer
     /// most of a 7-row glyph.</summary>
     public const int MaxShadowSpread = 3;
 
+    /// <summary>Blank rows kept between two text lines when the caller does not ask for a
+    /// specific gap. 4 keeps the lines clearly separate without pushing a line off a 24-row panel.</summary>
+    public const int DefaultLineGap = 4;
+
+    /// <summary>Line gaps are clamped to this: past it a 24-row panel no longer has room for
+    /// two 7-row lines, and the text collapses to a single line anyway.</summary>
+    public const int MaxLineGap = 8;
+
     public static int MeasureWidth(string text)
         => text.Length > 0 ? text.Length * GlyphAdvance - 1 : 0;
 
@@ -156,15 +164,19 @@ public static class TextRenderer
     /// output.</param>
     /// <param name="shadowSpread">Half-width of that halo: 1 gives a 1 px outline around every stroke,
     /// 2 gives a 2 px one, 0 draws no halo at all. Only used when <paramref name="overlay"/> is true.</param>
-    public static void DrawBanner(Span<byte> frame, int width, int height, string text, long elapsedMs, bool overlay = false, int shadowSpread = 1)
+    /// <param name="lineGap">Blank rows kept between consecutive text lines. Default
+    /// <see cref="DefaultLineGap"/>, clamped to 0..<see cref="MaxLineGap"/>; only relevant when the
+    /// text actually renders as multiple lines.</param>
+    public static void DrawBanner(Span<byte> frame, int width, int height, string text, long elapsedMs, bool overlay = false, int shadowSpread = 1, int lineGap = DefaultLineGap)
     {
         if (text.Length == 0 || width <= 0 || height <= 0) return;
         if (frame.Length < width * height * 4)
             throw new ArgumentException("Framebuffer is smaller than width*height*4 bytes.", nameof(frame));
 
-        // Band: glyph height plus 1px padding above and below. Rows outside a band are untouched.
-        int bandHeight = GlyphHeight + 2;
-        int maxLines = Math.Max(1, height / bandHeight);
+        // Row pitch between two lines' glyph boxes: the gap plus one glyph.
+        int lineGapClamped = Math.Clamp(lineGap, 0, MaxLineGap);
+        int bandPitch = GlyphHeight + lineGapClamped;
+        int maxLines = Math.Max(1, height / bandPitch);
 
         string[] lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
         int lineCount = lines.Length;
@@ -179,14 +191,14 @@ public static class TextRenderer
 
         // The block of stacked lines is centered vertically as a whole. Frame rows are
         // bottom-up, so the FIRST text line gets the HIGHEST row indices.
-        int blockGlyphHeight = lineCount * GlyphHeight + (lineCount - 1) * 2;
+        int blockGlyphHeight = lineCount * GlyphHeight + (lineCount - 1) * lineGapClamped;
         int blockTopIndex = height - 1 - (height - blockGlyphHeight) / 2;
 
         int[] glyphTops = new int[lineCount];
         int[] lineXs = new int[lineCount];
         for (int li = 0; li < lineCount; li++)
         {
-            glyphTops[li] = blockTopIndex - li * bandHeight;
+            glyphTops[li] = blockTopIndex - li * bandPitch;
 
             int textWidth = MeasureWidth(lines[li]);
             if (textWidth <= width)
@@ -200,15 +212,17 @@ public static class TextRenderer
                 long pos = (elapsedMs * ScrollPixelsPerSecond / 1000) % travel;
                 lineXs[li] = (int)(width - pos);
             }
+        }
 
-            if (!overlay)
-            {
-                // Clear this line's band: glyph rows [glyphTop-6 .. glyphTop] plus 1px padding.
-                int bandTop = Math.Max(0, glyphTops[li] - GlyphHeight);
-                int bandBottom = Math.Min(height, glyphTops[li] + 2);
-                for (int y = bandTop; y < bandBottom; y++)
-                    frame.Slice(y * width * 4, width * 4).Clear();
-            }
+        if (!overlay)
+        {
+            // Clear ONE continuous block covering every line: glyph rows plus 1px padding top
+            // and bottom. With a line gap wider than that padding the gap rows are covered too,
+            // so the space between the lines is solid background, not a strip of live shader.
+            int blockBottom = Math.Max(0, glyphTops[lineCount - 1] - GlyphHeight);
+            int blockTop = Math.Min(height, glyphTops[0] + 2);
+            for (int y = blockBottom; y < blockTop; y++)
+                frame.Slice(y * width * 4, width * 4).Clear();
         }
 
         // Glyph rows occupy indices [glyphTop - 6, glyphTop]. Index order is bottom-up, so

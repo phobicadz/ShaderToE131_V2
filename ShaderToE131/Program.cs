@@ -24,6 +24,7 @@ class Program : IDisposable
     private bool _noPreview = false;
     private bool _textOverlay = false;   // default banner behaviour: draw over the shader, no black band
     private int _textShadow = TextRenderer.DefaultShadowSpread; // halo width around overlay text
+    private int _textLineGap = TextRenderer.DefaultLineGap;    // blank rows between two text lines
     private string? _shaderSource = null;
     private string? _currentShaderFileName;
     private bool _demoMode = false;
@@ -379,6 +380,8 @@ void main()
             else if (args[i] == "--text-overlay") { prog._textOverlay = true; }
             else if (args[i] == "--text-shadow" && i + 1 < args.Length && int.TryParse(args[++i], out var ts))
                 prog._textShadow = Math.Clamp(ts, 0, TextRenderer.MaxShadowSpread);
+            else if (args[i] == "--text-line-gap" && i + 1 < args.Length && int.TryParse(args[++i], out var tlg))
+                prog._textLineGap = Math.Clamp(tlg, 0, TextRenderer.MaxLineGap);
             else if (args[i] == "--led-agent") { prog._ledAgentEnabled = true; }
             else if (args[i] == "--led-agent-host" && i + 1 < args.Length)
                 prog._ledAgentHost = args[++i];
@@ -425,6 +428,7 @@ void main()
             Console.WriteLine("  --fps <n>            Cap the output rate (matrix + string); headless mode paces its render loop to it. Default: uncapped");
             Console.WriteLine("  --text-overlay       Default banner style: draw text over the shader (with a black outline around the strokes) instead of blanking a band across it. Per-message \"overlay\" overrides it");
             Console.WriteLine("  --text-shadow <0-3>  Width of that outline (1 = 1px halo, 2 = 2px halo, 0 = none). Default: 1. Only applies to overlay banners");
+            Console.WriteLine("  --text-line-gap <0-8> Blank rows between two text lines (a '\n' in the message; only the 24-row panel stacks two lines). Default: 4");
             Console.WriteLine("  --led-agent          Stream the frame colour to a standalone LED agent service driving another machine's motherboard RGB LEDs (start it with: dotnet run --project LedAgent)");
             Console.WriteLine("  --led-agent-host <host>  LED agent address (default: 127.0.0.1)");
             Console.WriteLine("  --led-agent-port <port>  LED agent port (default: 6743)");
@@ -1469,7 +1473,7 @@ void main()
             }
             return;
         }
-        TextRenderer.DrawBanner(_frameBuffer.AsSpan(), MatW, MatH, _notifyText, nowMs - _notifyStartMs, _notifyOverlay, _textShadow);
+        TextRenderer.DrawBanner(_frameBuffer.AsSpan(), MatW, MatH, _notifyText, nowMs - _notifyStartMs, _notifyOverlay, _textShadow, _textLineGap);
     }
 
     /// <summary>
@@ -1515,7 +1519,7 @@ void main()
                 _matrix2OffFramesRemaining = OffClearFrames;
             return;
         }
-        TextRenderer.DrawBanner(_matrix2FrameBuffer.AsSpan(), _matrix2W, _matrix2H, _notifyText2, nowMs - _notifyStartMs2, _notifyOverlay2, _textShadow);
+        TextRenderer.DrawBanner(_matrix2FrameBuffer.AsSpan(), _matrix2W, _matrix2H, _notifyText2, nowMs - _notifyStartMs2, _notifyOverlay2, _textShadow, _textLineGap);
     }
 
     /// <summary>Remaining seconds of matrix 2's active notification (0 when none).</summary>
