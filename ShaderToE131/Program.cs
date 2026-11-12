@@ -1680,6 +1680,12 @@ void main()
         if (_audioCapture != null && (!_isOff || _shaderProgram2 != null))
         {
             var spectrum = _audioCapture.ReadSpectrum();
+            // Bind the main program first: uniforms apply to whichever program is
+            // current, and with matrix 2 the last-bound one is _shaderProgram2
+            // (see RenderMatrix2) — without this the main matrix's audio uniforms
+            // would be written into matrix 2's program and the main matrix would
+            // never react to sound.
+            _shaderProgram?.Use(_gl!);
             _shaderProgram?.SetAudioValues(spectrum);
             _lastSpectrum = spectrum; // shared with the matrix-2 program; ReadSpectrum drains once per frame
             if (++_audioDebugCount % 60 == 0)
@@ -1927,6 +1933,12 @@ void main()
         if (_audioCapture != null && (!_isOff || _shaderProgram2 != null))
         {
             var spectrum = _audioCapture.ReadSpectrum();
+            // Bind the main program first: uniforms apply to whichever program is
+            // current, and with matrix 2 the last-bound one is _shaderProgram2
+            // (see RenderMatrix2) — without this the main matrix's audio uniforms
+            // would be written into matrix 2's program and the main matrix would
+            // never react to sound.
+            _shaderProgram?.Use(_gl!);
             _shaderProgram?.SetAudioValues(spectrum);
             _lastSpectrum = spectrum; // shared with the matrix-2 program; ReadSpectrum drains once per frame
             if (++_audioDebugCount % 60 == 0)
